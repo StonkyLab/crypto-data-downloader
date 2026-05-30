@@ -12,6 +12,7 @@ Copyright (c) 2025 Vitezslav Kot <vitezslav.kot@stonky.cz>, Stonky s.r.o.
 #include "stonky/mexc/mexc_futures_downloader.h"
 #include "stonky/mexc/mexc_spot_downloader.h"
 #include "stonky/hyperliquid/hyperliquid_downloader.h"
+#include "stonky/lighter/lighter_downloader.h"
 #include "stonky/downloader.h"
 #include "stonky/binance/binance_spot_downloader.h"
 #include <spdlog/spdlog.h>
@@ -26,7 +27,7 @@ Copyright (c) 2025 Vitezslav Kot <vitezslav.kot@stonky.cz>, Stonky s.r.o.
 
 #undef max
 
-#define VERSION "2.2.1"
+#define VERSION "2.3.0"
 
 using namespace stonky;
 
@@ -86,7 +87,7 @@ int main(int argc, char **argv) {
 
     options.add_options()
             ("e,exchange",
-             R"(Exchange name: Binance (bnb), OKX (okx), Bybit (bybit), MEXC (mexc) or Hyperliquid (hl), example: -e bnb (default: bnb))",
+             R"(Exchange name: Binance (bnb), OKX (okx), Bybit (bybit), MEXC (mexc), Hyperliquid (hl) or Lighter (lt), example: -e bnb (default: bnb))",
              cxxopts::value<std::string>()->default_value({"bnb"}))
             ("o,output", R"(Output directory path, example: -o "C:\Users\UserName\BNBData")",
              cxxopts::value<std::string>())
@@ -164,8 +165,8 @@ int main(int argc, char **argv) {
 
         exchange = parseResult["exchange"].as<std::string>();
 
-        if (exchange != "bnb" && exchange != "bybit" && exchange != "okx" && exchange != "mexc" && exchange != "hl") {
-            spdlog::error(fmt::format("Wrong value of exchange parameter, must be 'bnb', 'okx', 'bybit', 'mexc' or 'hl', is: {}", exchange));
+        if (exchange != "bnb" && exchange != "bybit" && exchange != "okx" && exchange != "mexc" && exchange != "hl" && exchange != "lt") {
+            spdlog::error(fmt::format("Wrong value of exchange parameter, must be 'bnb', 'okx', 'bybit', 'mexc', 'hl' or 'lt', is: {}", exchange));
             spdlog::info(options.help());
             return -1;
         }
@@ -179,7 +180,8 @@ int main(int argc, char **argv) {
             if (outputDirectoryLowerCase.find("bybit") != std::string::npos ||
                 outputDirectoryLowerCase.find("okx") != std::string::npos ||
                 outputDirectoryLowerCase.find("mexc") != std::string::npos ||
-                outputDirectoryLowerCase.find("hyperliquid") != std::string::npos) {
+                outputDirectoryLowerCase.find("hyperliquid") != std::string::npos ||
+                outputDirectoryLowerCase.find("lighter") != std::string::npos) {
                 std::string response;
                 std::cout
                         << "Seems that you are trying to save Binance data into another exchange folder, are you sure? Type y (yes) or n (no)"
@@ -195,7 +197,8 @@ int main(int argc, char **argv) {
                 outputDirectoryLowerCase.find("binance") != std::string::npos ||
                 outputDirectoryLowerCase.find("okx") != std::string::npos ||
                 outputDirectoryLowerCase.find("mexc") != std::string::npos ||
-                outputDirectoryLowerCase.find("hyperliquid") != std::string::npos) {
+                outputDirectoryLowerCase.find("hyperliquid") != std::string::npos ||
+                outputDirectoryLowerCase.find("lighter") != std::string::npos) {
                 std::string response;
                 std::cout
                         << "Seems that you are trying to save Bybit data into another exchange folder, are you sure? Type y (yes) or n (no)"
@@ -211,7 +214,8 @@ int main(int argc, char **argv) {
                 outputDirectoryLowerCase.find("binance") != std::string::npos ||
                 outputDirectoryLowerCase.find("bybit") != std::string::npos ||
                 outputDirectoryLowerCase.find("mexc") != std::string::npos ||
-                outputDirectoryLowerCase.find("hyperliquid") != std::string::npos) {
+                outputDirectoryLowerCase.find("hyperliquid") != std::string::npos ||
+                outputDirectoryLowerCase.find("lighter") != std::string::npos) {
                 std::string response;
                 std::cout
                         << "Seems that you are trying to save OKX data into another exchange folder, are you sure? Type y (yes) or n (no)"
@@ -227,7 +231,8 @@ int main(int argc, char **argv) {
                 outputDirectoryLowerCase.find("binance") != std::string::npos ||
                 outputDirectoryLowerCase.find("bybit") != std::string::npos ||
                 outputDirectoryLowerCase.find("okx") != std::string::npos ||
-                outputDirectoryLowerCase.find("hyperliquid") != std::string::npos) {
+                outputDirectoryLowerCase.find("hyperliquid") != std::string::npos ||
+                outputDirectoryLowerCase.find("lighter") != std::string::npos) {
                 std::string response;
                 std::cout
                         << "Seems that you are trying to save MEXC data into another exchange folder, are you sure? Type y (yes) or n (no)"
@@ -243,10 +248,28 @@ int main(int argc, char **argv) {
                 outputDirectoryLowerCase.find("binance") != std::string::npos ||
                 outputDirectoryLowerCase.find("bybit") != std::string::npos ||
                 outputDirectoryLowerCase.find("okx") != std::string::npos ||
-                outputDirectoryLowerCase.find("mexc") != std::string::npos) {
+                outputDirectoryLowerCase.find("mexc") != std::string::npos ||
+                outputDirectoryLowerCase.find("lighter") != std::string::npos) {
                 std::string response;
                 std::cout
                         << "Seems that you are trying to save Hyperliquid data into another exchange folder, are you sure? Type y (yes) or n (no)"
+                        << std::endl;
+                std::cin >> response;
+
+                if (response != "y") {
+                    return -1;
+                }
+            }
+        } else if (exchange == "lt") {
+            if (outputDirectoryLowerCase.find("bnb") != std::string::npos ||
+                outputDirectoryLowerCase.find("binance") != std::string::npos ||
+                outputDirectoryLowerCase.find("bybit") != std::string::npos ||
+                outputDirectoryLowerCase.find("okx") != std::string::npos ||
+                outputDirectoryLowerCase.find("mexc") != std::string::npos ||
+                outputDirectoryLowerCase.find("hyperliquid") != std::string::npos) {
+                std::string response;
+                std::cout
+                        << "Seems that you are trying to save Lighter data into another exchange folder, are you sure? Type y (yes) or n (no)"
                         << std::endl;
                 std::cin >> response;
 
@@ -314,6 +337,11 @@ int main(int argc, char **argv) {
             downloader = std::make_unique<HyperliquidDownloader>(maxJobs, deleteDelistedData);
         } else if (exchange == "hl" && marketCategory == MarketCategory::Spot) {
             spdlog::error("Hyperliquid does not support Spot market, use -c f for Futures");
+            return -1;
+        } else if (exchange == "lt" && marketCategory == MarketCategory::Futures) {
+            downloader = std::make_unique<LighterDownloader>(maxJobs, deleteDelistedData);
+        } else if (exchange == "lt" && marketCategory == MarketCategory::Spot) {
+            spdlog::error("Lighter does not support Spot market, use -c f for Futures");
             return -1;
         }
 

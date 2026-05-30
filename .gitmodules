@@ -16,3 +16,6 @@
 [submodule "hyperliquid-cpp-api"]
 	path = hyperliquid-cpp-api
 	url = git@github.com:StonkyLab/hyperliquid-cpp-api.git
+[submodule "lighter-cpp-api"]
+	path = lighter-cpp-api
+	url = git@github.com:StonkyLab/lighter-cpp-api.git

@@ -8,7 +8,7 @@ A high-performance command-line utility for downloading historical market data (
 
 ## Features
 
-- **Multi-Exchange Support**: Binance, Bybit, OKX, MEXC, and Hyperliquid
+- **Multi-Exchange Support**: Binance, Bybit, OKX, MEXC, Hyperliquid, and Lighter
 - **Multiple Data Types**: OHLCV candles and funding rate history
 - **Parallel Downloads**: Configurable concurrent job processing
 - **Flexible Output**: CSV format with optional T6 (Zorro) conversion
@@ -26,8 +26,21 @@ A high-performance command-line utility for downloading historical market data (
 | OKX          | ✅ | ✅ | ✅ | ✅ |
 | MEXC         | ✅ | ✅ | ✅ | ✅ |
 | Hyperliquid  | ✅ | ❌ | ✅ | ✅ |
+| Lighter      | ✅ | ❌ | ✅ | ✅ |
 
 ### Exchange-Specific Notes
+
+#### Lighter
+
+Lighter supports **perpetuals only** (no Spot). Symbols are coin names without a quote suffix (e.g. `BTC`, `ETH`).
+
+Lighter's mainnet (zkLighter) launched in late 2024. API host: `mainnet.zklighter.elliot.ai`.
+
+On the **first run** for a symbol the downloader requests the most recent ~5 000 candles of the chosen interval; subsequent runs append only data since the last CSV record.
+
+**Funding rates** cadence is 1 hour, available from late 2024.
+
+> **Note:** The API sits behind an AWS WAF that returns HTTP 405 + CAPTCHA under sustained flooding. Downloads are sequential (`maxConcurrentDownloadJobs{1}`) and the retry loop also catches "405" / "captcha" patterns.
 
 #### Hyperliquid
 
@@ -164,7 +177,7 @@ crypto_data_downloader [OPTIONS]
 
 | Option | Long Form | Description | Default |
 |--------|-----------|-------------|---------|
-| `-e` | `--exchange` | Exchange: `bnb` (Binance), `bybit`, `okx`, `mexc`, `hl` (Hyperliquid) | `bnb` |
+| `-e` | `--exchange` | Exchange: `bnb` (Binance), `bybit`, `okx`, `mexc`, `hl` (Hyperliquid), `lt` (Lighter) | `bnb` |
 | `-t` | `--data_type` | Data type: `c` (candles), `fr` (funding rates) | `c` |
 | `-o` | `--output` | Output directory path | *required* |
 | `-s` | `--symbols` | Symbols to download (comma-separated) or `all` | `all` |
@@ -229,6 +242,21 @@ crypto_data_downloader [OPTIONS]
 ./crypto_data_downloader -e hl -t fr -o /data/hyperliquid
 ```
 
+**Download Lighter perpetuals — 1h candles (all symbols):**
+```bash
+./crypto_data_downloader -e lt -c f -b 60 -o /data/lighter
+```
+
+**Download specific Lighter symbols:**
+```bash
+./crypto_data_downloader -e lt -b 60 -s "BTC,ETH,SOL" -o /data/lighter
+```
+
+**Download Lighter funding rate history (all symbols):**
+```bash
+./crypto_data_downloader -e lt -t fr -o /data/lighter
+```
+
 **Download Binance spot data:**
 ```bash
 ./crypto_data_downloader -e bnb -c s -o /data/binance_spot
@@ -285,6 +313,7 @@ crypto_data_downloader/
 │   ├── okx/                  # OKX-specific downloader
 │   ├── mexc/                 # MEXC-specific downloader
 │   ├── hyperliquid/          # Hyperliquid-specific downloader
+│   ├── lighter/              # Lighter-specific downloader
 │   └── downloader.h          # Common utilities
 ├── src/                      # Implementation files
 ├── binance-cpp-api/          # Binance API wrapper (submodule)
@@ -292,6 +321,7 @@ crypto_data_downloader/
 ├── okx-cpp-api/              # OKX API wrapper (submodule)
 ├── mexc-cpp-api/             # MEXC API wrapper (submodule)
 ├── hyperliquid-cpp-api/      # Hyperliquid API wrapper (submodule)
+├── lighter-cpp-api/          # Lighter API wrapper (submodule)
 ├── stonky-cpp-common/        # Common utilities (submodule)
 ├── CMakeLists.txt            # Build configuration
 └── main.cpp                  # Entry point
