@@ -42,6 +42,32 @@ On the **first run** for a symbol the downloader requests the most recent ~5 000
 
 > **Note:** The API sits behind an AWS WAF that returns HTTP 405 + CAPTCHA under sustained flooding. Downloads are sequential (`maxConcurrentDownloadJobs{1}`) and the retry loop also catches "405" / "captcha" patterns.
 
+**Optional: higher rate limits via tier upgrade**
+
+Lighter's Standard tier (60 req/min, ~1 req/s) is the default. To go faster, set up a Lighter account and export a read-only auth token before running the downloader:
+
+| Tier      | /candles  | `LIGHTER_MIN_REQUEST_INTERVAL_MS`    |
+|-----------|-----------|--------------------------------------|
+| Standard  | 60/min    | unset (default 1000)                 |
+| Premium   | 80/min    | `750`                                |
+| Plus      | 400/min   | `150`                                |
+| Builder   | 800/min   | `75`                                 |
+
+> **Důležité:** mít `LIGHTER_AUTH_TOKEN` nastavený sám o sobě **nepovyšuje tvůj tier** — Plus/Builder vyžadují explicit opt-in. Pokud máš jen token a jsi pořád Standard, nech `LIGHTER_MIN_REQUEST_INTERVAL_MS` nenastavený (downloader použije bezpečných 1000 ms). Nastavení nižšího intervalu než tvůj reálný tier vede k AWS WAF banu IP adresy.
+
+Setup (one-time):
+
+1. Register an account at lighter.xyz with an Ethereum wallet (no deposit required, gas < $1).
+2. Generate a read-only API key via the Lighter Python SDK (`system_setup.py` in `elliottech/lighter-python`).
+3. For Plus or Builder tier, open a Discord #support ticket — Plus requires the IP whitelist, Builder requires a brief use-case description.
+4. Export the token:
+   ```bash
+   export LIGHTER_AUTH_TOKEN="ro:account_index:scope:expiry_unix:nonce_hex"
+   export LIGHTER_MIN_REQUEST_INTERVAL_MS=75  # adjust to your tier
+   ```
+
+Without the env vars the downloader falls back to Standard tier — works fine for incremental updates, slow for first-time bootstraps. See the [Lighter rate-limits docs](https://apidocs.lighter.xyz/docs/rate-limits) for details.
+
 #### Hyperliquid
 
 Hyperliquid supports **perpetual futures only** (no Spot). Symbols are coin names without a quote suffix (e.g. `BTC`, `ETH`, `SOL`), not trading pairs.

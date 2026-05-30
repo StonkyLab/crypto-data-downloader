@@ -13,6 +13,8 @@ Copyright (c) 2026 Vitezslav Kot <vitezslav.kot@stonky.cz>, Stonky s.r.o.
 #include "stonky/utils/utils.h"
 #include "stonky/utils/semaphore.h"
 #include "csv.h"
+#include <chrono>
+#include <cstdlib>
 #include <filesystem>
 #include <fstream>
 #include <set>
@@ -47,8 +49,57 @@ struct LighterDownloader::P {
 
     static bool writeFundingRatesToCSVFile(const std::vector<FundingRate> &fr, const std::string &path);
 
+    static std::unique_ptr<RESTClient> makeClient() {
+        // Read optional Lighter authentication from environment.
+        //
+        // LIGHTER_AUTH_TOKEN — read-only auth token in the format
+        //   `ro:account_index:scope:expiry_unix:nonce_hex`
+        // Generate via the Lighter Python SDK once (long-lived, max 10 years) and
+        // export it before running the downloader. Without it the client falls back
+        // to unauthenticated Standard tier (60 req/min, 1 req/s sustained).
+        //
+        // LIGHTER_MIN_REQUEST_INTERVAL_MS — REQUIRED for higher tiers. Just having
+        // a token does NOT upgrade you from Standard (60 req/min) — Plus/Builder
+        // need an explicit Discord opt-in. Set this to match your tier:
+        //   Premium → 750     Plus → 150     Builder → 75
+        // Without it the throttle stays at Standard's safe 1000 ms even with a
+        // token, so a misconfigured tier doesn't get the IP banned by AWS WAF.
+        // See https://apidocs.lighter.xyz/docs/rate-limits
+        const char* envToken = std::getenv("LIGHTER_AUTH_TOKEN");
+        const char* envInterval = std::getenv("LIGHTER_MIN_REQUEST_INTERVAL_MS");
+
+        if (envToken == nullptr || *envToken == '\0') {
+            if (envInterval != nullptr && *envInterval != '\0') {
+                spdlog::warn("LIGHTER_MIN_REQUEST_INTERVAL_MS ignored without LIGHTER_AUTH_TOKEN");
+            }
+            spdlog::info("Lighter: using unauthenticated Standard tier (60 req/min, 1000 ms throttle)");
+            return std::make_unique<RESTClient>();
+        }
+
+        std::chrono::milliseconds interval{1000}; // Standard — safe default until tier is known
+        bool intervalOverridden = false;
+        if (envInterval != nullptr && *envInterval != '\0') {
+            try {
+                const auto parsed = std::stoll(envInterval);
+                if (parsed > 0) {
+                    interval = std::chrono::milliseconds{parsed};
+                    intervalOverridden = true;
+                }
+            } catch (const std::exception&) {
+                spdlog::warn("LIGHTER_MIN_REQUEST_INTERVAL_MS={} not parseable, keeping 1000 ms", envInterval);
+            }
+        }
+        if (intervalOverridden) {
+            spdlog::info("Lighter: authenticated client, throttle = {} ms (custom)", interval.count());
+        } else {
+            spdlog::info("Lighter: authenticated client, throttle = 1000 ms (Standard — "
+                         "set LIGHTER_MIN_REQUEST_INTERVAL_MS to match your actual tier)");
+        }
+        return std::make_unique<RESTClient>(envToken, interval);
+    }
+
     explicit P(const std::uint32_t maxJobs, const bool deleteDelistedData)
-        : ltClient(std::make_unique<RESTClient>()),
+        : ltClient(makeClient()),
           maxConcurrentConvertJobs(maxJobs),
           deleteDelistedData(deleteDelistedData) {
     }
@@ -443,13 +494,43 @@ void LighterDownloader::updateMarketData(const std::string &dirPath,
                                       msg.find("rate limit") != std::string::npos;
                            };
                            constexpr int64_t oldestLighterDate = 1704067200000LL;
+
+                           // Discover the market's listing date with a single cheap 1d probe.
+                           // Lighter retains full per-market history at all resolutions, so the
+                           // listing date is the correct floor for a first-time download.
+                           // `getHistoricalPrices` paginates internally (transparent to caller),
+                           // so the probe returns ALL 1d candles in [from, to), not just 500.
+                           // We pass `from = oldestLighterDate` rather than 0 to bound how many
+                           // empty pre-listing windows the paginator walks before reaching data
+                           // (one batch step is 500 days for 1d, so from=0 would mean ~41 wasted
+                           // requests scanning 1970→2024 before the first real candle).
+                           // Probe is skipped when the CSV already has data (we resume from CSV).
+                           int64_t listingDate = nowTimestamp;
+                           if (P::checkSymbolCSVFile(symbolFilePathCsv.string()) == oldestLighterDate) {
+                               try {
+                                   const auto probe = m_p->ltClient->getHistoricalPrices(
+                                       symbol, lighter::CandleInterval::_1d, oldestLighterDate, nowTimestamp);
+                                   if (!probe.empty()) {
+                                       listingDate = probe.front().openTime;
+                                   } else {
+                                       // No 1d candles at all — newly listed market with no full day yet.
+                                       // Fall back to 24h of history; subsequent runs append from CSV.
+                                       listingDate = nowTimestamp - 86400000LL;
+                                   }
+                               } catch (const std::exception &e) {
+                                   spdlog::warn(fmt::format("Listing-date probe failed for {}: {} — falling back to last 30 days",
+                                                            symbol, e.what()));
+                                   listingDate = nowTimestamp - 30LL * 86400000LL;
+                               }
+                           }
+
                            constexpr int maxRetries = 5;
                            for (int attempt = 0; attempt < maxRetries; ++attempt) {
                                // Re-read CSV state at start of each attempt — a previous attempt
                                // may have written batches to disk before hitting a 429.
                                const int64_t fromTimeStamp = P::checkSymbolCSVFile(symbolFilePathCsv.string());
                                const int64_t effectiveFrom = (fromTimeStamp == oldestLighterDate)
-                                   ? nowTimestamp - static_cast<int64_t>(barSizeInMinutes) * 5000LL * 60000
+                                   ? listingDate
                                    : fromTimeStamp;
                                try {
                                    std::ignore = m_p->ltClient->getHistoricalPrices(
@@ -475,7 +556,9 @@ void LighterDownloader::updateMarketData(const std::string &dirPath,
                                } catch (const std::exception &e) {
                                    const std::string errMsg = e.what();
                                    if (isRateLimitError(errMsg) && attempt < maxRetries - 1) {
-                                       const int waitMs = 1000 * (1 << attempt);
+                                       // Lighter firewall cooldown is a fixed 60s once the WAF locks the IP.
+                                       // Sub-minute backoff just consumes retry budget without recovery.
+                                       constexpr int waitMs = 60000;
                                        spdlog::warn(fmt::format(
                                            "Rate limit for symbol: {}, retry {}/{} in {} ms: {}",
                                            symbol, attempt + 1, maxRetries - 1, waitMs, errMsg));
@@ -693,7 +776,8 @@ void LighterDownloader::updateFundingRateData(const std::string &dirPath,
                                } catch (const std::exception &e) {
                                    const std::string errMsg = e.what();
                                    if (isRateLimitError(errMsg) && attempt < maxRetries - 1) {
-                                       const int waitMs = 1000 * (1 << attempt);
+                                       // Lighter firewall cooldown is a fixed 60s once the WAF locks the IP.
+                                       constexpr int waitMs = 60000;
                                        spdlog::warn(fmt::format(
                                            "Rate limit for symbol: {}, retry {}/{} in {} ms: {}",
                                            symbol, attempt + 1, maxRetries - 1, waitMs, errMsg));
