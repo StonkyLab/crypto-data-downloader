@@ -7,6 +7,7 @@ Copyright (c) 2025 Vitezslav Kot <vitezslav.kot@stonky.cz>, Stonky s.r.o.
 */
 
 #include "stonky/hyperliquid/hyperliquid_downloader.h"
+#include "stonky/csv_data.h"
 #include "stonky/downloader.h"
 #include "stonky/hyperliquid/hyperliquid_rest_client.h"
 #include "stonky/hyperliquid/hyperliquid.h"
@@ -178,7 +179,8 @@ bool HyperliquidDownloader::P::writeCandlesToCSVFile(const std::vector<Candle> &
     }
 
     for (const auto &candle: candles) {
-        if (candle.startTime == lastTs) {
+        // <= guards against any overlap with already-persisted data
+        if (candle.startTime <= lastTs) {
             continue;
         }
         ofs << candle.startTime << ",";
@@ -189,98 +191,26 @@ bool HyperliquidDownloader::P::writeCandlesToCSVFile(const std::vector<Candle> &
         ofs << candle.volume << std::endl;
     }
 
+    ofs.flush();
+    if (!ofs.good()) {
+        spdlog::error(fmt::format("Write to file failed (disk full?): {}", path));
+        ofs.close();
+        return false;
+    }
     ofs.close();
     return true;
 }
 
 int64_t HyperliquidDownloader::P::checkSymbolCSVFile(const std::string &path) {
     constexpr int64_t oldestHyperliquidDate = 1672531200000; /// Sunday 1. January 2023 0:00:00
-
-    std::ifstream ifs;
-    ifs.open(path, std::ios::ate);
-
-    if (!ifs.is_open()) {
-        if (std::filesystem::exists(path)) {
-            spdlog::error(fmt::format("Couldn't open file: {}", path));
-        }
-        return oldestHyperliquidDate;
-    }
-
-    const std::streampos size = ifs.tellg();
-    char c;
-    std::string row;
-    int endLines = 0;
-
-    for (int i = 1; i <= size; i++) {
-        ifs.seekg(-i, std::ios::end);
-        ifs.get(c);
-
-        if (c == '\n') {
-            endLines++;
-            if (endLines >= 1 && !row.empty()) {
-                std::ranges::reverse(row);
-
-                const auto records = splitString(row, ',');
-
-                if (records.size() != 6) {
-                    spdlog::error(fmt::format("Wrong records number in the CSV file: {}", path));
-                    ifs.close();
-                    return oldestHyperliquidDate;
-                }
-                ifs.close();
-                return std::stoll(records[0]);
-            }
-        } else {
-            row.push_back(c);
-        }
-    }
-    ifs.close();
-    return oldestHyperliquidDate;
+    // Self-healing read: a torn tail (interrupted write) is truncated instead of
+    // resetting the resume point to the oldest-date sentinel.
+    return CsvData::lastValidRecord(path, 6, oldestHyperliquidDate).timestamp;
 }
 
 int64_t HyperliquidDownloader::P::checkFundingRatesCSVFile(const std::string &path) {
     constexpr int64_t oldestHyperliquidDate = 1672531200000; /// Sunday 1. January 2023 0:00:00
-
-    std::ifstream ifs;
-    ifs.open(path, std::ios::ate);
-
-    if (!ifs.is_open()) {
-        if (std::filesystem::exists(path)) {
-            spdlog::error(fmt::format("Couldn't open file: {}", path));
-        }
-        return oldestHyperliquidDate;
-    }
-
-    const std::streampos size = ifs.tellg();
-    char c;
-    std::string row;
-    int endLines = 0;
-
-    for (int i = 1; i <= size; i++) {
-        ifs.seekg(-i, std::ios::end);
-        ifs.get(c);
-
-        if (c == '\n') {
-            endLines++;
-            if (endLines >= 1 && !row.empty()) {
-                std::ranges::reverse(row);
-
-                const auto records = splitString(row, ',');
-
-                if (records.size() != 2) {
-                    spdlog::error(fmt::format("Wrong records number in the CSV file: {}", path));
-                    ifs.close();
-                    return oldestHyperliquidDate;
-                }
-                ifs.close();
-                return std::stoll(records[0]);
-            }
-        } else {
-            row.push_back(c);
-        }
-    }
-    ifs.close();
-    return oldestHyperliquidDate;
+    return CsvData::lastValidRecord(path, 2, oldestHyperliquidDate).timestamp;
 }
 
 bool HyperliquidDownloader::P::writeFundingRatesToCSVFile(const std::vector<FundingRate> &fr,
@@ -463,8 +393,10 @@ void HyperliquidDownloader::updateMarketData(const std::string &dirPath,
                                            if (!real.empty()) {
                                                if (!P::writeCandlesToCSVFile(real, symbolFilePathCsv.string(),
                                                                              fromTimeStamp)) {
-                                                   spdlog::warn(
-                                                       fmt::format("CSV file for symbol: {} update failed", symbol));
+                                                   // Abort pagination — continuing after a failed batch write
+                                                   // would leave a permanent gap inside the CSV.
+                                                   throw std::runtime_error(
+                                                       fmt::format("CSV write failed for symbol: {}", symbol));
                                                }
                                            }
                                        });

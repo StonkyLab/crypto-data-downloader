@@ -8,6 +8,7 @@ Copyright (c) 2025 Vitezslav Kot <vitezslav.kot@stonky.cz>, Stonky s.r.o.
 
 #include "stonky/binance/binance_common.h"
 #include "stonky/binance/binance_models.h"
+#include "stonky/csv_data.h"
 #include "stonky/utils/utils.h"
 #include "stonky/utils/semaphore.h"
 #include <filesystem>
@@ -122,54 +123,22 @@ bool BinanceCommon::writeCandlesToCSVFile(const std::vector<Candle> &candles, co
         ofs << candle.ignore << std::endl;
     }
 
+    ofs.flush();
+    if (!ofs.good()) {
+        spdlog::error(fmt::format("Write to file failed (disk full?): {}", path));
+        ofs.close();
+        return false;
+    }
     ofs.close();
     return true;
 }
 
 int64_t BinanceCommon::checkSymbolCSVFile(const std::string &path) {
     constexpr int64_t oldestBNBDate = 1420070400000; /// Thursday 1. January 2015 0:00:00
-
-    std::ifstream ifs;
-    ifs.open(path, std::ios::ate);
-
-    if (!ifs.is_open()) {
-        if (std::filesystem::exists(path)) {
-            spdlog::error(fmt::format("Couldn't open file: {}", path));
-        }
-        return oldestBNBDate;
-    }
-
-    /// Read last row
-    const std::streampos size = ifs.tellg();
-    char c;
-    std::string row;
-    int endLines = 0;
-
-    for (int i = 1; i <= size; i++) {
-        ifs.seekg(-i, std::ios::end);
-        ifs.get(c);
-
-        if (c == '\n') {
-            endLines++;
-            if (endLines >= 1 && !row.empty()) {
-                std::ranges::reverse(row);
-
-                const auto records = splitString(row, ',');
-
-                if (records.size() != 12) {
-                    spdlog::error(fmt::format("Wrong records number in the CSV file: {}", path));
-                    ifs.close();
-                    return oldestBNBDate;
-                }
-                ifs.close();
-                return std::stoll(records[0]);
-            }
-        } else {
-            row.push_back(c);
-        }
-    }
-    ifs.close();
-    return oldestBNBDate;
+    // Self-healing read: a torn tail (interrupted write) is truncated instead of
+    // resetting the resume point to oldestBNBDate, which used to silently
+    // re-download and append the entire history.
+    return CsvData::lastValidRecord(path, 12, oldestBNBDate).timestamp;
 }
 
 void BinanceCommon::convertFromCSVToT6(const std::vector<std::filesystem::path> &filePaths,

@@ -9,6 +9,7 @@ Copyright (c) 2025 Vitezslav Kot <vitezslav.kot@stonky.cz>, Stonky s.r.o.
 #include "stonky/binance/binance_futures_downloader.h"
 #include "stonky/binance/binance_futures_rest_client.h"
 #include "stonky/binance/binance_common.h"
+#include "stonky/csv_data.h"
 #include "stonky/downloader.h"
 #include "stonky/utils/semaphore.h"
 #include "stonky/utils/utils.h"
@@ -46,7 +47,8 @@ struct BinanceFuturesDownloader::P {
 
     static int64_t checkFundingRatesCSVFile(const std::string &path);
 
-    static bool writeFundingRatesToCSVFile(const std::vector<futures::FundingRate> &fr, const std::string &path);
+    static bool writeFundingRatesToCSVFile(const std::vector<futures::FundingRate> &fr, const std::string &path,
+                                           std::int64_t lastTs);
 };
 
 BinanceFuturesDownloader::BinanceFuturesDownloader(std::uint32_t maxJobs, bool deleteDelistedData) : m_p(
@@ -57,52 +59,13 @@ BinanceFuturesDownloader::~BinanceFuturesDownloader() = default;
 
 int64_t BinanceFuturesDownloader::P::checkFundingRatesCSVFile(const std::string &path) {
     constexpr int64_t oldestBNBDate = 1420070400000; /// Thursday 1. January 2015 0:00:00
-
-    std::ifstream ifs;
-    ifs.open(path, std::ios::ate);
-
-    if (!ifs.is_open()) {
-        if (std::filesystem::exists(path)) {
-            spdlog::error(fmt::format("Couldn't open file: {}", path));
-        }
-        return oldestBNBDate;
-    }
-
-    /// Read last row
-    const std::streampos size = ifs.tellg();
-    char c;
-    std::string row;
-    int endLines = 0;
-
-    for (int i = 1; i <= size; i++) {
-        ifs.seekg(-i, std::ios::end);
-        ifs.get(c);
-
-        if (c == '\n') {
-            endLines++;
-            if (endLines >= 1 && !row.empty()) {
-                std::ranges::reverse(row);
-
-                const auto records = splitString(row, ',');
-
-                if (records.size() != 2) {
-                    spdlog::error(fmt::format("Wrong records number in the CSV file: {}", path));
-                    ifs.close();
-                    return oldestBNBDate;
-                }
-                ifs.close();
-                return std::stoll(records[0]);
-            }
-        } else {
-            row.push_back(c);
-        }
-    }
-    ifs.close();
-    return oldestBNBDate;
+    // Self-healing read: a torn tail (interrupted write) is truncated instead of
+    // resetting the resume point to oldestBNBDate.
+    return CsvData::lastValidRecord(path, 2, oldestBNBDate).timestamp;
 }
 
 bool BinanceFuturesDownloader::P::writeFundingRatesToCSVFile(const std::vector<futures::FundingRate> &fr,
-                                                             const std::string &path) {
+                                                             const std::string &path, const std::int64_t lastTs) {
     const std::filesystem::path pathToCSVFile{path};
 
     std::ofstream ofs;
@@ -126,11 +89,25 @@ bool BinanceFuturesDownloader::P::writeFundingRatesToCSVFile(const std::vector<f
                 << std::endl;
     }
 
+    // Monotonic filter: skips both the inclusive resume-boundary record and
+    // page-boundary duplicates the client merges into one vector (records
+    // repeated at 1000-row fetch boundaries).
+    std::int64_t prevTs = lastTs;
     for (const auto &record: fr) {
+        if (record.fundingTime <= prevTs) {
+            continue;
+        }
         ofs << record.fundingTime << ",";
         ofs << record.fundingRate << std::endl;
+        prevTs = record.fundingTime;
     }
 
+    ofs.flush();
+    if (!ofs.good()) {
+        spdlog::error(fmt::format("Write to file failed (disk full?): {}", path));
+        ofs.close();
+        return false;
+    }
     ofs.close();
 
     return true;
@@ -548,7 +525,7 @@ void BinanceFuturesDownloader::updateFundingRateData(const std::string &dirPath,
                                        }
                                    }
 
-                                   if (P::writeFundingRatesToCSVFile(fr, symbolFilePathCsv.string())) {
+                                   if (P::writeFundingRatesToCSVFile(fr, symbolFilePathCsv.string(), fromTimeStamp)) {
                                        spdlog::info(fmt::format("CSV file for symbol: {} updated", symbol));
                                        return symbolFilePathCsv;
                                    }

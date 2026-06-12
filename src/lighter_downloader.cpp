@@ -7,6 +7,7 @@ Copyright (c) 2026 Vitezslav Kot <vitezslav.kot@stonky.cz>, Stonky s.r.o.
 */
 
 #include "stonky/lighter/lighter_downloader.h"
+#include "stonky/csv_data.h"
 #include "stonky/downloader.h"
 #include "stonky/lighter/lighter_rest_client.h"
 #include "stonky/lighter/lighter.h"
@@ -229,7 +230,8 @@ bool LighterDownloader::P::writeCandlesToCSVFile(const std::vector<Candle> &cand
     }
 
     for (const auto &candle: candles) {
-        if (candle.openTime == lastTs) {
+        // <= guards against any overlap with already-persisted data
+        if (candle.openTime <= lastTs) {
             continue;
         }
         ofs << candle.openTime << ",";
@@ -240,98 +242,26 @@ bool LighterDownloader::P::writeCandlesToCSVFile(const std::vector<Candle> &cand
         ofs << candle.baseVolume << std::endl;
     }
 
+    ofs.flush();
+    if (!ofs.good()) {
+        spdlog::error(fmt::format("Write to file failed (disk full?): {}", path));
+        ofs.close();
+        return false;
+    }
     ofs.close();
     return true;
 }
 
 int64_t LighterDownloader::P::checkSymbolCSVFile(const std::string &path) {
     constexpr int64_t oldestLighterDate = 1704067200000; /// Monday 1. January 2024 0:00:00
-
-    std::ifstream ifs;
-    ifs.open(path, std::ios::ate);
-
-    if (!ifs.is_open()) {
-        if (std::filesystem::exists(path)) {
-            spdlog::error(fmt::format("Couldn't open file: {}", path));
-        }
-        return oldestLighterDate;
-    }
-
-    const std::streampos size = ifs.tellg();
-    char c;
-    std::string row;
-    int endLines = 0;
-
-    for (int i = 1; i <= size; i++) {
-        ifs.seekg(-i, std::ios::end);
-        ifs.get(c);
-
-        if (c == '\n') {
-            endLines++;
-            if (endLines >= 1 && !row.empty()) {
-                std::ranges::reverse(row);
-
-                const auto records = splitString(row, ',');
-
-                if (records.size() != 6) {
-                    spdlog::error(fmt::format("Wrong records number in the CSV file: {}", path));
-                    ifs.close();
-                    return oldestLighterDate;
-                }
-                ifs.close();
-                return std::stoll(records[0]);
-            }
-        } else {
-            row.push_back(c);
-        }
-    }
-    ifs.close();
-    return oldestLighterDate;
+    // Self-healing read: a torn tail (interrupted write) is truncated instead of
+    // resetting the resume point to the oldest-date sentinel.
+    return CsvData::lastValidRecord(path, 6, oldestLighterDate).timestamp;
 }
 
 int64_t LighterDownloader::P::checkFundingRatesCSVFile(const std::string &path) {
     constexpr int64_t oldestLighterDate = 1704067200000; /// Monday 1. January 2024 0:00:00
-
-    std::ifstream ifs;
-    ifs.open(path, std::ios::ate);
-
-    if (!ifs.is_open()) {
-        if (std::filesystem::exists(path)) {
-            spdlog::error(fmt::format("Couldn't open file: {}", path));
-        }
-        return oldestLighterDate;
-    }
-
-    const std::streampos size = ifs.tellg();
-    char c;
-    std::string row;
-    int endLines = 0;
-
-    for (int i = 1; i <= size; i++) {
-        ifs.seekg(-i, std::ios::end);
-        ifs.get(c);
-
-        if (c == '\n') {
-            endLines++;
-            if (endLines >= 1 && !row.empty()) {
-                std::ranges::reverse(row);
-
-                const auto records = splitString(row, ',');
-
-                if (records.size() != 2) {
-                    spdlog::error(fmt::format("Wrong records number in the CSV file: {}", path));
-                    ifs.close();
-                    return oldestLighterDate;
-                }
-                ifs.close();
-                return std::stoll(records[0]);
-            }
-        } else {
-            row.push_back(c);
-        }
-    }
-    ifs.close();
-    return oldestLighterDate;
+    return CsvData::lastValidRecord(path, 2, oldestLighterDate).timestamp;
 }
 
 bool LighterDownloader::P::writeFundingRatesToCSVFile(const std::vector<FundingRate> &fr,
@@ -546,8 +476,10 @@ void LighterDownloader::updateMarketData(const std::string &dirPath,
                                            if (!real.empty()) {
                                                if (!P::writeCandlesToCSVFile(real, symbolFilePathCsv.string(),
                                                                              fromTimeStamp)) {
-                                                   spdlog::warn(
-                                                       fmt::format("CSV file for symbol: {} update failed", symbol));
+                                                   // Abort pagination — continuing after a failed batch write
+                                                   // would leave a permanent gap inside the CSV.
+                                                   throw std::runtime_error(
+                                                       fmt::format("CSV write failed for symbol: {}", symbol));
                                                }
                                            }
                                        });

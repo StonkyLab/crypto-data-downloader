@@ -7,6 +7,7 @@ Copyright (c) 2025 Vitezslav Kot <vitezslav.kot@stonky.cz>, Stonky s.r.o.
 */
 
 #include "stonky/okx/okx_downloader.h"
+#include "stonky/csv_data.h"
 #include "stonky/okx/okx.h"
 #include "stonky/okx/okx_rest_client.h"
 #include "stonky/okx/okx_market_data_utils.h"
@@ -206,94 +207,15 @@ bool OKXDownloader::P::writeCandlesToCSVFile(const std::vector<Candle> &candles,
 
 int64_t OKXDownloader::P::checkSymbolCSVFile(const std::string &path) {
     constexpr int64_t oldestBybitDate = 1420070400000; /// Thursday 1. January 2015 0:00:00
-
-    std::ifstream ifs;
-    ifs.open(path, std::ios::ate);
-
-    if (!ifs.is_open()) {
-        if (std::filesystem::exists(path)) {
-            spdlog::error(fmt::format("Couldn't open file: {}", path));
-        }
-        return oldestBybitDate;
-    }
-
-    /// Read last row
-    const std::streampos size = ifs.tellg();
-    char c;
-    std::string row;
-    int endLines = 0;
-
-    for (int i = 1; i <= size; i++) {
-        ifs.seekg(-i, std::ios::end);
-        ifs.get(c);
-
-        if (c == '\n') {
-            endLines++;
-            if (endLines >= 1 && !row.empty()) {
-                std::ranges::reverse(row);
-
-                const auto records = splitString(row, ',');
-
-                if (records.size() != 8) {
-                    spdlog::error(fmt::format("Wrong records number in the CSV file: {}", path));
-                    ifs.close();
-                    return oldestBybitDate;
-                }
-                ifs.close();
-                return std::stoll(records[0]);
-            }
-        } else {
-            row.push_back(c);
-        }
-    }
-    ifs.close();
-    return oldestBybitDate;
+    // Self-healing read: a torn tail (interrupted write) is truncated instead of
+    // resetting the resume point to the oldest-date sentinel, which used to
+    // silently re-download and append the entire history.
+    return CsvData::lastValidRecord(path, 8, oldestBybitDate).timestamp;
 }
 
 int64_t OKXDownloader::P::checkFundingRatesCSVFile(const std::string &path) {
     constexpr int64_t oldestDate = 1420070400000; /// Thursday 1. January 2015 0:00:00
-
-    std::ifstream ifs;
-    ifs.open(path, std::ios::ate);
-
-    if (!ifs.is_open()) {
-        if (std::filesystem::exists(path)) {
-            spdlog::error(fmt::format("Couldn't open file: {}", path));
-        }
-        return oldestDate;
-    }
-
-    /// Read last row
-    const std::streampos size = ifs.tellg();
-    char c;
-    std::string row;
-    int endLines = 0;
-
-    for (int i = 1; i <= size; i++) {
-        ifs.seekg(-i, std::ios::end);
-        ifs.get(c);
-
-        if (c == '\n') {
-            endLines++;
-            if (endLines >= 1 && !row.empty()) {
-                std::ranges::reverse(row);
-
-                const auto records = splitString(row, ',');
-
-                if (records.size() != 2) {
-                    spdlog::error(fmt::format("Wrong records number in the CSV file: {}", path));
-                    ifs.close();
-                    return oldestDate;
-                }
-                ifs.close();
-                return std::stoll(records[0]);
-            }
-        } else {
-            row.push_back(c);
-        }
-    }
-    ifs.close();
-    return oldestDate;
+    return CsvData::lastValidRecord(path, 2, oldestDate).timestamp;
 }
 
 bool OKXDownloader::P::writeFundingRatesToCSVFile(const std::vector<FundingRate> &fr, const std::string &path) {

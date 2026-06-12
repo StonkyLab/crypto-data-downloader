@@ -13,6 +13,7 @@ Copyright (c) 2025 Vitezslav Kot <vitezslav.kot@stonky.cz>, Stonky s.r.o.
 #include "stonky/mexc/mexc_spot_downloader.h"
 #include "stonky/hyperliquid/hyperliquid_downloader.h"
 #include "stonky/lighter/lighter_downloader.h"
+#include "stonky/csv_verifier.h"
 #include "stonky/downloader.h"
 #include "stonky/binance/binance_spot_downloader.h"
 #include <spdlog/spdlog.h>
@@ -27,7 +28,7 @@ Copyright (c) 2025 Vitezslav Kot <vitezslav.kot@stonky.cz>, Stonky s.r.o.
 
 #undef max
 
-#define VERSION "2.3.0"
+#define VERSION "2.4.0"
 
 using namespace stonky;
 
@@ -82,6 +83,8 @@ int main(int argc, char **argv) {
     auto marketCategory = MarketCategory::Futures;
     bool convertToT6 = false;
     bool keepDelistedData = true;
+    bool verifyData = false;
+    bool repairData = false;
     std::uint32_t maxJobs = static_cast<std::uint32_t>(std::max(std::floor(std::thread::hardware_concurrency() * 0.75),
                                                                 1.0));
 
@@ -107,6 +110,8 @@ int main(int argc, char **argv) {
              cxxopts::value<std::string>()->default_value("f"))
             ("d,delete_delisted", R"(Delete delisted symbols data files, if not specified delisted files will be preserved)")
             ("z,t6_conversion", R"(Convert existing CSV data to T6 format (Zorro Trader format) without downloading new data)")
+            ("y,verify", R"(Verify CSV data integrity (torn lines, duplicates, ordering, gaps) without downloading, example: -e bybit -o /data/bybit -b 1 -y)")
+            ("r,repair", R"(Verify and repair CSV data files in place (removes torn lines and duplicates, restores ordering), example: -e bybit -o /data/bybit -b 1 -r)")
             ("v,version", R"(Print version and quit)")
             ("h,help", R"(Print usage and quit)");
     try {
@@ -302,6 +307,8 @@ int main(int argc, char **argv) {
 
         convertToT6 = parseResult["t6_conversion"].as<bool>();
         keepDelistedData = !parseResult["delete_delisted"].as<bool>();
+        verifyData = parseResult["verify"].as<bool>();
+        repairData = parseResult["repair"].as<bool>();
     } catch (const std::exception &) {
         spdlog::critical("Wrong parameters!");
         spdlog::info(options.help());
@@ -316,6 +323,54 @@ int main(int argc, char **argv) {
         register_logger(combinedLogger);
         set_default_logger(combinedLogger);
         spdlog::flush_on(spdlog::level::info);
+
+        if (verifyData || repairData) {
+            CsvVerifier::Options verifierOptions;
+            verifierOptions.repair = repairData;
+            verifierOptions.maxJobs = maxJobs;
+
+            if (exchange == "bnb") {
+                verifierOptions.expectedFields = 12;
+            } else if (exchange == "okx") {
+                verifierOptions.expectedFields = 8;
+            } else if (exchange == "mexc") {
+                verifierOptions.expectedFields = 7;
+                verifierOptions.allowMoreFields = true;
+            } else {
+                verifierOptions.expectedFields = 6; // bybit, hl, lt
+            }
+            if (exchange == "bybit") {
+                // Salvage legacy 7-column rows (trailing turnover) found in old 1h files
+                verifierOptions.salvageExtraField = true;
+            }
+
+            std::filesystem::path verifyDir(outputDirectory);
+            if (dataType == "fr") {
+                verifyDir.append(CSV_FUT_FR_DIR);
+                verifierOptions.expectedFields = 2;
+                verifierOptions.allowMoreFields = false;
+                verifierOptions.salvageExtraField = false;
+                verifierOptions.intervalMs = 0; // funding cadence varies per symbol
+            } else {
+                verifyDir.append(marketCategory == MarketCategory::Spot ? CSV_SPOT_DIR : CSV_FUT_DIR);
+                verifyDir.append(Downloader::minutesToString(barSizeInMinutes));
+                // Hyperliquid/Lighter drop zero-volume bars, so gaps are expected there
+                verifierOptions.intervalMs = (exchange == "hl" || exchange == "lt")
+                                                 ? 0
+                                                 : static_cast<std::int64_t>(barSizeInMinutes) * 60000;
+            }
+
+            const auto reports = CsvVerifier::verifyDirectory(verifyDir.string(), verifierOptions);
+
+            bool anyUnresolvedIssue = false;
+            for (const auto &report: reports) {
+                if (report.readFailed || (report.needsRepair() && !report.repaired)) {
+                    anyUnresolvedIssue = true;
+                    break;
+                }
+            }
+            return anyUnresolvedIssue ? 1 : 0;
+        }
 
         std::unique_ptr<IExchangeDownloader> downloader;
         const auto candleInterval = Downloader::minutesToCandleInterval(barSizeInMinutes);

@@ -7,6 +7,7 @@ Copyright (c) 2026 Vitezslav Kot <vitezslav.kot@stonky.cz>, Stonky s.r.o.
 */
 
 #include "stonky/mexc/mexc_spot_downloader.h"
+#include "stonky/csv_data.h"
 #include "stonky/mexc/mexc_spot_rest_client.h"
 #include "stonky/mexc/mexc.h"
 #include "stonky/downloader.h"
@@ -192,47 +193,9 @@ int64_t MEXCSpotDownloader::P::checkSymbolCSVFile(const std::string &path) {
     // For newly listed tokens or intervals with limited history, backward pagination
     // will stop when API returns empty results
     constexpr int64_t defaultStartDate = 1577836800000; // Wednesday 1. January 2020 0:00:00
-
-    std::ifstream ifs;
-    ifs.open(path, std::ios::ate);
-
-    if (!ifs.is_open()) {
-        if (std::filesystem::exists(path)) {
-            spdlog::error(fmt::format("Couldn't open file: {}", path));
-        }
-        return defaultStartDate;
-    }
-
-    const std::streampos size = ifs.tellg();
-    char c;
-    std::string row;
-    int endLines = 0;
-
-    for (int i = 1; i <= size; i++) {
-        ifs.seekg(-i, std::ios::end);
-        ifs.get(c);
-
-        if (c == '\n') {
-            endLines++;
-            if (endLines >= 1 && !row.empty()) {
-                std::ranges::reverse(row);
-                const auto records = splitString(row, ',');
-
-                if (records.size() < 7) {
-                    spdlog::error(fmt::format("Wrong records number in the CSV file: {}", path));
-                    ifs.close();
-                    return defaultStartDate;
-                }
-                ifs.close();
-                // Return timestamp of last candle (backward pagination will handle the rest)
-                return std::stoll(records[0]);
-            }
-        } else {
-            row.push_back(c);
-        }
-    }
-    ifs.close();
-    return defaultStartDate;
+    // Self-healing read: a torn tail (interrupted write) is truncated instead of
+    // resetting the resume point to the default start date.
+    return CsvData::lastValidRecord(path, 7, defaultStartDate, true).timestamp;
 }
 
 bool MEXCSpotDownloader::P::writeCandlesToCSVFile(const std::vector<Candle> &candles, const std::string &path) {

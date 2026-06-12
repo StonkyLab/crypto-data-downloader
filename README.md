@@ -16,6 +16,7 @@ A high-performance command-line utility for downloading historical market data (
 - **Symbol Filtering**: Download specific symbols or all available pairs
 - **Multiple Timeframes**: Support for various bar sizes (1m, 5m, 15m, 1h, etc.)
 - **Market Categories**: Supports both Spot and Futures markets
+- **Data Integrity**: Self-healing resume after interrupted writes, plus a built-in verify/repair mode (`-y` / `-r`)
 
 ## Supported Exchanges
 
@@ -213,6 +214,8 @@ crypto_data_downloader [OPTIONS]
 | `-c` | `--category` | Market category: `f` (futures), `s` (spot) | `f` |
 | `-d` | `--delete_delisted` | Delete delisted symbols data files | - |
 | `-z` | `--t6_conversion` | Convert existing CSV data to T6 format (Zorro Trader) without downloading | - |
+| `-y` | `--verify` | Verify CSV data integrity (torn lines, duplicates, ordering, gaps) without downloading | - |
+| `-r` | `--repair` | Verify and repair CSV data files in place | - |
 | `-v` | `--version` | Print version and exit | - |
 | `-h` | `--help` | Print help and exit | - |
 
@@ -302,6 +305,34 @@ crypto_data_downloader [OPTIONS]
 ```bash
 ./crypto_data_downloader -z -o /data/binance -e bnb -b 60 -c s
 ```
+
+**Verify Bybit 1-minute candle data integrity (no download, no modification):**
+```bash
+./crypto_data_downloader -e bybit -o /data/bybit -b 1 -y
+```
+
+**Verify and repair Bybit funding rate files in place:**
+```bash
+./crypto_data_downloader -e bybit -o /data/bybit -t fr -r
+```
+
+### Data Integrity
+
+An interrupted run (kill, power loss, full disk) can leave a partially written
+last line in a CSV file. Since v2.4.0 the downloader self-heals on the next
+run: the torn tail is truncated and the download resumes from the last valid
+record. (Older versions instead reset the resume point and silently appended a
+full duplicate of the symbol's history — if your data predates v2.4.0, run
+`--repair` once per data directory to clean it up.)
+
+The verify mode (`-y`) checks every CSV file in the selected directory for
+torn/glued lines, duplicate timestamps, out-of-order blocks and gaps. The
+repair mode (`-r`) additionally rewrites affected files in place (atomic
+replace): malformed lines are dropped, duplicates removed (first occurrence
+wins), ordering restored, and legacy Bybit 7-column rows converted to the
+current 6-column format. Gaps are only reported — missing data cannot be
+restored locally; delete the affected file and re-download where the exchange
+still serves the range.
 
 ## Output Format
 
