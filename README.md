@@ -334,6 +334,13 @@ current 6-column format. Gaps are only reported — missing data cannot be
 restored locally; delete the affected file and re-download where the exchange
 still serves the range.
 
+Gap analysis is automatically skipped where missing bars are exchange-native
+rather than a data defect: Hyperliquid and Lighter (zero-volume bars are
+filtered during download) and Binance Spot (the kline API omits zero-trade
+intervals entirely; exchange-wide outages in 2021 also left holes in every
+symbol trading at the time). A re-download can never fill these gaps — the
+data does not exist on the exchange.
+
 ## Output Format
 
 ### Candle Data (CSV)
