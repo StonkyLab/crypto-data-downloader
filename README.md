@@ -334,12 +334,19 @@ current 6-column format. Gaps are only reported — missing data cannot be
 restored locally; delete the affected file and re-download where the exchange
 still serves the range.
 
-Gap analysis is automatically skipped where missing bars are exchange-native
-rather than a data defect: Hyperliquid and Lighter (zero-volume bars are
-filtered during download) and Binance Spot (the kline API omits zero-trade
+Gap analysis is automatically skipped for Binance Spot, where missing bars are
+exchange-native rather than a data defect (the kline API omits zero-trade
 intervals entirely; exchange-wide outages in 2021 also left holes in every
 symbol trading at the time). A re-download can never fill these gaps — the
 data does not exist on the exchange.
+
+> **Note:** Versions before 2.4.0 filtered zero-volume bars from Hyperliquid
+> and Lighter downloads, leaving artificial gaps (both exchanges serve a
+> continuous series where no-trade bars legitimately carry zero volume).
+> Since 2.4.0 all bars are stored as-is. To refill the artificial gaps in
+> previously downloaded data, delete the affected price CSVs and re-download
+> (Lighter retains full history; Hyperliquid only the most recent ~5 000 bars
+> per interval).
 
 ## Output Format
 

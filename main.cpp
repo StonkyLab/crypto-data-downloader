@@ -355,11 +355,12 @@ int main(int argc, char **argv) {
                 verifyDir.append(marketCategory == MarketCategory::Spot ? CSV_SPOT_DIR : CSV_FUT_DIR);
                 verifyDir.append(Downloader::minutesToString(barSizeInMinutes));
                 // Gap analysis is skipped where missing bars are exchange-native:
-                // Hyperliquid/Lighter (zero-volume bars are filtered on download) and
                 // Binance spot (the kline API omits zero-trade intervals entirely,
                 // plus exchange-wide 2021 outages left mid-minute holes everywhere).
-                const bool gapsExpected = exchange == "hl" || exchange == "lt" ||
-                                          (exchange == "bnb" && marketCategory == MarketCategory::Spot);
+                // Hyperliquid/Lighter serve continuous series incl. zero-volume bars,
+                // so gaps there are meaningful (data downloaded before v2.4.0 had
+                // zero-volume bars filtered out — re-download to refill).
+                const bool gapsExpected = exchange == "bnb" && marketCategory == MarketCategory::Spot;
                 verifierOptions.intervalMs = gapsExpected
                                                  ? 0
                                                  : static_cast<std::int64_t>(barSizeInMinutes) * 60000;

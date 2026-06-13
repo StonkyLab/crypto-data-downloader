@@ -384,14 +384,13 @@ void HyperliquidDownloader::updateMarketData(const std::string &dirPath,
                                        symbol, hlInterval, effectiveFrom, nowTimestamp,
                                        [symbolFilePathCsv, symbol, fromTimeStamp](
                                        const std::vector<hyperliquid::Candle> &cnd) {
-                                           // Filter out zero-volume candles — Hyperliquid serves synthetic
-                                           // oracle prices (v=0, numTrades=0) before real trading began.
-                                           std::vector<hyperliquid::Candle> real;
-                                           for (const auto &c : cnd) {
-                                               if (c.volume > 0.0) real.push_back(c);
-                                           }
-                                           if (!real.empty()) {
-                                               if (!P::writeCandlesToCSVFile(real, symbolFilePathCsv.string(),
+                                           // Zero-volume bars are stored as-is: the exchange serves a
+                                           // continuous series and no-trade bars are needed downstream
+                                           // (MTM, funding, SL triggers). Note: bars before real trading
+                                           // began (pre-March-2023 era) also carry v=0 oracle prices —
+                                           // excluding those is an upstream universe-selection concern.
+                                           if (!cnd.empty()) {
+                                               if (!P::writeCandlesToCSVFile(cnd, symbolFilePathCsv.string(),
                                                                              fromTimeStamp)) {
                                                    // Abort pagination — continuing after a failed batch write
                                                    // would leave a permanent gap inside the CSV.

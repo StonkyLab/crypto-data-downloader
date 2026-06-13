@@ -467,14 +467,11 @@ void LighterDownloader::updateMarketData(const std::string &dirPath,
                                        symbol, ltInterval, effectiveFrom, nowTimestamp,
                                        [symbolFilePathCsv, symbol, fromTimeStamp](
                                        const std::vector<lighter::Candle> &cnd) {
-                                           // Filter out zero-volume candles — defensive against
-                                           // synthetic / oracle-only bars on newly listed markets.
-                                           std::vector<lighter::Candle> real;
-                                           for (const auto &c : cnd) {
-                                               if (c.baseVolume > 0.0) real.push_back(c);
-                                           }
-                                           if (!real.empty()) {
-                                               if (!P::writeCandlesToCSVFile(real, symbolFilePathCsv.string(),
+                                           // Zero-volume bars are stored as-is: Lighter serves a continuous
+                                           // series (~44% of bars on quieter markets carry v=0) and no-trade
+                                           // bars are needed downstream (MTM, funding, SL triggers).
+                                           if (!cnd.empty()) {
+                                               if (!P::writeCandlesToCSVFile(cnd, symbolFilePathCsv.string(),
                                                                              fromTimeStamp)) {
                                                    // Abort pagination — continuing after a failed batch write
                                                    // would leave a permanent gap inside the CSV.
