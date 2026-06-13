@@ -55,6 +55,7 @@ public:
         std::size_t duplicates = 0;  ///< duplicate timestamps, first kept
         std::size_t outOfOrder = 0;  ///< backward timestamp jumps, sorted on repair
         std::size_t gaps = 0;        ///< report-only
+        std::size_t missingBars = 0; ///< total bars missing across all gaps
         std::int64_t firstGapTs = 0;
         bool repaired = false;
         bool readFailed = false;

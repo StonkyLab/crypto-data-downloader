@@ -118,11 +118,15 @@ CsvVerifier::FileReport CsvVerifier::verifyFile(const std::string &path, const O
     // Gap analysis (report only)
     if (options.intervalMs > 0) {
         for (std::size_t i = 1; i < unique.size(); ++i) {
-            if (unique[i].ts - unique[i - 1].ts != options.intervalMs) {
+            const auto delta = unique[i].ts - unique[i - 1].ts;
+            if (delta != options.intervalMs) {
                 if (report.gaps == 0) {
                     report.firstGapTs = unique[i - 1].ts;
                 }
                 report.gaps++;
+                if (delta > options.intervalMs) {
+                    report.missingBars += static_cast<std::size_t>(delta / options.intervalMs - 1);
+                }
             }
         }
     }
@@ -218,9 +222,11 @@ std::vector<CsvVerifier::FileReport> CsvVerifier::verifyDirectory(const std::str
             const auto fileName = std::filesystem::path(report.path).filename().string();
             std::string gapInfo;
             if (report.gaps > 0) {
-                gapInfo = fmt::format(", gaps: {} (first after ts {} — not locally repairable, "
-                                      "delete file and re-download to refill)",
-                                      report.gaps, report.firstGapTs);
+                gapInfo = fmt::format(", gaps: {} ({} missing bars, first after {} UTC — short gaps at "
+                                      "identical times across symbols are exchange outages (not repairable); "
+                                      "large blocks may be refillable by delete + re-download)",
+                                      report.gaps, report.missingBars,
+                                      getDateTimeStringFromTimeStamp(report.firstGapTs, "%Y-%m-%d %H:%M", true));
             }
             spdlog::warn(fmt::format(
                 "{}: records: {}, malformed: {}, salvaged: {}, duplicates: {}, out-of-order: {}{}{}",
