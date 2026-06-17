@@ -68,25 +68,36 @@ CsvVerifier::FileReport CsvVerifier::verifyFile(const std::string &path, const O
         const auto fields = splitString(line, ',');
         std::int64_t ts = 0;
 
-        const bool countOk = options.allowMoreFields
-                                 ? fields.size() >= options.expectedFields
-                                 : fields.size() == options.expectedFields;
-
-        if (countOk && parseTimestamp(fields[0], ts)) {
-            // valid record, keep as-is
-        } else if (!options.allowMoreFields && options.salvageExtraField &&
-                   fields.size() == options.expectedFields + 1 && parseTimestamp(fields[0], ts)) {
-            // Legacy row with one extra trailing column — rebuild without it
-            std::string rebuilt = fields[0];
-            for (std::size_t i = 1; i < options.expectedFields; ++i) {
-                rebuilt += ',';
-                rebuilt += fields[i];
+        if (options.allowMoreFields) {
+            // Variable-width layout (MEXC): require at least expectedFields, keep verbatim.
+            if (fields.size() < options.expectedFields || !parseTimestamp(fields[0], ts)) {
+                report.malformed++;
+                continue;
             }
-            line = rebuilt;
-            report.salvaged++;
         } else {
-            report.malformed++;
-            continue;
+            // Fixed-width layout. Accept rows with exactly expectedFields, plus
+            // (when salvaging) rows with extra value columns. Normalise every
+            // accepted row to the canonical first-expectedFields form so a stray
+            // trailing delimiter — an empty legacy turnover column that
+            // splitString silently drops, leaving a 6-token row whose raw text
+            // still has 7 comma-separated fields and breaks downstream pandas —
+            // is rewritten cleanly.
+            const bool exact = fields.size() == options.expectedFields;
+            const bool extra = options.salvageExtraField && fields.size() > options.expectedFields;
+            if ((!exact && !extra) || !parseTimestamp(fields[0], ts)) {
+                report.malformed++;
+                continue;
+            }
+            const bool trailingDelim = !line.empty() && line.back() == ',';
+            if (!exact || trailingDelim) {
+                std::string canonical = fields[0];
+                for (std::size_t i = 1; i < options.expectedFields; ++i) {
+                    canonical += ',';
+                    canonical += fields[i];
+                }
+                line = std::move(canonical);
+                report.salvaged++;
+            }
         }
 
         if (prevTs >= 0 && ts < prevTs) {
