@@ -60,3 +60,15 @@ set(SOURCES
 
 add_executable(crypto_data_downloader main.cpp ${SOURCES} ${HEADERS})
 target_link_libraries(crypto_data_downloader PRIVATE spdlog::spdlog_header_only binance_api bybit_api okx_api mexc_api hyperliquid_api lighter_api)
+
+# hyperliquid_api and lighter_api build as DLLs (MODULE_MANAGER). Windows has no
+# rpath and vcpkg's applocal copies only vcpkg DLLs, so drop our own module DLLs
+# next to the executable or it fails to start ("cannot find hyperliquid_api.dll").
+# On Linux the build-tree rpath already resolves the .so from their subdirs.
+if (WIN32)
+    add_custom_command(TARGET crypto_data_downloader POST_BUILD
+            COMMAND ${CMAKE_COMMAND} -E copy_if_different
+            $<TARGET_FILE:hyperliquid_api> $<TARGET_FILE:lighter_api>
+            $<TARGET_FILE_DIR:crypto_data_downloader>
+            COMMAND_EXPAND_LISTS)
+endif ()
