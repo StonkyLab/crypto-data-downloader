@@ -58,3 +58,6 @@ All notable changes to this project will be documented in this file. This projec
 - Add `-x/--xperp` for OKX X-Perps (USD-settled perpetual-style futures, `instType=FUTURES` / `ruleType=xperp`), stored under `<output>/xperp/`. Candles come from the bulk archive; funding rates only from REST, because the archive's funding module rejects `instType=FUTURES` — that history decays after ~3 months and needs regular collection
 - Parse `ruleType` on OKX instruments (separates X-Perps from the ordinary dated futures on the same endpoint)
 - Floor archive listing windows onto OKX's own file boundaries: `market-data-history` returns a file only when `begin` falls on or before the day its period starts, so asking from an instrument's listing timestamp silently dropped its entire listing month
+- Stop discarding archive rows flagged `confirm=0`. OKX writes 0 into the bulk files for whole stretches of history (2023-09-01 to 2024-07-18 for every symbol), and the parser threw those rows away — the cause of the multi-month holes across the dataset
+- Read ZIP entries in a loop instead of trusting a single `mz_zip_reader_entry_read()`, and fail loudly on a short read; a monthly file was being truncated to its first ~116 KB
+- Filter archive rows by instrument name: "futureschain" files are keyed by instrument family and can hold several contracts

@@ -657,7 +657,9 @@ void OKXDownloader::updateMarketData(const std::string &dirPath,
                                         candles = withRetry(fmt::format("download {}", fileInfo.filename), [&] {
                                             const auto zipData = RESTClient::downloadMarketDataFile(fileInfo.url);
                                             const auto csvData = okx::utils::extractZip(zipData);
-                                            return okx::utils::parseCandlesCsv(csvData);
+                                            // Archive files are keyed by instrument family, so keep
+                                            // only this contract's rows — see parseCandlesCsv()
+                                            return okx::utils::parseCandlesCsv(csvData, symbol);
                                         });
                                     } catch (const std::exception &e) {
                                         // Never skip forward past a failed file: the CSV is append-only
@@ -994,7 +996,7 @@ void OKXDownloader::updateFundingRateData(const std::string &dirPath,
                                        rates = withRetry(fmt::format("download {}", fileInfo.filename), [&] {
                                            const auto zipData = RESTClient::downloadMarketDataFile(fileInfo.url);
                                            const auto csvData = okx::utils::extractZip(zipData);
-                                           return okx::utils::parseFundingRateCsv(csvData);
+                                           return okx::utils::parseFundingRateCsv(csvData, symbol);
                                        });
                                    } catch (const std::exception &e) {
                                        // Append-only file: skipping forward past a failure would leave a
