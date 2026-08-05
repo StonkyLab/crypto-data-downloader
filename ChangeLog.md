@@ -57,3 +57,4 @@ All notable changes to this project will be documented in this file. This projec
 - Raise the OKX `market-data-history` rate limiter from 1 to 20 req/s (the endpoint advertises 60)
 - Add `-x/--xperp` for OKX X-Perps (USD-settled perpetual-style futures, `instType=FUTURES` / `ruleType=xperp`), stored under `<output>/xperp/`. Candles come from the bulk archive; funding rates only from REST, because the archive's funding module rejects `instType=FUTURES` — that history decays after ~3 months and needs regular collection
 - Parse `ruleType` on OKX instruments (separates X-Perps from the ordinary dated futures on the same endpoint)
+- Floor archive listing windows onto OKX's own file boundaries: `market-data-history` returns a file only when `begin` falls on or before the day its period starts, so asking from an instrument's listing timestamp silently dropped its entire listing month

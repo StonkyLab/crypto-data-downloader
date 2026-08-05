@@ -65,6 +65,27 @@ std::int64_t hkMonthStartMs(const std::int64_t tsMs) {
     return firstOfMonth.time_since_epoch().count() * MS_PER_DAY - HK_OFFSET_MS;
 }
 
+/// Start of the UTC+8 calendar day containing `tsMs`, as a UTC timestamp.
+std::int64_t hkDayStartMs(const std::int64_t tsMs) {
+    using namespace std::chrono;
+    const auto local = sys_time<milliseconds>(milliseconds{tsMs + HK_OFFSET_MS});
+    return floor<days>(local).time_since_epoch().count() * MS_PER_DAY - HK_OFFSET_MS;
+}
+
+/**
+ * Floor a listing window's start onto the archive's own file boundaries.
+ *
+ * market-data-history returns a file only when `begin` falls on or before the
+ * day its period STARTS — a window of [2026-07-09, 2026-07-31 16:00] answers
+ * with nothing at all, even though the 2026-07 file covers most of it. Asking
+ * from an instrument's listing timestamp (or from any mid-period resume point)
+ * therefore drops the whole period silently: a symbol listed on the 9th lost
+ * every bar of its listing month.
+ */
+std::int64_t archiveWindowStart(const std::int64_t tsMs, const DateAggrType dateAggrType) {
+    return dateAggrType == DateAggrType::monthly ? hkMonthStartMs(tsMs) : hkDayStartMs(tsMs);
+}
+
 /// Run a request with bounded retries. Transient OKX failures (rate limiting,
 /// gateway hiccups) must not translate into skipped archive files — a skipped
 /// file becomes a permanent hole, because the resume logic only ever appends
@@ -103,7 +124,9 @@ std::vector<MarketDataFileInfo> listArchiveFiles(const RESTClient &client,
     const std::int64_t windowMs = dateAggrType == DateAggrType::monthly ? MAX_MONTHLY_RANGE_MS : MAX_DAILY_RANGE_MS;
     std::map<std::string, MarketDataFileInfo> unique;
 
-    for (std::int64_t windowStart = begin; windowStart < end;) {
+    // Flooring happens here rather than at the call sites so no caller can
+    // forget it and lose a period without any error surfacing.
+    for (std::int64_t windowStart = archiveWindowStart(begin, dateAggrType); windowStart < end;) {
         const std::int64_t windowEnd = std::min(windowStart + windowMs, end);
 
         const auto history = withRetry(
@@ -613,7 +636,8 @@ void OKXDownloader::updateMarketData(const std::string &dirPath,
 
                                 for (const auto &fileInfo: listArchiveFiles(
                                          *m_p->okxClient, MarketDataModule::Candles1m, instrumentType,
-                                         instFamilyOrId, DateAggrType::monthly, fromTimeStamp, monthlyCutoff)) {
+                                         instFamilyOrId, DateAggrType::monthly,
+                                         fromTimeStamp, monthlyCutoff)) {
                                     archiveFiles.emplace_back(fileInfo, MONTHLY_FILE_SPAN_MS);
                                 }
                                 for (const auto &fileInfo: listArchiveFiles(
