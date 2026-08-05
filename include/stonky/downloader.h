@@ -18,6 +18,13 @@ static auto CSV_SPOT_DIR = "spot/prices/csv";
 static auto T6_FUT_DIR = "futures/prices/t6";
 static auto T6_SPOT_DIR = "spot/prices/t6";
 
+/// OKX X-Perps live in their own tree: they are USD-settled while the swaps
+/// next to them are USDT-settled, so mixing both products into one directory
+/// would leave nothing but the file name to tell them apart.
+static auto CSV_XPERP_DIR = "xperp/prices/csv";
+static auto CSV_XPERP_FR_DIR = "xperp/funding_rates/csv";
+static auto T6_XPERP_DIR = "xperp/prices/t6";
+
 class Downloader {
 public:
     static std::string minutesToString(const std::int32_t minutes) {

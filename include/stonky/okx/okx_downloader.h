@@ -20,7 +20,15 @@ class OKXDownloader final : public IExchangeDownloader {
     std::unique_ptr<P> m_p{};
 
 public:
-    explicit OKXDownloader(std::uint32_t maxJobs, MarketCategory marketCategory, bool deleteDelistedData = false);
+    /**
+     * @param xperp download OKX X-Perps (USD-settled, `instType=FUTURES`,
+     *              `ruleType=xperp`) instead of the USDT swaps. They are a
+     *              separate product with a separate directory tree, and their
+     *              funding rates exist only through the REST endpoint — the
+     *              bulk archive's funding module rejects `instType=FUTURES`.
+     */
+    explicit OKXDownloader(std::uint32_t maxJobs, MarketCategory marketCategory, bool deleteDelistedData = false,
+                           bool xperp = false);
 
     ~OKXDownloader() override;
 

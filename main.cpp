@@ -13,6 +13,7 @@ Copyright (c) 2025 Vitezslav Kot <vitezslav.kot@stonky.cz>, Stonky s.r.o.
 #include "stonky/mexc/mexc_spot_downloader.h"
 #include "stonky/hyperliquid/hyperliquid_downloader.h"
 #include "stonky/lighter/lighter_downloader.h"
+#include "stonky/candle_aggregator.h"
 #include "stonky/csv_verifier.h"
 #include "stonky/downloader.h"
 #include "stonky/binance/binance_spot_downloader.h"
@@ -28,7 +29,7 @@ Copyright (c) 2025 Vitezslav Kot <vitezslav.kot@stonky.cz>, Stonky s.r.o.
 
 #undef max
 
-#define VERSION "2.4.0"
+#define VERSION "2.5.0"
 
 using namespace stonky;
 
@@ -85,6 +86,8 @@ int main(int argc, char **argv) {
     bool keepDelistedData = true;
     bool verifyData = false;
     bool repairData = false;
+    bool xperp = false;
+    std::vector<std::string> aggregateTargets;
     std::uint32_t maxJobs = static_cast<std::uint32_t>(std::max(std::floor(std::thread::hardware_concurrency() * 0.75),
                                                                 1.0));
 
@@ -110,6 +113,9 @@ int main(int argc, char **argv) {
              cxxopts::value<std::string>()->default_value("f"))
             ("d,delete_delisted", R"(Delete delisted symbols data files, if not specified delisted files will be preserved)")
             ("z,t6_conversion", R"(Convert existing CSV data to T6 format (Zorro Trader format) without downloading new data)")
+            ("g,aggregate", R"(Aggregate the existing -b bar size into coarser timeframes (minutes, comma separated) without downloading, example: -o /data/okx -b 1 -g 5,60. OKX only publishes 1m bars in its bulk archive, so higher timeframes are built locally)",
+             cxxopts::value<std::vector<std::string> >()->default_value(""))
+            ("x,xperp", R"(OKX only: download X-Perps (USD-settled perpetual-style futures, instType FUTURES / ruleType xperp) instead of USDT swaps. Data land in <output>/xperp/. Their funding rates come from the REST endpoint only, which serves ~3 months)")
             ("y,verify", R"(Verify CSV data integrity (torn lines, duplicates, ordering, gaps) without downloading, example: -e bybit -o /data/bybit -b 1 -y)")
             ("r,repair", R"(Verify and repair CSV data files in place (removes torn lines and duplicates, restores ordering), example: -e bybit -o /data/bybit -b 1 -r)")
             ("v,version", R"(Print version and quit)")
@@ -309,6 +315,18 @@ int main(int argc, char **argv) {
         keepDelistedData = !parseResult["delete_delisted"].as<bool>();
         verifyData = parseResult["verify"].as<bool>();
         repairData = parseResult["repair"].as<bool>();
+        aggregateTargets = parseResult["aggregate"].as<std::vector<std::string> >();
+        std::erase_if(aggregateTargets, [](const std::string &s) { return s.empty(); });
+        xperp = parseResult["xperp"].as<bool>();
+
+        if (xperp && exchange != "okx") {
+            spdlog::error("The -x/--xperp option is OKX specific");
+            return -1;
+        }
+        if (xperp && marketCategory == MarketCategory::Spot) {
+            spdlog::error("X-Perps are a futures product, -x cannot be combined with -c s");
+            return -1;
+        }
     } catch (const std::exception &) {
         spdlog::critical("Wrong parameters!");
         spdlog::info(options.help());
@@ -323,6 +341,35 @@ int main(int argc, char **argv) {
         register_logger(combinedLogger);
         set_default_logger(combinedLogger);
         spdlog::flush_on(spdlog::level::info);
+
+        if (!aggregateTargets.empty()) {
+            CandleAggregator::Options aggregatorOptions;
+            aggregatorOptions.sourceMinutes = barSizeInMinutes;
+            aggregatorOptions.maxJobs = maxJobs;
+
+            for (const auto &target: aggregateTargets) {
+                try {
+                    const auto minutes = std::stoi(target);
+                    // Rejects an unrepresentable bar size before any file is touched
+                    (void) Downloader::minutesToString(minutes);
+                    aggregatorOptions.targetMinutes.push_back(minutes);
+                } catch (const std::exception &e) {
+                    spdlog::error(fmt::format("Invalid aggregation target '{}': {}", target, e.what()));
+                    return -1;
+                }
+            }
+
+            std::filesystem::path pricesDir(outputDirectory);
+            pricesDir.append(xperp
+                                 ? CSV_XPERP_DIR
+                                 : (marketCategory == MarketCategory::Spot ? CSV_SPOT_DIR : CSV_FUT_DIR));
+
+            const auto reports = CandleAggregator::aggregateDirectory(pricesDir.string(), aggregatorOptions);
+            const bool anyFailure = std::ranges::any_of(reports, [](const CandleAggregator::Report &r) {
+                return r.failed;
+            });
+            return anyFailure ? 1 : 0;
+        }
 
         if (verifyData || repairData) {
             CsvVerifier::Options verifierOptions;
@@ -346,13 +393,15 @@ int main(int argc, char **argv) {
 
             std::filesystem::path verifyDir(outputDirectory);
             if (dataType == "fr") {
-                verifyDir.append(CSV_FUT_FR_DIR);
+                verifyDir.append(xperp ? CSV_XPERP_FR_DIR : CSV_FUT_FR_DIR);
                 verifierOptions.expectedFields = 2;
                 verifierOptions.allowMoreFields = false;
                 verifierOptions.salvageExtraField = false;
                 verifierOptions.intervalMs = 0; // funding cadence varies per symbol
             } else {
-                verifyDir.append(marketCategory == MarketCategory::Spot ? CSV_SPOT_DIR : CSV_FUT_DIR);
+                verifyDir.append(xperp
+                                     ? CSV_XPERP_DIR
+                                     : (marketCategory == MarketCategory::Spot ? CSV_SPOT_DIR : CSV_FUT_DIR));
                 verifyDir.append(Downloader::minutesToString(barSizeInMinutes));
                 // Gap analysis is skipped where missing bars are exchange-native:
                 // Binance spot (the kline API omits zero-trade intervals entirely,
@@ -389,7 +438,7 @@ int main(int argc, char **argv) {
         } else if (exchange == "bybit") {
             downloader = std::make_unique<BybitDownloader>(maxJobs, marketCategory, deleteDelistedData);
         } else if (exchange == "okx") {
-            downloader = std::make_unique<OKXDownloader>(maxJobs, marketCategory, deleteDelistedData);
+            downloader = std::make_unique<OKXDownloader>(maxJobs, marketCategory, deleteDelistedData, xperp);
         } else if (exchange == "mexc" && marketCategory == MarketCategory::Futures) {
             downloader = std::make_unique<MEXCFuturesDownloader>(maxJobs, deleteDelistedData);
         } else if (exchange == "mexc" && marketCategory == MarketCategory::Spot) {

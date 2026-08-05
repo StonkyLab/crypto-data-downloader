@@ -214,6 +214,8 @@ crypto_data_downloader [OPTIONS]
 | `-c` | `--category` | Market category: `f` (futures), `s` (spot) | `f` |
 | `-d` | `--delete_delisted` | Delete delisted symbols data files | - |
 | `-z` | `--t6_conversion` | Convert existing CSV data to T6 format (Zorro Trader) without downloading | - |
+| `-g` | `--aggregate` | Aggregate the `-b` bar size into coarser timeframes (comma-separated minutes) without downloading | - |
+| `-x` | `--xperp` | OKX only: download X-Perps instead of USDT swaps, into `<output>/xperp/` | - |
 | `-y` | `--verify` | Verify CSV data integrity (torn lines, duplicates, ordering, gaps) without downloading | - |
 | `-r` | `--repair` | Verify and repair CSV data files in place | - |
 | `-v` | `--version` | Print version and exit | - |
@@ -240,6 +242,71 @@ crypto_data_downloader [OPTIONS]
 ```bash
 ./crypto_data_downloader -e okx -t fr -o /data/okx
 ```
+
+**Download OKX perpetual candles and build 5m/1h from them:**
+```bash
+./crypto_data_downloader -e okx -c f -b 1 -o /data/okx    # 1m only — see OKX notes below
+./crypto_data_downloader -o /data/okx -b 1 -g 5,60        # local aggregation, no network
+```
+
+### OKX history — what the exchange actually serves
+
+OKX splits historical market data between a bulk file archive
+(`/api/v5/public/market-data-history`, ZIP files on `static.okx.com`) and the
+paginated REST endpoints. The downloader uses both, and the split is not
+symmetric between candles and funding:
+
+| | bulk archive | REST endpoint |
+|---|---|---|
+| candles | 1-minute only, monthly files for complete months plus daily files for the last ~1 year | `/market/history-candles`, any bar size, back to the listing date, 100 bars per request |
+| funding | monthly files only, **no** daily aggregation | `/public/funding-rate-history`, **last ~3 months only** |
+
+Consequences worth knowing before trusting the dataset:
+
+- **History starts 2021-09.** The oldest archive file of any instrument is the
+  `2021-09` batch (2021-08-31 16:00 UTC). Candles reach further back through the
+  REST endpoint, but funding does not — so the downloader treats the archive
+  floor as the start of history for both.
+- **Funding for 2021-10, 2021-11 and 2021-12 does not exist.** OKX never
+  published those monthly files. The hole is in the exchange's archive, not in
+  the downloader; it cannot be filled from any endpoint.
+- **Archive files are cut on UTC+8 midnights.** A "2024-09" file starts
+  2024-08-31 16:00 UTC. Month boundaries are computed in that zone.
+- **Range limits are 10 months / 10 days.** `market-data-history` rejects longer
+  ranges with error `50077` / `50076`. The downloader walks the history in
+  9-month and 9-day windows.
+- **Higher timeframes are built locally** with `-g`, because the archive only
+  carries 1-minute bars.
+- **Delisted symbols stay in the update set.** `/public/instruments` lists only
+  live contracts, so when downloading `all`, symbols found on disk but no longer
+  on the exchange are refreshed too (unless `-d` is given). The bulk archive
+  still serves them, and dropping them would put survivorship bias into the
+  dataset.
+
+### OKX X-Perps (`-x`)
+
+Alongside the USDT swaps OKX lists **X-Perps** — `instType=FUTURES`,
+`ruleType=xperp`, instrument IDs like `BTC-USD_UM_XPERP-310404`. They carry a
+nominal ~2031 expiry that exists only to satisfy EEA regulation; economically
+they are linear, USD-settled perpetuals with 8-hour funding. The instrument
+catalog is byte-identical on `www.okx.com` and `eea.okx.com`, so market data
+needs no EEA host.
+
+`-x` switches the downloader to that product. Data land in `<output>/xperp/`,
+not in `futures/`, because the two products settle in different currencies and
+only the file name would otherwise distinguish them.
+
+The data sources are asymmetric, and one of them decays:
+
+- **Candles: bulk archive works.** `instType=FUTURES` with the family name
+  (`BTC-USD_UM_XPERP`) returns `...-futureschain-candlesticks-YYYY-MM.zip`
+  files in the same 10-column format as the swap archive.
+- **Funding: no bulk archive at all.** The archive's funding module accepts
+  only `instType=SWAP` and answers `50016 "Parameter instType doesn't match
+  parameter module"` for futures. The REST endpoint does serve X-Perp funding,
+  but only for roughly the last 3 months — so **X-Perp funding history is lost
+  unless it is collected regularly**. The product listed in 2026-03; by
+  2026-08 the first ~5 weeks of BTC X-Perp funding were already unreachable.
 
 **Download MEXC futures candles (hourly recommended):**
 ```bash

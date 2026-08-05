@@ -29,6 +29,7 @@ include_directories(include stonky-cpp-common/include binance-cpp-api/include by
 
 set(HEADERS
         include/stonky/downloader.h
+        include/stonky/candle_aggregator.h
         include/stonky/csv_data.h
         include/stonky/csv_verifier.h
         include/stonky/binance/binance_futures_downloader.h
@@ -43,6 +44,7 @@ set(HEADERS
 )
 
 set(SOURCES
+        src/candle_aggregator.cpp
         src/csv_data.cpp
         src/csv_verifier.cpp
         src/binance_futures_downloader.cpp

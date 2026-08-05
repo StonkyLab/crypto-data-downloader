@@ -15,23 +15,145 @@ Copyright (c) 2025 Vitezslav Kot <vitezslav.kot@stonky.cz>, Stonky s.r.o.
 #include "stonky/utils/utils.h"
 #include "stonky/utils/semaphore.h"
 #include "csv.h"
+#include <chrono>
 #include <filesystem>
 #include <fstream>
 #include <map>
 #include <set>
+#include <thread>
 #include <spdlog/spdlog.h>
 #include <spdlog/fmt/ranges.h>
 
 using namespace stonky::okx;
 
 namespace stonky {
+
+namespace {
+constexpr std::int64_t MS_PER_DAY = 24LL * 60 * 60 * 1000;
+
+/// OKX cuts every bulk archive file on a UTC+8 midnight, so a "2024-09" file
+/// starts at 2024-08-31 16:00 UTC. Month/day boundaries used to decide which
+/// files to ask for must be computed in that zone, not in UTC.
+constexpr std::int64_t HK_OFFSET_MS = 8LL * 60 * 60 * 1000;
+
+/// `/api/v5/public/market-data-history` rejects a range longer than 10 months
+/// for `monthly` (error 50077) and 10 days for `daily` (error 50076). The
+/// limits used to be 20/20; when OKX tightened them the previous 19-month /
+/// 19-day windows started failing on EVERY call, which killed the whole bulk
+/// path and left multi-month holes in the dataset. 9 keeps a safety margin.
+constexpr std::int64_t MAX_MONTHLY_RANGE_MS = 270LL * MS_PER_DAY;
+constexpr std::int64_t MAX_DAILY_RANGE_MS = 9LL * MS_PER_DAY;
+
+/// Oldest bulk archive file of any instrument: the "2021-09" batch, starting
+/// 2021-08-31 16:00 UTC. Anything older exists only through the paginated REST
+/// candle endpoint and has no funding-rate counterpart at all, so the archive
+/// floor is treated as the start of history.
+constexpr std::int64_t ARCHIVE_FLOOR_MS = 1630425600000;
+
+/// A monthly file covers at most 31 days; a daily file exactly one. Used to
+/// decide whether a file can still hold records newer than what is stored.
+constexpr std::int64_t MONTHLY_FILE_SPAN_MS = 32LL * MS_PER_DAY;
+
+constexpr int MAX_REQUEST_ATTEMPTS = 4;
+
+/// Start of the UTC+8 calendar month containing `tsMs`, as a UTC timestamp.
+std::int64_t hkMonthStartMs(const std::int64_t tsMs) {
+    using namespace std::chrono;
+    const auto local = sys_time<milliseconds>(milliseconds{tsMs + HK_OFFSET_MS});
+    const year_month_day ymd{floor<days>(local)};
+    const sys_days firstOfMonth{ymd.year() / ymd.month() / 1};
+    return firstOfMonth.time_since_epoch().count() * MS_PER_DAY - HK_OFFSET_MS;
+}
+
+/// Run a request with bounded retries. Transient OKX failures (rate limiting,
+/// gateway hiccups) must not translate into skipped archive files — a skipped
+/// file becomes a permanent hole, because the resume logic only ever appends
+/// after the last stored record.
+template<typename Fn>
+auto withRetry(const std::string &what, Fn &&fn) -> decltype(fn()) {
+    std::string lastError;
+    for (int attempt = 1; attempt <= MAX_REQUEST_ATTEMPTS; ++attempt) {
+        try {
+            return fn();
+        } catch (const std::exception &e) {
+            lastError = e.what();
+            // A delisted/unknown instrument is a terminal answer, not a hiccup.
+            if (lastError.find("code: 51001") != std::string::npos ||
+                lastError.find("code: 51000") != std::string::npos) {
+                throw;
+            }
+            if (attempt < MAX_REQUEST_ATTEMPTS) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(500 * attempt));
+            }
+        }
+    }
+    throw std::runtime_error(fmt::format("{} failed after {} attempts: {}", what, MAX_REQUEST_ATTEMPTS, lastError));
+}
+
+/// Enumerate every archive file covering [begin, end), walking the range in
+/// windows the endpoint accepts. Results are de-duplicated by file name
+/// (adjacent windows overlap on partial months) and sorted oldest first.
+std::vector<MarketDataFileInfo> listArchiveFiles(const RESTClient &client,
+                                                 const MarketDataModule module,
+                                                 const InstrumentType instrumentType,
+                                                 const std::string &instFamilyOrId,
+                                                 const DateAggrType dateAggrType,
+                                                 const std::int64_t begin,
+                                                 const std::int64_t end) {
+    const std::int64_t windowMs = dateAggrType == DateAggrType::monthly ? MAX_MONTHLY_RANGE_MS : MAX_DAILY_RANGE_MS;
+    std::map<std::string, MarketDataFileInfo> unique;
+
+    for (std::int64_t windowStart = begin; windowStart < end;) {
+        const std::int64_t windowEnd = std::min(windowStart + windowMs, end);
+
+        const auto history = withRetry(
+            fmt::format("market-data-history {} [{}, {}]", instFamilyOrId, windowStart, windowEnd),
+            [&] {
+                return client.getMarketDataHistory(module, instrumentType, instFamilyOrId, dateAggrType,
+                                                   windowStart, windowEnd);
+            });
+
+        for (const auto &detail: history.details) {
+            for (const auto &fileInfo: detail.groupDetails) {
+                unique.try_emplace(fileInfo.filename, fileInfo);
+            }
+        }
+
+        windowStart = windowEnd;
+    }
+
+    std::vector<MarketDataFileInfo> files;
+    files.reserve(unique.size());
+    for (auto &[_, fileInfo]: unique) {
+        files.push_back(fileInfo);
+    }
+    std::ranges::sort(files, [](const MarketDataFileInfo &a, const MarketDataFileInfo &b) {
+        return a.dateTs < b.dateTs;
+    });
+    return files;
+}
+} // namespace
+
 struct OKXDownloader::P {
     std::unique_ptr<RESTClient> okxClient;
     mutable Semaphore maxConcurrentConvertJobs;
     mutable std::recursive_mutex locker;
     Semaphore maxConcurrentDownloadJobs{3};
     bool deleteDelistedData = false;
+    bool xperp = false;
     MarketCategory marketCategory = MarketCategory::Futures;
+
+    /// Instruments of the product being downloaded. X-Perps share the FUTURES
+    /// endpoint with 39 ordinary dated futures, so `instType` alone is not a
+    /// sufficient filter — `ruleType` is what separates them.
+    [[nodiscard]] std::vector<Instrument> productInstruments(const InstrumentType instrumentType) const {
+        auto instruments = okxClient->getInstruments(xperp ? InstrumentType::FUTURES : instrumentType);
+
+        if (xperp) {
+            std::erase_if(instruments, [](const Instrument &i) { return i.ruleType != "xperp"; });
+        }
+        return instruments;
+    }
 
     static bool writeCSVCandlesToZorroT6File(const std::string &csvPath, const std::string &t6Path);
 
@@ -55,9 +177,10 @@ struct OKXDownloader::P {
     }
 };
 
-OKXDownloader::OKXDownloader(std::uint32_t maxJobs, const MarketCategory marketCategory, bool deleteDelistedData) : m_p(
-    std::make_unique<P>(maxJobs, deleteDelistedData)) {
+OKXDownloader::OKXDownloader(std::uint32_t maxJobs, const MarketCategory marketCategory, bool deleteDelistedData,
+                             const bool xperp) : m_p(std::make_unique<P>(maxJobs, deleteDelistedData)) {
     m_p->marketCategory = marketCategory;
+    m_p->xperp = xperp;
 }
 
 OKXDownloader::~OKXDownloader() = default;
@@ -270,7 +393,9 @@ void OKXDownloader::updateMarketData(const std::string &dirPath,
 
     // Market data history endpoint only supports 1-minute candles
     if (okxBarSize != BarSize::_1m) {
-        throw std::invalid_argument("OKX market data history only supports 1-minute candles, you must aggregate to higher time frames manually");
+        throw std::invalid_argument(
+            "OKX bulk market data history only publishes 1-minute candles; download with -b 1 and build "
+            "higher timeframes locally with -g (e.g. -b 1 -g 5,60)");
     }
 
     std::vector<std::future<std::filesystem::path> > futures;
@@ -296,6 +421,12 @@ void OKXDownloader::updateMarketData(const std::string &dirPath,
             break;
     }
 
+    if (m_p->xperp) {
+        instrumentType = InstrumentType::FUTURES;
+        csvDirName = CSV_XPERP_DIR;
+        t6DirName = T6_XPERP_DIR;
+    }
+
     spdlog::info(fmt::format("Symbols directory: {}", finalPath.string()));
 
     if (symbolsToUpdate.empty()) {
@@ -304,7 +435,7 @@ void OKXDownloader::updateMarketData(const std::string &dirPath,
         spdlog::info(fmt::format("Updating symbols: {}", fmt::join(symbols, ", ")));
     }
 
-    const auto exchangeInstruments = m_p->okxClient->getInstruments(instrumentType);
+    const auto exchangeInstruments = m_p->productInstruments(instrumentType);
 
     // Create a map from instId to Instrument for quick lookup
     std::map<std::string, Instrument> instrumentMap;
@@ -316,7 +447,9 @@ void OKXDownloader::updateMarketData(const std::string &dirPath,
 
     if (symbolsToUpdate.empty()) {
         for (const auto &el: exchangeInstruments) {
-            if (el.settleCcy == "USDT" || el.quoteCcy == "USDT") {
+            // X-Perps settle in USD, so the USDT filter that selects the swap
+            // universe would reject every one of them.
+            if (m_p->xperp || el.settleCcy == "USDT" || el.quoteCcy == "USDT") {
                 if (el.state != InstrumentStatus::live && m_p->deleteDelistedData) {
                     symbolsToDelete.push_back(el.instId);
                 } else {
@@ -325,22 +458,35 @@ void OKXDownloader::updateMarketData(const std::string &dirPath,
             }
         }
 
-        // Scan existing CSV files for symbols no longer on the exchange
-        if (m_p->deleteDelistedData) {
-            std::filesystem::path csvDir = finalPath;
-            csvDir.append(csvDirName);
-            csvDir.append(Downloader::minutesToString(barSizeInMinutes));
+        // Scan existing CSV files for symbols no longer on the exchange. Unless
+        // they are being deleted they stay in the update set: `/public/instruments`
+        // only ever lists live contracts, so a delisted symbol dropped here would
+        // stop being maintained and would vanish from a rebuilt dataset, silently
+        // introducing survivorship bias. The bulk archive still serves them.
+        std::filesystem::path csvDir = finalPath;
+        csvDir.append(csvDirName);
+        csvDir.append(Downloader::minutesToString(barSizeInMinutes));
 
-            if (std::filesystem::exists(csvDir)) {
-                for (const auto &entry: std::filesystem::directory_iterator(csvDir)) {
-                    if (entry.is_regular_file() && entry.path().extension() == ".csv") {
-                        const auto stem = entry.path().stem().string();
-                        if (!exchangeSymbolSet.contains(stem)) {
+        std::size_t delistedKept = 0;
+
+        if (std::filesystem::exists(csvDir)) {
+            for (const auto &entry: std::filesystem::directory_iterator(csvDir)) {
+                if (entry.is_regular_file() && entry.path().extension() == ".csv") {
+                    const auto stem = entry.path().stem().string();
+                    if (!exchangeSymbolSet.contains(stem)) {
+                        if (m_p->deleteDelistedData) {
                             symbolsToDelete.push_back(stem);
+                        } else {
+                            symbolsToUpdate.push_back(stem);
+                            delistedKept++;
                         }
                     }
                 }
             }
+        }
+
+        if (delistedKept > 0) {
+            spdlog::info(fmt::format("Keeping {} delisted symbols found on disk in the update set", delistedKept));
         }
     } else {
         std::vector<std::string> tempSymbols;
@@ -445,138 +591,91 @@ void OKXDownloader::updateMarketData(const std::string &dirPath,
                                fromTimeStamp = instrumentListTime;
                            }
 
-                            try {
-                                // OKX API limits: max 20 days for daily, max 20 months for monthly
-                                constexpr int64_t maxMonthlyRangeMs = 19LL * 30 * 24 * 60 * 60 * 1000;
-                                constexpr int64_t maxDailyRangeMs = 19LL * 24 * 60 * 60 * 1000; // 19 days in ms
+                           // Nothing older than the bulk archive floor is fetched. Going deeper is
+                           // possible through the paginated REST candle endpoint (it reaches back to
+                           // the listing date), but those bars would have no funding-rate counterpart,
+                           // because the funding archive starts at the same floor and the REST funding
+                           // endpoint only serves the last ~3 months.
+                           fromTimeStamp = std::max(fromTimeStamp, ARCHIVE_FLOOR_MS);
 
-                                int64_t currentStart = fromTimeStamp;
+                            try {
                                 int64_t totalNewCandles = 0;
                                 int64_t lastSavedTimestamp = fromTimeStamp;
+                                bool stoppedEarly = false;
 
-                                // 1. Download historical data via bulk ZIP files (Monthly intervals)
-                                    while (currentStart < nowTimestamp - 30LL * 24 * 60 * 60 * 1000) {
-                                        int64_t currentEnd = std::min(currentStart + maxMonthlyRangeMs, nowTimestamp);
-                                        auto history = m_p->okxClient->getMarketDataHistory(
-                                            MarketDataModule::Candles1m,
-                                            instrumentType,
-                                            instFamilyOrId,
-                                            DateAggrType::monthly,
-                                            currentStart,
-                                            currentEnd);
+                                // Monthly files exist only for complete UTC+8 months; the running
+                                // month is served by daily files and the last hours by REST.
+                                const int64_t monthlyCutoff = hkMonthStartMs(nowTimestamp);
 
-                                        currentStart = currentEnd;
+                                // Oldest first, monthly files then the daily files of the running
+                                // month: strictly ascending, which is what append-only resume needs.
+                                std::vector<std::pair<MarketDataFileInfo, int64_t> > archiveFiles;
 
-                                        if (history.details.empty()) {
-                                            continue;
-                                        }
+                                for (const auto &fileInfo: listArchiveFiles(
+                                         *m_p->okxClient, MarketDataModule::Candles1m, instrumentType,
+                                         instFamilyOrId, DateAggrType::monthly, fromTimeStamp, monthlyCutoff)) {
+                                    archiveFiles.emplace_back(fileInfo, MONTHLY_FILE_SPAN_MS);
+                                }
+                                for (const auto &fileInfo: listArchiveFiles(
+                                         *m_p->okxClient, MarketDataModule::Candles1m, instrumentType,
+                                         instFamilyOrId, DateAggrType::daily,
+                                         std::max(fromTimeStamp, monthlyCutoff), nowTimestamp)) {
+                                    archiveFiles.emplace_back(fileInfo, MS_PER_DAY);
+                                }
 
-                                        std::vector<MarketDataFileInfo> allFiles;
-                                        for (const auto &detail: history.details) {
-                                            for (const auto &fileInfo: detail.groupDetails) {
-                                                allFiles.push_back(fileInfo);
-                                            }
-                                        }
-
-                                        std::ranges::sort(allFiles, [](const MarketDataFileInfo &a, const MarketDataFileInfo &b) {
-                                            return a.dateTs < b.dateTs;
-                                        });
-
-                                        for (const auto &fileInfo: allFiles) {
-                                            if (fileInfo.dateTs + 30LL * 24 * 60 * 60 * 1000 > lastSavedTimestamp) {
-                                                const auto zipData = RESTClient::downloadMarketDataFile(fileInfo.url);
-                                                const auto csvData = okx::utils::extractZip(zipData);
-                                                auto candles = okx::utils::parseCandlesCsv(csvData);
-
-                                                if (!candles.empty()) {
-                                                    std::ranges::sort(candles, [](const Candle &a, const Candle &b) {
-                                                        return a.ts < b.ts;
-                                                    });
-                                                    std::vector<Candle> newCandles;
-                                                    for (const auto &candle : candles) {
-                                                        if (candle.ts > lastSavedTimestamp)
-                                                            newCandles.push_back(candle);
-                                                    }
-                                                    if (!newCandles.empty()) {
-                                                        P::writeCandlesToCSVFile(newCandles, symbolFilePathCsv.string(), false);
-                                                        totalNewCandles += static_cast<int64_t>(newCandles.size());
-                                                        lastSavedTimestamp = newCandles.back().ts;
-                                                    }
-                                                }
-                                            }
-                                        }
+                                for (const auto &[fileInfo, fileSpanMs]: archiveFiles) {
+                                    if (fileInfo.dateTs + fileSpanMs <= lastSavedTimestamp) {
+                                        continue; // fully covered by what is already stored
                                     }
 
-                                    // 2. Download recent historical data via bulk ZIP files (Daily intervals)
-                                    while (currentStart < nowTimestamp) {
-                                        int64_t currentEnd = std::min(currentStart + maxDailyRangeMs, nowTimestamp);
-
-                                        const auto history = m_p->okxClient->getMarketDataHistory(
-                                            MarketDataModule::Candles1m,
-                                            instrumentType,
-                                            instFamilyOrId,
-                                            DateAggrType::daily,
-                                            currentStart,
-                                            currentEnd);
-
-                                        if (history.details.empty()) {
-                                            currentStart = currentEnd;
-                                            continue;
-                                        }
-
-                                        std::vector<MarketDataFileInfo> allFiles;
-                                        for (const auto &detail : history.details) {
-                                            for (const auto &fileInfo : detail.groupDetails) {
-                                                allFiles.push_back(fileInfo);
-                                            }
-                                        }
-
-                                        std::ranges::sort(allFiles, [](const MarketDataFileInfo &a, const MarketDataFileInfo &b) {
-                                            return a.dateTs < b.dateTs;
-                                        });
-
-                                        for (const auto &fileInfo : allFiles) {
-                                            if (fileInfo.dateTs + 24LL * 60 * 60 * 1000 <= lastSavedTimestamp)
-                                                continue;
-
+                                    std::vector<Candle> candles;
+                                    try {
+                                        candles = withRetry(fmt::format("download {}", fileInfo.filename), [&] {
                                             const auto zipData = RESTClient::downloadMarketDataFile(fileInfo.url);
                                             const auto csvData = okx::utils::extractZip(zipData);
-                                            auto candles = okx::utils::parseCandlesCsv(csvData);
-
-                                            if (candles.empty())
-                                                continue;
-
-                                            std::ranges::sort(candles, [](const Candle &a, const Candle &b) {
-                                                return a.ts < b.ts;
-                                            });
-
-                                            std::vector<Candle> newCandles;
-                                            for (const auto &candle : candles) {
-                                                if (candle.ts > lastSavedTimestamp)
-                                                    newCandles.push_back(candle);
-                                            }
-
-                                            if (!newCandles.empty()) {
-                                                P::writeCandlesToCSVFile(newCandles, symbolFilePathCsv.string(), false);
-                                                totalNewCandles += static_cast<int64_t>(newCandles.size());
-                                                lastSavedTimestamp = newCandles.back().ts;
-                                            }
-                                        }
-
-                                        currentStart = currentEnd;
+                                            return okx::utils::parseCandlesCsv(csvData);
+                                        });
+                                    } catch (const std::exception &e) {
+                                        // Never skip forward past a failed file: the CSV is append-only
+                                        // and resumes from its last record, so a skipped file would turn
+                                        // into a permanent hole. Stop here and let the next run retry.
+                                        spdlog::warn(fmt::format(
+                                            "Symbol: {}: archive file {} could not be downloaded ({}), "
+                                            "stopping at {} — the next run resumes from there",
+                                            symbol, fileInfo.filename, e.what(), lastSavedTimestamp));
+                                        stoppedEarly = true;
+                                        break;
                                     }
 
-                               // Fill the gap between last downloaded file and now using REST API
-                               // The file-based endpoint only has complete days, so recent data needs REST API
-                               if (lastSavedTimestamp < nowTimestamp) {
+                                    if (candles.empty()) {
+                                        continue;
+                                    }
 
-                                   // spdlog::info("Filling the gap between last downloaded file and now time...");
+                                    std::ranges::sort(candles, [](const Candle &a, const Candle &b) {
+                                        return a.ts < b.ts;
+                                    });
 
+                                    std::vector<Candle> newCandles;
+                                    for (const auto &candle: candles) {
+                                        if (candle.ts > lastSavedTimestamp) {
+                                            newCandles.push_back(candle);
+                                        }
+                                    }
+
+                                    if (!newCandles.empty()) {
+                                        P::writeCandlesToCSVFile(newCandles, symbolFilePathCsv.string(), false);
+                                        totalNewCandles += static_cast<int64_t>(newCandles.size());
+                                        lastSavedTimestamp = newCandles.back().ts;
+                                    }
+                                }
+
+                               // Bulk files only cover complete days, so the last hours come from the
+                               // paginated REST endpoint.
+                               if (!stoppedEarly && lastSavedTimestamp < nowTimestamp) {
                                    auto recentCandles = m_p->okxClient->getHistoricalPrices(
                                        symbol, BarSize::_1m, lastSavedTimestamp, nowTimestamp);
 
                                    if (!recentCandles.empty()) {
-                                       // spdlog::info(fmt::format("Found {} missing candles", recentCandles.size()));
                                        // Sort by timestamp (API returns newest first)
                                        std::ranges::sort(recentCandles, [](const Candle &a, const Candle &b) {
                                            return a.ts < b.ts;
@@ -598,7 +697,8 @@ void OKXDownloader::updateMarketData(const std::string &dirPath,
                                }
 
                                if (totalNewCandles > 0) {
-                                   spdlog::info(fmt::format("CSV file for symbol: {} updated", symbol));
+                                   spdlog::info(fmt::format("CSV file for symbol: {} updated ({} new candles)",
+                                                            symbol, totalNewCandles));
                                }
 
                                // Return the path if the CSV file exists (for T6 conversion)
@@ -706,7 +806,20 @@ void OKXDownloader::updateFundingRateData(const std::string &dirPath,
     std::vector<std::filesystem::path> csvFilePaths;
     std::vector<std::string> symbolsToDelete;
 
+    const std::string frDirName = m_p->xperp ? CSV_XPERP_FR_DIR : CSV_FUT_FR_DIR;
+
     spdlog::info(fmt::format("Symbols directory: {}", finalPath.string()));
+
+    if (m_p->xperp) {
+        // The bulk archive's funding module rejects instType=FUTURES
+        // ("Parameter instType doesn't match parameter module"), so X-Perp
+        // funding exists only through the REST endpoint — and that serves the
+        // last ~3 months. Anything older is already unrecoverable, which makes
+        // this the one dataset here that decays if it is not collected
+        // regularly.
+        spdlog::warn("X-Perp funding rates come from the REST endpoint only (no bulk archive); "
+                     "it serves roughly the last 3 months, so run this regularly or history is lost");
+    }
 
     if (symbolsToUpdate.empty()) {
         spdlog::info(fmt::format("Updating all symbols"));
@@ -714,7 +827,7 @@ void OKXDownloader::updateFundingRateData(const std::string &dirPath,
         spdlog::info(fmt::format("Updating symbols: {}", fmt::join(symbols, ", ")));
     }
 
-    const auto exchangeInstruments = m_p->okxClient->getInstruments(InstrumentType::SWAP);
+    const auto exchangeInstruments = m_p->productInstruments(InstrumentType::SWAP);
 
     // Build set of all known symbols from exchange for filesystem-based delisting detection
     std::set<std::string> exchangeSymbolSet;
@@ -724,7 +837,8 @@ void OKXDownloader::updateFundingRateData(const std::string &dirPath,
 
     if (symbolsToUpdate.empty()) {
         for (const auto &el: exchangeInstruments) {
-            if (el.settleCcy == "USDT") {
+            // X-Perps settle in USD — see updateMarketData() for the same filter
+            if (m_p->xperp || el.settleCcy == "USDT") {
                 if (el.state != InstrumentStatus::live && m_p->deleteDelistedData) {
                     symbolsToDelete.push_back(el.instId);
                 } else {
@@ -733,24 +847,36 @@ void OKXDownloader::updateFundingRateData(const std::string &dirPath,
             }
         }
 
-        // Scan existing CSV files for symbols no longer on the exchange
-        if (m_p->deleteDelistedData) {
-            std::filesystem::path frDir = finalPath;
-            frDir.append(CSV_FUT_FR_DIR);
+        // Scan existing CSV files for symbols no longer on the exchange. Unless
+        // they are being deleted they stay in the update set — see the same
+        // reasoning in updateMarketData(): dropping them would introduce
+        // survivorship bias into a rebuilt dataset.
+        std::filesystem::path frDir = finalPath;
+        frDir.append(frDirName);
 
-            if (std::filesystem::exists(frDir)) {
-                for (const auto &entry: std::filesystem::directory_iterator(frDir)) {
-                    if (entry.is_regular_file() && entry.path().extension() == ".csv") {
-                        auto stem = entry.path().stem().string();
-                        if (stem.ends_with("_fr")) {
-                            stem = stem.substr(0, stem.size() - 3);
-                        }
-                        if (!exchangeSymbolSet.contains(stem)) {
+        std::size_t delistedKept = 0;
+
+        if (std::filesystem::exists(frDir)) {
+            for (const auto &entry: std::filesystem::directory_iterator(frDir)) {
+                if (entry.is_regular_file() && entry.path().extension() == ".csv") {
+                    auto stem = entry.path().stem().string();
+                    if (stem.ends_with("_fr")) {
+                        stem = stem.substr(0, stem.size() - 3);
+                    }
+                    if (!exchangeSymbolSet.contains(stem)) {
+                        if (m_p->deleteDelistedData) {
                             symbolsToDelete.push_back(stem);
+                        } else {
+                            symbolsToUpdate.push_back(stem);
+                            delistedKept++;
                         }
                     }
                 }
             }
+        }
+
+        if (delistedKept > 0) {
+            spdlog::info(fmt::format("Keeping {} delisted symbols found on disk in the update set", delistedKept));
         }
     } else {
         std::vector<std::string> tempSymbols;
@@ -785,13 +911,13 @@ void OKXDownloader::updateFundingRateData(const std::string &dirPath,
     for (const auto &s: symbolsToUpdate) {
         futures.push_back(
             std::async(std::launch::async,
-                       [finalPath, this](const std::string &symbol,
-                                         Semaphore &maxJobs) -> std::filesystem::path {
+                       [finalPath, this, &frDirName](const std::string &symbol,
+                                                     Semaphore &maxJobs) -> std::filesystem::path {
                            std::scoped_lock w(maxJobs);
                            std::filesystem::path symbolFilePathCsv = finalPath;
 
 
-                           symbolFilePathCsv.append(CSV_FUT_FR_DIR);
+                           symbolFilePathCsv.append(frDirName);
                            if (const auto err = createDirectoryRecursively(symbolFilePathCsv.string());
                                err.value() != 0) {
                                throw std::runtime_error(fmt::format("Failed to create directory: {}, error: {}",
@@ -815,80 +941,72 @@ void OKXDownloader::updateFundingRateData(const std::string &dirPath,
                                instFamily = symbol;
                            }
 
-                           try {
-                               // OKX API limit: max 20 months for monthly aggregation, use 19 to be safe
-                               constexpr int64_t maxMonthlyRangeMs = 19LL * 30 * 24 * 60 * 60 * 1000;
+                           // The funding archive starts at the same floor as the candle archive and
+                           // the REST funding endpoint only serves the last ~3 months, so there is no
+                           // source for anything older.
+                           fromTimeStamp = std::max(fromTimeStamp, ARCHIVE_FLOOR_MS);
 
-                               int64_t currentStart = fromTimeStamp;
+                           try {
                                int64_t totalNewRates = 0;
                                int64_t lastSavedTimestamp = fromTimeStamp;
+                               bool stoppedEarly = false;
+
+                               // Funding rates have no daily aggregation — monthly files for complete
+                               // UTC+8 months, REST for the running month. For X-Perps there are no
+                               // files at all: the archive's funding module accepts only instType=SWAP,
+                               // so the whole history has to come from REST.
+                               const int64_t monthlyCutoff = m_p->xperp ? fromTimeStamp : hkMonthStartMs(nowTimestamp);
 
                                // 1. Download historical data via bulk ZIP files (monthly)
-                               while (currentStart < nowTimestamp) {
-                                   int64_t currentEnd = std::min(currentStart + maxMonthlyRangeMs, nowTimestamp);
+                               for (const auto &fileInfo: listArchiveFiles(
+                                        *m_p->okxClient, MarketDataModule::FundingRate, InstrumentType::SWAP,
+                                        instFamily, DateAggrType::monthly, fromTimeStamp, monthlyCutoff)) {
+                                   if (fileInfo.dateTs + MONTHLY_FILE_SPAN_MS <= lastSavedTimestamp) {
+                                       continue; // fully covered by what is already stored
+                                   }
 
-                                   const auto history = m_p->okxClient->getMarketDataHistory(
-                                       MarketDataModule::FundingRate,
-                                       InstrumentType::SWAP,
-                                       instFamily,
-                                       DateAggrType::monthly,
-                                       currentStart,
-                                       currentEnd);
+                                   std::vector<FundingRate> rates;
+                                   try {
+                                       rates = withRetry(fmt::format("download {}", fileInfo.filename), [&] {
+                                           const auto zipData = RESTClient::downloadMarketDataFile(fileInfo.url);
+                                           const auto csvData = okx::utils::extractZip(zipData);
+                                           return okx::utils::parseFundingRateCsv(csvData);
+                                       });
+                                   } catch (const std::exception &e) {
+                                       // Append-only file: skipping forward past a failure would leave a
+                                       // permanent hole, so stop and let the next run resume from here.
+                                       spdlog::warn(fmt::format(
+                                           "Symbol: {}: archive file {} could not be downloaded ({}), "
+                                           "stopping at {} — the next run resumes from there",
+                                           symbol, fileInfo.filename, e.what(), lastSavedTimestamp));
+                                       stoppedEarly = true;
+                                       break;
+                                   }
 
-                                   if (history.details.empty()) {
-                                       currentStart = currentEnd;
+                                   if (rates.empty()) {
                                        continue;
                                    }
 
-                                   // Collect all files and sort by date (oldest first)
-                                   std::vector<MarketDataFileInfo> allFiles;
-                                   for (const auto &detail : history.details) {
-                                       for (const auto &fileInfo : detail.groupDetails) {
-                                           allFiles.push_back(fileInfo);
-                                       }
-                                   }
-
-                                   std::ranges::sort(allFiles, [](const MarketDataFileInfo &a, const MarketDataFileInfo &b) {
-                                       return a.dateTs < b.dateTs;
+                                   std::ranges::sort(rates, [](const FundingRate &a, const FundingRate &b) {
+                                       return a.fundingTime < b.fundingTime;
                                    });
 
-                                   for (const auto &fileInfo : allFiles) {
-                                       // Skip files older than what we already have (month + ~31 days)
-                                       if (fileInfo.dateTs + 31LL * 24 * 60 * 60 * 1000 <= lastSavedTimestamp) {
-                                           continue;
-                                       }
-
-                                       const auto zipData = RESTClient::downloadMarketDataFile(fileInfo.url);
-                                       const auto csvData = okx::utils::extractZip(zipData);
-                                       auto rates = okx::utils::parseFundingRateCsv(csvData);
-
-                                       if (rates.empty()) {
-                                           continue;
-                                       }
-
-                                       std::ranges::sort(rates, [](const FundingRate &a, const FundingRate &b) {
-                                           return a.fundingTime < b.fundingTime;
-                                       });
-
-                                       std::vector<FundingRate> newRates;
-                                       for (const auto &rate : rates) {
-                                           if (rate.fundingTime > lastSavedTimestamp) {
-                                               newRates.push_back(rate);
-                                           }
-                                       }
-
-                                       if (!newRates.empty()) {
-                                           P::writeFundingRatesToCSVFile(newRates, symbolFilePathCsv.string());
-                                           totalNewRates += static_cast<int64_t>(newRates.size());
-                                           lastSavedTimestamp = newRates.back().fundingTime;
+                                   std::vector<FundingRate> newRates;
+                                   for (const auto &rate : rates) {
+                                       if (rate.fundingTime > lastSavedTimestamp) {
+                                           newRates.push_back(rate);
                                        }
                                    }
 
-                                   currentStart = currentEnd;
+                                   if (!newRates.empty()) {
+                                       P::writeFundingRatesToCSVFile(newRates, symbolFilePathCsv.string());
+                                       totalNewRates += static_cast<int64_t>(newRates.size());
+                                       lastSavedTimestamp = newRates.back().fundingTime;
+                                   }
                                }
 
                                // 2. Fill the gap between last bulk file and now using REST API
-                               if (lastSavedTimestamp < nowTimestamp) {
+                               if (!stoppedEarly && lastSavedTimestamp < nowTimestamp) {
                                    auto recentRates = m_p->okxClient->getFundingRates(
                                        symbol, lastSavedTimestamp, nowTimestamp, 1000);
 
@@ -941,7 +1059,7 @@ void OKXDownloader::updateFundingRateData(const std::string &dirPath,
     if (m_p->deleteDelistedData) {
         for (const auto &symbol: symbolsToDelete) {
             std::filesystem::path symbolFilePathCsv = finalPath;
-            symbolFilePathCsv.append(CSV_FUT_FR_DIR);
+            symbolFilePathCsv.append(frDirName);
             symbolFilePathCsv = symbolFilePathCsv.lexically_normal();
             symbolFilePathCsv.append(symbol + "_fr.csv");
 

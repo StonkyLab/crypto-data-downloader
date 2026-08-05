@@ -46,3 +46,14 @@ All notable changes to this project will be documented in this file. This projec
 
 ## [2.2.1](https://github.com/vitakot/crypto_data_downloader/releases/tag/v2.2.1) (2026-02-24)
 - Add possibility to run t6 conversion only
+
+## [2.5.0](https://github.com/vitakot/crypto_data_downloader/releases/tag/v2.5.0) (2026-08-05)
+- Fix OKX bulk history download: OKX tightened the `market-data-history` range limits from 20 months / 20 days to 10 months / 10 days, so the hardcoded 19-month and 19-day windows failed on every call (errors 50077 / 50076) and the whole bulk path silently produced nothing
+- Compute OKX archive month boundaries in UTC+8, the zone the archive files are cut on
+- Stop the per-symbol download at the first failed archive file instead of skipping forward; append-only CSVs cannot backfill a skipped file, so skipping turned transient failures into permanent multi-month holes
+- Retry OKX archive listings and file downloads before giving up
+- Keep delisted symbols found on disk in the OKX update set (unless `-d`), `/public/instruments` lists live contracts only
+- Add `-g/--aggregate` to build coarser timeframes from an existing 1-minute dataset locally (OKX only publishes 1m bars in its bulk archive)
+- Raise the OKX `market-data-history` rate limiter from 1 to 20 req/s (the endpoint advertises 60)
+- Add `-x/--xperp` for OKX X-Perps (USD-settled perpetual-style futures, `instType=FUTURES` / `ruleType=xperp`), stored under `<output>/xperp/`. Candles come from the bulk archive; funding rates only from REST, because the archive's funding module rejects `instType=FUTURES` — that history decays after ~3 months and needs regular collection
+- Parse `ruleType` on OKX instruments (separates X-Perps from the ordinary dated futures on the same endpoint)
