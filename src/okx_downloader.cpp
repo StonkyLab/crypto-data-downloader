@@ -56,6 +56,19 @@ constexpr std::int64_t MONTHLY_FILE_SPAN_MS = 32LL * MS_PER_DAY;
 
 constexpr int MAX_REQUEST_ATTEMPTS = 4;
 
+/// How many times a listing window is re-requested while it keeps handing back
+/// a download URL that belongs to a different instrument than the entry it is
+/// filed under. Each retry is an independent draw, so a handful suffices.
+constexpr int MAX_LISTING_ATTEMPTS = 8;
+
+/// File name a download URL actually points at, without the query string.
+std::string urlFileName(const std::string &url) {
+    const auto query = url.find('?');
+    const auto path = query == std::string::npos ? url : url.substr(0, query);
+    const auto slash = path.rfind('/');
+    return slash == std::string::npos ? path : path.substr(slash + 1);
+}
+
 /// Start of the UTC+8 calendar month containing `tsMs`, as a UTC timestamp.
 std::int64_t hkMonthStartMs(const std::int64_t tsMs) {
     using namespace std::chrono;
@@ -129,17 +142,49 @@ std::vector<MarketDataFileInfo> listArchiveFiles(const RESTClient &client,
     for (std::int64_t windowStart = archiveWindowStart(begin, dateAggrType); windowStart < end;) {
         const std::int64_t windowEnd = std::min(windowStart + windowMs, end);
 
-        const auto history = withRetry(
-            fmt::format("market-data-history {} [{}, {}]", instFamilyOrId, windowStart, windowEnd),
-            [&] {
-                return client.getMarketDataHistory(module, instrumentType, instFamilyOrId, dateAggrType,
-                                                   windowStart, windowEnd);
-            });
+        // The listing intermittently links a file belonging to a DIFFERENT
+        // instrument than the entry names: for BTC-USDT 2024-04..2024-08 about
+        // half of the responses give a SWAP entry the URL of the SPOT archive.
+        // Downloading it would splice spot prices into a swap series — the
+        // instrument-name filter in parseCandlesCsv() rejects those rows, but
+        // that turns the mismatch into a silent hole. The discrepancy is
+        // visible in the listing itself, so re-request until the URL agrees
+        // with the name it is filed under.
+        std::set<std::string> mismatched;
 
-        for (const auto &detail: history.details) {
-            for (const auto &fileInfo: detail.groupDetails) {
-                unique.try_emplace(fileInfo.filename, fileInfo);
+        for (int attempt = 1; attempt <= MAX_LISTING_ATTEMPTS; ++attempt) {
+            const auto history = withRetry(
+                fmt::format("market-data-history {} [{}, {}]", instFamilyOrId, windowStart, windowEnd),
+                [&] {
+                    return client.getMarketDataHistory(module, instrumentType, instFamilyOrId, dateAggrType,
+                                                       windowStart, windowEnd);
+                });
+
+            bool sawMismatch = false;
+            for (const auto &detail: history.details) {
+                for (const auto &fileInfo: detail.groupDetails) {
+                    if (urlFileName(fileInfo.url) != fileInfo.filename) {
+                        if (!unique.contains(fileInfo.filename)) {
+                            mismatched.insert(fileInfo.filename);
+                            sawMismatch = true;
+                        }
+                        continue;
+                    }
+                    unique.try_emplace(fileInfo.filename, fileInfo);
+                    mismatched.erase(fileInfo.filename);
+                }
             }
+
+            if (!sawMismatch || mismatched.empty()) {
+                break;
+            }
+        }
+
+        if (!mismatched.empty()) {
+            spdlog::error(fmt::format(
+                "{}: archive kept linking foreign files for {} after {} listing attempts — those periods "
+                "are MISSING from this run: {}",
+                instFamilyOrId, mismatched.size(), MAX_LISTING_ATTEMPTS, fmt::join(mismatched, ", ")));
         }
 
         windowStart = windowEnd;
