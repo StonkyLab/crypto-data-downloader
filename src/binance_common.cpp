@@ -9,6 +9,7 @@ Copyright (c) 2025 Vitezslav Kot <vitezslav.kot@stonky.cz>, Stonky s.r.o.
 #include "stonky/binance/binance_common.h"
 #include "stonky/binance/binance_models.h"
 #include "stonky/csv_data.h"
+#include "stonky/csv_format.h"
 #include "stonky/utils/utils.h"
 #include "stonky/utils/semaphore.h"
 #include <filesystem>
@@ -110,16 +111,16 @@ bool BinanceCommon::writeCandlesToCSVFile(const std::vector<Candle> &candles, co
 
     for (const auto &candle: candles) {
         ofs << candle.closeTime << ",";
-        ofs << candle.open << ",";
-        ofs << candle.high << ",";
-        ofs << candle.low << ",";
-        ofs << candle.close << ",";
-        ofs << candle.volume << ",";
+        ofs << csvNumber(candle.open) << ",";
+        ofs << csvNumber(candle.high) << ",";
+        ofs << csvNumber(candle.low) << ",";
+        ofs << csvNumber(candle.close) << ",";
+        ofs << csvNumber(candle.volume) << ",";
         ofs << candle.openTime << ",";
-        ofs << candle.quoteVolume << ",";
+        ofs << csvNumber(candle.quoteVolume) << ",";
         ofs << candle.numberOfTrades << ",";
-        ofs << candle.takerBuyVolume << ",";
-        ofs << candle.takerQuoteVolume << ",";
+        ofs << csvNumber(candle.takerBuyVolume) << ",";
+        ofs << csvNumber(candle.takerQuoteVolume) << ",";
         ofs << candle.ignore << std::endl;
     }
 

@@ -8,6 +8,7 @@ Copyright (c) 2025 Vitezslav Kot <vitezslav.kot@stonky.cz>, Stonky s.r.o.
 
 #include "stonky/bybit/bybit_downloader.h"
 #include "stonky/csv_data.h"
+#include "stonky/csv_format.h"
 #include "stonky/downloader.h"
 #include "stonky/bybit/bybit_rest_client.h"
 #include "stonky/bybit/bybit.h"
@@ -187,11 +188,11 @@ bool BybitDownloader::P::writeCandlesToCSVFile(const std::vector<Candle> &candle
             continue;
         }
         ofs << candle.startTime << ",";
-        ofs << candle.open << ",";
-        ofs << candle.high << ",";
-        ofs << candle.low << ",";
-        ofs << candle.close << ",";
-        ofs << candle.volume << std::endl;
+        ofs << csvNumber(candle.open) << ",";
+        ofs << csvNumber(candle.high) << ",";
+        ofs << csvNumber(candle.low) << ",";
+        ofs << csvNumber(candle.close) << ",";
+        ofs << csvNumber(candle.volume) << std::endl;
     }
 
     ofs.flush();
@@ -244,7 +245,7 @@ bool BybitDownloader::P::writeFundingRatesToCSVFile(const std::vector<FundingRat
 
     for (const auto &record: fr) {
         ofs << record.fundingRateTimestamp << ",";
-        ofs << record.fundingRate << std::endl;
+        ofs << csvNumber(record.fundingRate) << std::endl;
     }
 
     ofs.flush();

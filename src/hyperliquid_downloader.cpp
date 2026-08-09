@@ -8,6 +8,7 @@ Copyright (c) 2025 Vitezslav Kot <vitezslav.kot@stonky.cz>, Stonky s.r.o.
 
 #include "stonky/hyperliquid/hyperliquid_downloader.h"
 #include "stonky/csv_data.h"
+#include "stonky/csv_format.h"
 #include "stonky/downloader.h"
 #include "stonky/hyperliquid/hyperliquid_rest_client.h"
 #include "stonky/hyperliquid/hyperliquid.h"
@@ -184,11 +185,11 @@ bool HyperliquidDownloader::P::writeCandlesToCSVFile(const std::vector<Candle> &
             continue;
         }
         ofs << candle.startTime << ",";
-        ofs << candle.open << ",";
-        ofs << candle.high << ",";
-        ofs << candle.low << ",";
-        ofs << candle.close << ",";
-        ofs << candle.volume << std::endl;
+        ofs << csvNumber(candle.open) << ",";
+        ofs << csvNumber(candle.high) << ",";
+        ofs << csvNumber(candle.low) << ",";
+        ofs << csvNumber(candle.close) << ",";
+        ofs << csvNumber(candle.volume) << std::endl;
     }
 
     ofs.flush();
@@ -238,7 +239,7 @@ bool HyperliquidDownloader::P::writeFundingRatesToCSVFile(const std::vector<Fund
 
     for (const auto &record: fr) {
         ofs << record.time << ",";
-        ofs << record.fundingRate << std::endl;
+        ofs << csvNumber(record.fundingRate) << std::endl;
     }
 
     ofs.close();

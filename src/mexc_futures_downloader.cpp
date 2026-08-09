@@ -7,6 +7,7 @@ Copyright (c) 2026 Vitezslav Kot <vitezslav.kot@stonky.cz>, Stonky s.r.o.
 */
 
 #include "stonky/mexc/mexc_futures_downloader.h"
+#include "stonky/csv_format.h"
 #include "stonky/csv_data.h"
 #include "stonky/mexc/mexc_futures_rest_client.h"
 #include "stonky/mexc/mexc.h"
@@ -227,12 +228,12 @@ bool MEXCFuturesDownloader::P::writeCandlesToCSVFile(const std::vector<Candle> &
 
     for (const auto &candle: candles) {
         ofs << candle.openTime << ",";
-        ofs << candle.open.str(8, std::ios_base::fixed) << ",";
-        ofs << candle.high.str(8, std::ios_base::fixed) << ",";
-        ofs << candle.low.str(8, std::ios_base::fixed) << ",";
-        ofs << candle.close.str(8, std::ios_base::fixed) << ",";
-        ofs << candle.volume.str(10, std::ios_base::fixed) << ",";
-        ofs << candle.amount.str(10, std::ios_base::fixed) << std::endl;
+        ofs << csvNumber(candle.open) << ",";
+        ofs << csvNumber(candle.high) << ",";
+        ofs << csvNumber(candle.low) << ",";
+        ofs << csvNumber(candle.close) << ",";
+        ofs << csvNumber(candle.volume) << ",";
+        ofs << csvNumber(candle.amount) << std::endl;
     }
 
     ofs.close();
@@ -250,12 +251,12 @@ bool MEXCFuturesDownloader::P::writeCandlesToTempFile(const std::vector<Candle> 
 
     for (const auto &candle: candles) {
         ofs << candle.openTime << ",";
-        ofs << candle.open.str(8, std::ios_base::fixed) << ",";
-        ofs << candle.high.str(8, std::ios_base::fixed) << ",";
-        ofs << candle.low.str(8, std::ios_base::fixed) << ",";
-        ofs << candle.close.str(8, std::ios_base::fixed) << ",";
-        ofs << candle.volume.str(10, std::ios_base::fixed) << ",";
-        ofs << candle.amount.str(10, std::ios_base::fixed) << std::endl;
+        ofs << csvNumber(candle.open) << ",";
+        ofs << csvNumber(candle.high) << ",";
+        ofs << csvNumber(candle.low) << ",";
+        ofs << csvNumber(candle.close) << ",";
+        ofs << csvNumber(candle.volume) << ",";
+        ofs << csvNumber(candle.amount) << std::endl;
     }
 
     ofs.close();
@@ -394,7 +395,7 @@ bool MEXCFuturesDownloader::P::writeFundingRatesToCSVFile(const std::vector<Fund
 
     for (const auto &record: fr) {
         ofs << record.timestamp << ",";
-        ofs << record.fundingRate << std::endl;
+        ofs << csvNumber(record.fundingRate) << std::endl;
     }
 
     ofs.close();
@@ -426,7 +427,7 @@ bool MEXCFuturesDownloader::P::writeHistoricalFundingRatesToCSVFile(const std::v
 
     for (const auto &record: fr) {
         ofs << record.settleTime << ",";
-        ofs << record.fundingRate << std::endl;
+        ofs << csvNumber(record.fundingRate) << std::endl;
     }
 
     ofs.close();

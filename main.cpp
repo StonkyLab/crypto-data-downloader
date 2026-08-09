@@ -29,7 +29,7 @@ Copyright (c) 2025 Vitezslav Kot <vitezslav.kot@stonky.cz>, Stonky s.r.o.
 
 #undef max
 
-#define VERSION "2.5.0"
+#define VERSION "2.6.0"
 
 using namespace stonky;
 
@@ -151,7 +151,13 @@ int main(int argc, char **argv) {
             symbols = parseSymbolsFile(assetFile);
 
             if (symbols.empty()) {
-                spdlog::info("Symbols file is empty or unreadable, updating all exchange symbols");
+                // An empty list means "every symbol on the exchange" further
+                // down, so a typo in the path used to silently launch a full
+                // universe download instead of the intended handful.
+                spdlog::error(fmt::format(
+                    "Symbols file {} is empty or unreadable — refusing to fall back to all exchange symbols",
+                    assetFile));
+                return -1;
             }
         }
 
@@ -417,14 +423,30 @@ int main(int argc, char **argv) {
 
             const auto reports = CsvVerifier::verifyDirectory(verifyDir.string(), verifierOptions);
 
+            if (reports.empty()) {
+                spdlog::error(fmt::format("No CSV files verified in {} — wrong path or empty dataset",
+                                          verifyDir.string()));
+                return 1;
+            }
+
             bool anyUnresolvedIssue = false;
+            bool anyGaps = false;
             for (const auto &report: reports) {
                 if (report.readFailed || (report.needsRepair() && !report.repaired)) {
                     anyUnresolvedIssue = true;
-                    break;
+                }
+                if (report.hasGaps()) {
+                    anyGaps = true;
                 }
             }
-            return anyUnresolvedIssue ? 1 : 0;
+
+            // Distinct codes so a cron job can tell the two apart: 1 is damage
+            // that should have been repairable, 2 is missing bars, which are
+            // often exchange outages and need a human to judge.
+            if (anyUnresolvedIssue) {
+                return 1;
+            }
+            return anyGaps ? 2 : 0;
         }
 
         std::unique_ptr<IExchangeDownloader> downloader;
@@ -463,7 +485,11 @@ int main(int argc, char **argv) {
             downloader->updateFundingRateData(outputDirectory, symbols, {}, {});
         }
     } catch (std::exception &e) {
+        // Returning 0 here made every fatal error invisible to cron, systemd
+        // and CI: an unimplemented operation, an invalid interval or a missing
+        // input directory all logged CRITICAL and then reported success.
         spdlog::critical(e.what());
+        return 1;
     }
 
     return 0;

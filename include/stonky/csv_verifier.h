@@ -60,9 +60,15 @@ public:
         bool repaired = false;
         bool readFailed = false;
 
+        /// Damage `--repair` can actually undo: torn lines, duplicates, ordering.
+        /// Gaps are deliberately NOT included — a missing bar cannot be invented
+        /// locally, so reporting it as repairable would make `-r` claim a fix it
+        /// never performed. Use hasGaps() for the reporting side.
         [[nodiscard]] bool needsRepair() const {
             return malformed > 0 || salvaged > 0 || duplicates > 0 || outOfOrder > 0;
         }
+
+        [[nodiscard]] bool hasGaps() const { return gaps > 0; }
     };
 
     /// Verify (and optionally repair) a single CSV file.

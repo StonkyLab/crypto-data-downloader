@@ -8,6 +8,7 @@ Copyright (c) 2026 Vitezslav Kot <vitezslav.kot@stonky.cz>, Stonky s.r.o.
 
 #include "stonky/lighter/lighter_downloader.h"
 #include "stonky/csv_data.h"
+#include "stonky/csv_format.h"
 #include "stonky/downloader.h"
 #include "stonky/lighter/lighter_rest_client.h"
 #include "stonky/lighter/lighter.h"
@@ -235,11 +236,11 @@ bool LighterDownloader::P::writeCandlesToCSVFile(const std::vector<Candle> &cand
             continue;
         }
         ofs << candle.openTime << ",";
-        ofs << candle.open << ",";
-        ofs << candle.high << ",";
-        ofs << candle.low << ",";
-        ofs << candle.close << ",";
-        ofs << candle.baseVolume << std::endl;
+        ofs << csvNumber(candle.open) << ",";
+        ofs << csvNumber(candle.high) << ",";
+        ofs << csvNumber(candle.low) << ",";
+        ofs << csvNumber(candle.close) << ",";
+        ofs << csvNumber(candle.baseVolume) << std::endl;
     }
 
     ofs.flush();
@@ -289,7 +290,7 @@ bool LighterDownloader::P::writeFundingRatesToCSVFile(const std::vector<FundingR
 
     for (const auto &record: fr) {
         ofs << record.fundingTime << ",";
-        ofs << record.fundingRate << std::endl;
+        ofs << csvNumber(record.fundingRate) << std::endl;
     }
 
     ofs.close();

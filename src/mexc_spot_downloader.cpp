@@ -7,6 +7,7 @@ Copyright (c) 2026 Vitezslav Kot <vitezslav.kot@stonky.cz>, Stonky s.r.o.
 */
 
 #include "stonky/mexc/mexc_spot_downloader.h"
+#include "stonky/csv_format.h"
 #include "stonky/csv_data.h"
 #include "stonky/mexc/mexc_spot_rest_client.h"
 #include "stonky/mexc/mexc.h"
@@ -223,12 +224,12 @@ bool MEXCSpotDownloader::P::writeCandlesToCSVFile(const std::vector<Candle> &can
 
     for (const auto &candle: candles) {
         ofs << candle.openTime << ",";
-        ofs << candle.open.str(8, std::ios_base::fixed) << ",";
-        ofs << candle.high.str(8, std::ios_base::fixed) << ",";
-        ofs << candle.low.str(8, std::ios_base::fixed) << ",";
-        ofs << candle.close.str(8, std::ios_base::fixed) << ",";
-        ofs << candle.volume.str(10, std::ios_base::fixed) << ",";
-        ofs << candle.quoteAssetVolume.str(10, std::ios_base::fixed) << std::endl;
+        ofs << csvNumber(candle.open) << ",";
+        ofs << csvNumber(candle.high) << ",";
+        ofs << csvNumber(candle.low) << ",";
+        ofs << csvNumber(candle.close) << ",";
+        ofs << csvNumber(candle.volume) << ",";
+        ofs << csvNumber(candle.quoteAssetVolume) << std::endl;
     }
 
     ofs.close();
@@ -246,12 +247,12 @@ bool MEXCSpotDownloader::P::writeCandlesToTempFile(const std::vector<Candle> &ca
 
     for (const auto &candle: candles) {
         ofs << candle.openTime << ",";
-        ofs << candle.open.str(8, std::ios_base::fixed) << ",";
-        ofs << candle.high.str(8, std::ios_base::fixed) << ",";
-        ofs << candle.low.str(8, std::ios_base::fixed) << ",";
-        ofs << candle.close.str(8, std::ios_base::fixed) << ",";
-        ofs << candle.volume.str(10, std::ios_base::fixed) << ",";
-        ofs << candle.quoteAssetVolume.str(10, std::ios_base::fixed) << std::endl;
+        ofs << csvNumber(candle.open) << ",";
+        ofs << csvNumber(candle.high) << ",";
+        ofs << csvNumber(candle.low) << ",";
+        ofs << csvNumber(candle.close) << ",";
+        ofs << csvNumber(candle.volume) << ",";
+        ofs << csvNumber(candle.quoteAssetVolume) << std::endl;
     }
 
     ofs.close();

@@ -63,3 +63,12 @@ All notable changes to this project will be documented in this file. This projec
 - Filter archive rows by instrument name: "futureschain" files are keyed by instrument family and can hold several contracts
 - Re-request an archive listing when it links a file belonging to a different instrument than the entry names. OKX returns the SPOT archive URL from a SWAP entry in roughly half of the responses for some months, which spliced spot prices into futures series before the instrument-name filter, and left a hole after it
 - Binance spot: keep the last candle when it has already closed. It was dropped unconditionally, which permanently cost every delisted symbol its final bar
+
+## [2.6.0](https://github.com/vitakot/crypto_data_downloader/releases/tag/v2.6.0) (2026-08-10)
+- Write CSV numbers losslessly. Streaming a value used the stream's default of six SIGNIFICANT digits, so anything needing more was truncated: BTC-USDT-SWAP above $100 000 lost its 0.1 tick across 310 000 bars (105635.8 stored as 105636) and a volume of 1 205 829 became 1.20583e+06. Affected Binance, Bybit, OKX, Hyperliquid, Lighter and MEXC
+- OKX: drop the still-forming candle instead of the oldest one. The REST endpoint answers newest-first, so the code discarded a complete candle and kept the partial one, which the append-only CSV then froze permanently
+- MEXC: stop converting prices through `std::to_string(double)`, which formats six decimal places and collapsed everything below 0.000001 to zero
+- Enable TLS peer and hostname verification on Binance, OKX and Hyperliquid (Bybit and Lighter already had it). The OKX archive host is verified against the host in the download URL
+- Return a non-zero exit code on fatal errors; verification exits 1 for repairable damage and 2 for gaps, so cron can tell them apart
+- Refuse to fall back to "all exchange symbols" when `-a` points at an empty or unreadable file
+

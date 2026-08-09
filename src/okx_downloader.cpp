@@ -8,6 +8,7 @@ Copyright (c) 2025 Vitezslav Kot <vitezslav.kot@stonky.cz>, Stonky s.r.o.
 
 #include "stonky/okx/okx_downloader.h"
 #include "stonky/csv_data.h"
+#include "stonky/csv_format.h"
 #include "stonky/okx/okx.h"
 #include "stonky/okx/okx_rest_client.h"
 #include "stonky/okx/okx_market_data_utils.h"
@@ -383,13 +384,13 @@ bool OKXDownloader::P::writeCandlesToCSVFile(const std::vector<Candle> &candles,
 
     for (const auto &candle: candles) {
         ofs << candle.ts << ",";
-        ofs << candle.o << ",";
-        ofs << candle.h << ",";
-        ofs << candle.l << ",";
-        ofs << candle.c << ",";
-        ofs << candle.vol << ",";
-        ofs << candle.volCcy << ",";
-        ofs << candle.volCcyQuote << std::endl;
+        ofs << csvNumber(candle.o) << ",";
+        ofs << csvNumber(candle.h) << ",";
+        ofs << csvNumber(candle.l) << ",";
+        ofs << csvNumber(candle.c) << ",";
+        ofs << csvNumber(candle.vol) << ",";
+        ofs << csvNumber(candle.volCcy) << ",";
+        ofs << csvNumber(candle.volCcyQuote) << std::endl;
     }
 
     ofs.close();
@@ -436,7 +437,7 @@ bool OKXDownloader::P::writeFundingRatesToCSVFile(const std::vector<FundingRate>
 
     for (const auto &record: fr) {
         ofs << record.fundingTime << ",";
-        ofs << record.fundingRate << std::endl;
+        ofs << csvNumber(record.fundingRate) << std::endl;
     }
 
     ofs.close();
