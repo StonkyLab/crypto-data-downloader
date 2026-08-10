@@ -10,6 +10,7 @@ Copyright (c) 2025 Vitezslav Kot <vitezslav.kot@stonky.cz>, Stonky s.r.o.
 #include "stonky/binance/binance_spot_rest_client.h"
 #include "stonky/binance/binance_common.h"
 #include "stonky/downloader.h"
+#include "stonky/future_utils.h"
 #include "stonky/utils/semaphore.h"
 #include "stonky/utils/utils.h"
 #include "stonky/binance/binance.h"
@@ -28,7 +29,7 @@ struct BinanceSpotDownloader::P {
     std::unique_ptr<spot::RESTClient> bnbSpotClient;
     std::unique_ptr<BinanceCommon> binanceCommon;
     mutable Semaphore maxConcurrentConvertJobs;
-    Semaphore maxConcurrentDownloadJobs{3};
+    Semaphore maxConcurrentDownloadJobs;
     bool deleteDelistedData = false;
 
     explicit P(const std::uint32_t maxJobs, const bool deleteDelistedData) : bnbSpotClient(
@@ -37,7 +38,8 @@ struct BinanceSpotDownloader::P {
                                                                              binanceCommon(
                                                                                  std::make_unique<BinanceCommon>(
                                                                                      maxJobs)),
-                                                                             maxConcurrentConvertJobs(maxJobs),
+                                                                             maxConcurrentConvertJobs(normalizedJobCount(maxJobs)),
+                                                                             maxConcurrentDownloadJobs(boundedJobCount(maxJobs, 3)),
                                                                              deleteDelistedData(deleteDelistedData) {
     }
 };
@@ -62,6 +64,7 @@ void BinanceSpotDownloader::updateMarketData(const std::string &dirPath, const s
 
     std::vector<std::future<std::filesystem::path> > futures;
     const std::filesystem::path finalPath(dirPath);
+    validateSymbolFileComponents(symbols);
     std::vector<std::string> symbolsToUpdate = symbols;
     std::vector<std::filesystem::path> csvFilePaths;
     std::vector<std::string> symbolsToDelete;
@@ -147,13 +150,17 @@ void BinanceSpotDownloader::updateMarketData(const std::string &dirPath, const s
         symbolsToUpdate = tempSymbols;
     }
 
+    deduplicatePreserveOrder(symbolsToUpdate);
+    validateSymbolFileComponents(symbolsToUpdate);
+    if (onSymbolsToUpdateCB) {
+        onSymbolsToUpdateCB(symbolsToUpdate);
+    }
+
     for (const auto &s: symbolsToUpdate) {
         futures.push_back(
-            std::async(std::launch::async,
-                       [finalPath, this, &bnbCandleInterval, &barSizeInMinutes, convertToT6](const std::string &symbol,
-                   Semaphore &maxJobs) ->
+            launchBounded(m_p->maxConcurrentDownloadJobs,
+                       [finalPath, this, &bnbCandleInterval, &barSizeInMinutes, convertToT6](const std::string &symbol) ->
                    std::filesystem::path {
-                           std::scoped_lock w(maxJobs);
                            std::filesystem::path symbolFilePathCsv = finalPath;
                            std::filesystem::path symbolFilePathT6 = finalPath;
 
@@ -190,15 +197,16 @@ void BinanceSpotDownloader::updateMarketData(const std::string &dirPath, const s
                            const int64_t fromTimeStamp = BinanceCommon::checkSymbolCSVFile(symbolFilePathCsv.string());
 
                            try {
-                               const auto candles = m_p->bnbSpotClient->getHistoricalPrices(symbol,
-                                   bnbCandleInterval,
-                                   fromTimeStamp,
-                                   nowTimestamp, 1500);
+                               const auto written = BinanceCommon::downloadCandlesToCSVFile(
+                                   [this, &symbol, bnbCandleInterval](const std::int64_t start,
+                                                                    const std::int64_t end,
+                                                                    const std::int32_t limit) {
+                                       return m_p->bnbSpotClient->getHistoricalPricesSingle(
+                                           symbol, bnbCandleInterval, start, end, limit);
+                                   }, fromTimeStamp, nowTimestamp, symbolFilePathCsv.string());
 
-                               if (!candles.empty()) {
-                                   if (BinanceCommon::writeCandlesToCSVFile(candles, symbolFilePathCsv.string())) {
-                                       spdlog::info(fmt::format("CSV file for symbol: {} updated", symbol));
-                                   }
+                               if (written > 0) {
+                                   spdlog::info(fmt::format("CSV file for symbol: {} updated", symbol));
                                }
                                // Return the path if the CSV file exists (for T6 conversion)
                                if (std::filesystem::exists(symbolFilePathCsv)) {
@@ -207,18 +215,17 @@ void BinanceSpotDownloader::updateMarketData(const std::string &dirPath, const s
                            } catch (const std::exception &e) {
                                spdlog::warn(fmt::format("Updating candles for symbol: {} failed, reason: {}",
                                                         symbol, e.what()));
+                               throw;
                            }
                            return "";
-                       }, s, std::ref(m_p->maxConcurrentDownloadJobs)));
+                       }, s));
     }
 
-    do {
-        for (auto &future: futures) {
-            if (isReady(future)) {
-                csvFilePaths.push_back(future.get());
-            }
+    csvFilePaths = waitAllOrThrow(futures, [&onSymbolCompletedCB](const std::filesystem::path &path) {
+        if (onSymbolCompletedCB && !path.empty()) {
+            onSymbolCompletedCB(path.stem().string());
         }
-    } while (csvFilePaths.size() < futures.size());
+    });
 
     std::filesystem::path T6Directory = finalPath;
 

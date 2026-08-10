@@ -7,13 +7,25 @@ Copyright (c) 2026 Vitezslav Kot <vitezslav.kot@stonky.cz>, Stonky s.r.o.
 */
 
 #include "stonky/csv_verifier.h"
+#include "stonky/future_utils.h"
 #include "stonky/utils/utils.h"
 #include "stonky/utils/semaphore.h"
 #include <algorithm>
+#include <cerrno>
+#include <cmath>
+#include <chrono>
+#include <cstdlib>
 #include <filesystem>
 #include <fstream>
 #include <future>
 #include <spdlog/spdlog.h>
+
+#ifdef _WIN32
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+#endif
 
 namespace stonky {
 
@@ -31,10 +43,87 @@ bool parseTimestamp(const std::string &field, std::int64_t &out) {
     return pos == field.size();
 }
 
+bool parseFiniteNumber(const std::string &field) {
+    if (field.empty()) {
+        return false;
+    }
+    char *end = nullptr;
+    errno = 0;
+    const auto value = std::strtold(field.c_str(), &end);
+    return end == field.c_str() + field.size() && errno != ERANGE && std::isfinite(value);
+}
+
 struct Record {
     std::int64_t ts{};
     std::string line;
 };
+
+bool matchesHeader(const std::vector<std::string> &fields, const CsvVerifier::Options &options) {
+    static const std::vector<std::string> funding{"funding_time", "funding_rate"};
+    static const std::vector<std::string> ohlcv{"open_time", "open", "high", "low", "close", "volume"};
+    static const std::vector<std::string> legacyBybit{
+        "open_time", "open", "high", "low", "close", "volume", "turnover"};
+    static const std::vector<std::string> mexcSpot{
+        "open_time", "open", "high", "low", "close", "volume", "quote_asset_volume"};
+    static const std::vector<std::string> mexcFutures{
+        "open_time", "open", "high", "low", "close", "volume", "amount"};
+    static const std::vector<std::string> okx{
+        "open_time", "open", "high", "low", "close", "volume", "vol_ccy", "vol_ccy_quote"};
+    static const std::vector<std::string> binance{
+        "close_time", "open", "high", "low", "close", "volume", "timestamp", "quote_av",
+        "trades", "tb_base_av", "tb_quote_av", "ignore"};
+
+    switch (options.expectedFields) {
+        case 2:
+            return fields == funding;
+        case 6:
+            return fields == ohlcv || (options.salvageExtraField && fields == legacyBybit);
+        case 7:
+            return fields == mexcSpot || fields == mexcFutures;
+        case 8:
+            return fields == okx;
+        case 12:
+            return fields == binance;
+        default:
+            return false;
+    }
+}
+
+bool replaceFile(const std::filesystem::path &source,
+                 const std::filesystem::path &destination,
+                 std::string &error) {
+#ifdef _WIN32
+    if (!::MoveFileExW(source.c_str(), destination.c_str(),
+                       MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)) {
+        error = fmt::format("Windows error {}", static_cast<unsigned long>(::GetLastError()));
+        return false;
+    }
+    return true;
+#else
+    std::error_code ec;
+    std::filesystem::rename(source, destination, ec);
+    if (ec) {
+        error = ec.message();
+        return false;
+    }
+    return true;
+#endif
+}
+
+std::int64_t nextCalendarTimestamp(const std::int64_t timestamp,
+                                   const bool timestampIsClose,
+                                   const std::int32_t utcOffsetMinutes) {
+    using namespace std::chrono;
+    const auto offset = minutes{utcOffsetMinutes};
+    const auto localBase = milliseconds{timestamp + (timestampIsClose ? 1 : 0)} + offset;
+    const year_month_day current{floor<days>(sys_time<milliseconds>{localBase})};
+    const year_month_day next = current.year() / current.month() / day{1} + months{1};
+    const auto nextOpen = duration_cast<milliseconds>((sys_days{next} - offset).time_since_epoch()).count();
+    if (!timestampIsClose) {
+        return nextOpen;
+    }
+    return nextOpen - 1;
+}
 } // namespace
 
 CsvVerifier::FileReport CsvVerifier::verifyFile(const std::string &path, const Options &options) {
@@ -50,7 +139,18 @@ CsvVerifier::FileReport CsvVerifier::verifyFile(const std::string &path, const O
 
     std::string header;
     if (!std::getline(ifs, header)) {
-        return report; // empty file — nothing to verify
+        report.readFailed = true;
+        spdlog::error(fmt::format("CSV file is empty: {}", path));
+        return report;
+    }
+    if (!header.empty() && header.back() == '\r') {
+        header.pop_back();
+    }
+    const auto headerFields = splitString(header, ',');
+    if (!matchesHeader(headerFields, options)) {
+        report.readFailed = true;
+        spdlog::error(fmt::format("Invalid CSV header in {}", path));
+        return report;
     }
 
     std::vector<Record> records;
@@ -68,36 +168,44 @@ CsvVerifier::FileReport CsvVerifier::verifyFile(const std::string &path, const O
         const auto fields = splitString(line, ',');
         std::int64_t ts = 0;
 
-        if (options.allowMoreFields) {
-            // Variable-width layout (MEXC): require at least expectedFields, keep verbatim.
-            if (fields.size() < options.expectedFields || !parseTimestamp(fields[0], ts)) {
-                report.malformed++;
-                continue;
+        // Fixed-width layout. Accept exactly one known legacy trailing Bybit
+        // turnover field when requested. Arbitrary extra fields are never
+        // accepted: they may be the suffix of a glued record.
+        const bool exact = fields.size() == options.expectedFields;
+        const bool legacyExtraHeader = options.salvageExtraField &&
+                                       headerFields.size() == options.expectedFields + 1 &&
+                                       headerFields.back() == "turnover";
+        const bool extra = legacyExtraHeader &&
+                           fields.size() == options.expectedFields + 1;
+        if ((!exact && !extra) || !parseTimestamp(fields[0], ts)) {
+            report.malformed++;
+            continue;
+        }
+        const bool trailingDelim = !line.empty() && line.back() == ',';
+        if (!exact || trailingDelim) {
+            std::string canonical = fields[0];
+            for (std::size_t i = 1; i < options.expectedFields; ++i) {
+                canonical += ',';
+                canonical += fields[i];
             }
-        } else {
-            // Fixed-width layout. Accept rows with exactly expectedFields, plus
-            // (when salvaging) rows with extra value columns. Normalise every
-            // accepted row to the canonical first-expectedFields form so a stray
-            // trailing delimiter — an empty legacy turnover column that
-            // splitString silently drops, leaving a 6-token row whose raw text
-            // still has 7 comma-separated fields and breaks downstream pandas —
-            // is rewritten cleanly.
-            const bool exact = fields.size() == options.expectedFields;
-            const bool extra = options.salvageExtraField && fields.size() > options.expectedFields;
-            if ((!exact && !extra) || !parseTimestamp(fields[0], ts)) {
-                report.malformed++;
-                continue;
+            line = std::move(canonical);
+            report.salvaged++;
+        }
+
+        // All downloader schemas put OHLCV/funding values after the timestamp.
+        // Reject NaN/Inf, empty cells and glued text even when the field count
+        // happens to look plausible.
+        const auto numericEnd = std::min(fields.size(), options.expectedFields);
+        bool numeric = true;
+        for (std::size_t i = 1; i < numericEnd; ++i) {
+            if (!parseFiniteNumber(fields[i])) {
+                numeric = false;
+                break;
             }
-            const bool trailingDelim = !line.empty() && line.back() == ',';
-            if (!exact || trailingDelim) {
-                std::string canonical = fields[0];
-                for (std::size_t i = 1; i < options.expectedFields; ++i) {
-                    canonical += ',';
-                    canonical += fields[i];
-                }
-                line = std::move(canonical);
-                report.salvaged++;
-            }
+        }
+        if (!numeric) {
+            report.malformed++;
+            continue;
         }
 
         if (prevTs >= 0 && ts < prevTs) {
@@ -107,9 +215,19 @@ CsvVerifier::FileReport CsvVerifier::verifyFile(const std::string &path, const O
         records.push_back({ts, std::move(line)});
         line.clear();
     }
+    if (ifs.bad()) {
+        report.readFailed = true;
+        spdlog::error(fmt::format("Failed while reading CSV file: {}", path));
+        return report;
+    }
     ifs.close();
 
     report.totalRecords = records.size();
+    if (records.empty()) {
+        report.readFailed = true;
+        spdlog::error(fmt::format("CSV file contains no valid data rows: {}", path));
+        return report;
+    }
 
     // Sort + dedup (keep the FIRST occurrence — the original download; later
     // occurrences come from historical re-appends)
@@ -127,7 +245,25 @@ CsvVerifier::FileReport CsvVerifier::verifyFile(const std::string &path, const O
     }
 
     // Gap analysis (report only)
-    if (options.intervalMs > 0) {
+    if (options.calendarMonth) {
+        const bool timestampIsClose = headerFields[0] == "close_time";
+        for (std::size_t i = 1; i < unique.size(); ++i) {
+            auto expected = nextCalendarTimestamp(unique[i - 1].ts, timestampIsClose,
+                                                  options.calendarUtcOffsetMinutes);
+            if (unique[i].ts != expected) {
+                if (report.gaps == 0) {
+                    report.firstGapTs = unique[i - 1].ts;
+                }
+                ++report.gaps;
+                std::size_t guard = 0;
+                while (expected < unique[i].ts && guard++ < 1200) {
+                    ++report.missingBars;
+                    expected = nextCalendarTimestamp(expected, timestampIsClose,
+                                                     options.calendarUtcOffsetMinutes);
+                }
+            }
+        }
+    } else if (options.intervalMs > 0) {
         for (std::size_t i = 1; i < unique.size(); ++i) {
             const auto delta = unique[i].ts - unique[i - 1].ts;
             if (delta != options.intervalMs) {
@@ -146,8 +282,7 @@ CsvVerifier::FileReport CsvVerifier::verifyFile(const std::string &path, const O
         // Canonical header: first expectedFields names of the original header
         // (drops a legacy trailing column name when salvaging)
         std::string outHeader = header;
-        if (const auto headerFields = splitString(header, ','); headerFields.size() > options.expectedFields &&
-                                                                !options.allowMoreFields) {
+        if (const auto headerFields = splitString(header, ','); headerFields.size() > options.expectedFields) {
             outHeader = headerFields[0];
             for (std::size_t i = 1; i < options.expectedFields; ++i) {
                 outHeader += ',';
@@ -177,11 +312,18 @@ CsvVerifier::FileReport CsvVerifier::verifyFile(const std::string &path, const O
             return report;
         }
         ofs.close();
+        if (!ofs.good()) {
+            spdlog::error(fmt::format("Closing temp file failed: {}", tmpPath));
+            std::error_code ec;
+            std::filesystem::remove(tmpPath, ec);
+            report.readFailed = true;
+            return report;
+        }
 
-        std::error_code ec;
-        std::filesystem::rename(tmpPath, path, ec);
-        if (ec) {
-            spdlog::error(fmt::format("Failed to replace {}: {}", path, ec.message()));
+        std::string replaceError;
+        if (!replaceFile(tmpPath, path, replaceError)) {
+            spdlog::error(fmt::format("Failed to replace {}: {}", path, replaceError));
+            std::error_code ec;
             std::filesystem::remove(tmpPath, ec);
             report.readFailed = true;
             return report;
@@ -218,9 +360,8 @@ std::vector<CsvVerifier::FileReport> CsvVerifier::verifyDirectory(const std::str
     futures.reserve(files.size());
 
     for (const auto &file: files) {
-        futures.push_back(std::async(std::launch::async,
-                                     [&options, &maxJobs](const std::filesystem::path &p) -> FileReport {
-                                         std::scoped_lock w(maxJobs);
+        futures.push_back(launchBounded(maxJobs,
+                                     [&options](const std::filesystem::path &p) -> FileReport {
                                          return verifyFile(p.string(), options);
                                      }, file));
     }

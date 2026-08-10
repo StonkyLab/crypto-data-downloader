@@ -10,7 +10,11 @@ Copyright (c) 2026 Vitezslav Kot <vitezslav.kot@stonky.cz>, Stonky s.r.o.
 #define INCLUDE_STONKY_CSV_FORMAT_H
 
 #include <boost/multiprecision/cpp_dec_float.hpp>
+#include <boost/math/special_functions/fpclassify.hpp>
 #include <spdlog/fmt/fmt.h>
+#include <cmath>
+#include <ios>
+#include <stdexcept>
 #include <string>
 
 namespace stonky {
@@ -31,16 +35,24 @@ namespace stonky {
  * to a clean 19557.9.
  */
 inline std::string csvNumber(const double value) {
+    if (!std::isfinite(value)) {
+        throw std::domain_error("non-finite double cannot be serialized to market-data CSV");
+    }
     return fmt::format("{}", value);
 }
 
 /**
- * Same for the arbitrary-precision type the OKX and MEXC models use. Market
- * data carries far fewer than the 15 significant digits a double holds
- * exactly, so the round trip is safe and yields the cleanest true value.
+ * Same for the arbitrary-precision type the OKX and MEXC models use. Keep the
+ * value in decimal form throughout: narrowing to double here would silently
+ * discard every significant digit beyond the double's precision. With zero
+ * requested digits Boost emits the backend's full available precision in its
+ * general format and suppresses insignificant trailing zeroes.
  */
 inline std::string csvNumber(const boost::multiprecision::cpp_dec_float_50 &value) {
-    return csvNumber(value.convert_to<double>());
+    if (!boost::math::isfinite(value)) {
+        throw std::domain_error("non-finite decimal cannot be serialized to market-data CSV");
+    }
+    return value.str(0, std::ios_base::fmtflags{});
 }
 
 } // namespace stonky

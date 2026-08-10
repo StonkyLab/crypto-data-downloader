@@ -1,0 +1,24 @@
+{
+  "name": "crypto-data-downloader",
+  "version-string": "development",
+  "builtin-baseline": "74e6536215718009aae747d86d84b78376bf9e09",
+  "dependencies": [
+    "boost-algorithm",
+    "boost-any",
+    "boost-asio",
+    "boost-beast",
+    "boost-config",
+    "boost-dll",
+    "boost-math",
+    "boost-multiprecision",
+    "boost-type-index",
+    "cxxopts",
+    "magic-enum",
+    "minizip-ng",
+    "nlohmann-json",
+    "openssl",
+    "secp256k1",
+    "spdlog",
+    "zlib"
+  ]
+}

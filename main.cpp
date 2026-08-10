@@ -21,7 +21,7 @@ Copyright (c) 2025 Vitezslav Kot <vitezslav.kot@stonky.cz>, Stonky s.r.o.
 #include <cxxopts.hpp>
 #include <filesystem>
 #include <spdlog/sinks/stdout_sinks.h>
-#include <spdlog/sinks/basic_file_sink.h>
+#include <spdlog/sinks/rotating_file_sink.h>
 #include <algorithm>
 #include "csv.h"
 #include <iostream>
@@ -87,6 +87,7 @@ int main(int argc, char **argv) {
     bool verifyData = false;
     bool repairData = false;
     bool xperp = false;
+    bool allowPartialAggregation = false;
     std::vector<std::string> aggregateTargets;
     std::uint32_t maxJobs = static_cast<std::uint32_t>(std::max(std::floor(std::thread::hardware_concurrency() * 0.75),
                                                                 1.0));
@@ -115,6 +116,7 @@ int main(int argc, char **argv) {
             ("z,t6_conversion", R"(Convert existing CSV data to T6 format (Zorro Trader format) without downloading new data)")
             ("g,aggregate", R"(Aggregate the existing -b bar size into coarser timeframes (minutes, comma separated) without downloading, example: -o /data/okx -b 1 -g 5,60. OKX only publishes 1m bars in its bulk archive, so higher timeframes are built locally)",
              cxxopts::value<std::vector<std::string> >()->default_value(""))
+            ("allow_partial_aggregation", R"(Allow aggregation to emit a coarse candle even when source bars are missing; by default incomplete buckets are skipped and the command fails)")
             ("x,xperp", R"(OKX only: download X-Perps (USD-settled perpetual-style futures, instType FUTURES / ruleType xperp) instead of USDT swaps. Data land in <output>/xperp/. Their funding rates come from the REST endpoint only, which serves ~3 months)")
             ("y,verify", R"(Verify CSV data integrity (torn lines, duplicates, ordering, gaps) without downloading, example: -e bybit -o /data/bybit -b 1 -y)")
             ("r,repair", R"(Verify and repair CSV data files in place (removes torn lines and duplicates, restores ordering), example: -e bybit -o /data/bybit -b 1 -r)")
@@ -323,6 +325,7 @@ int main(int argc, char **argv) {
         repairData = parseResult["repair"].as<bool>();
         aggregateTargets = parseResult["aggregate"].as<std::vector<std::string> >();
         std::erase_if(aggregateTargets, [](const std::string &s) { return s.empty(); });
+        allowPartialAggregation = parseResult["allow_partial_aggregation"].as<bool>();
         xperp = parseResult["xperp"].as<bool>();
 
         if (xperp && exchange != "okx") {
@@ -341,8 +344,9 @@ int main(int argc, char **argv) {
 
     try {
         std::vector<spdlog::sink_ptr> sinks;
-        sinks.push_back(std::make_shared<spdlog::sinks::stdout_sink_st>());
-        sinks.push_back(std::make_shared<spdlog::sinks::basic_file_sink_st>("crypto_data_downloader.log"));
+        sinks.push_back(std::make_shared<spdlog::sinks::stdout_sink_mt>());
+        sinks.push_back(std::make_shared<spdlog::sinks::rotating_file_sink_mt>(
+            "crypto_data_downloader.log", 10 * 1024 * 1024, 3));
         auto combinedLogger = std::make_shared<spdlog::logger>("crypto_data_downloader", begin(sinks), end(sinks));
         register_logger(combinedLogger);
         set_default_logger(combinedLogger);
@@ -352,10 +356,19 @@ int main(int argc, char **argv) {
             CandleAggregator::Options aggregatorOptions;
             aggregatorOptions.sourceMinutes = barSizeInMinutes;
             aggregatorOptions.maxJobs = maxJobs;
+            aggregatorOptions.allowPartialBuckets = allowPartialAggregation;
+            // Rebuild derived files transactionally. This allows a source gap
+            // repaired since the previous run to be inserted in chronological
+            // order instead of remaining behind an append-only target tail.
+            aggregatorOptions.rewrite = true;
 
             for (const auto &target: aggregateTargets) {
                 try {
                     const auto minutes = std::stoi(target);
+                    if (minutes == 43200) {
+                        throw std::runtime_error(
+                            "calendar-month aggregation is not representable as a fixed minute bucket");
+                    }
                     // Rejects an unrepresentable bar size before any file is touched
                     (void) Downloader::minutesToString(minutes);
                     aggregatorOptions.targetMinutes.push_back(minutes);
@@ -371,6 +384,11 @@ int main(int argc, char **argv) {
                                  : (marketCategory == MarketCategory::Spot ? CSV_SPOT_DIR : CSV_FUT_DIR));
 
             const auto reports = CandleAggregator::aggregateDirectory(pricesDir.string(), aggregatorOptions);
+            if (reports.empty()) {
+                spdlog::error(fmt::format("No CSV files aggregated from {} — wrong path or empty dataset",
+                                          pricesDir.string()));
+                return 1;
+            }
             const bool anyFailure = std::ranges::any_of(reports, [](const CandleAggregator::Report &r) {
                 return r.failed;
             });
@@ -388,7 +406,9 @@ int main(int argc, char **argv) {
                 verifierOptions.expectedFields = 8;
             } else if (exchange == "mexc") {
                 verifierOptions.expectedFields = 7;
-                verifierOptions.allowMoreFields = true;
+                // Current MEXC writers have a fixed seven-column schema. Exact
+                // width catches two records glued together after a torn write.
+                verifierOptions.allowMoreFields = false;
             } else {
                 verifierOptions.expectedFields = 6; // bybit, hl, lt
             }
@@ -416,9 +436,15 @@ int main(int argc, char **argv) {
                 // so gaps there are meaningful (data downloaded before v2.4.0 had
                 // zero-volume bars filtered out — re-download to refill).
                 const bool gapsExpected = exchange == "bnb" && marketCategory == MarketCategory::Spot;
-                verifierOptions.intervalMs = gapsExpected
-                                                 ? 0
-                                                 : static_cast<std::int64_t>(barSizeInMinutes) * 60000;
+                if (!gapsExpected && barSizeInMinutes == 43200) {
+                    verifierOptions.calendarMonth = true;
+                    verifierOptions.calendarUtcOffsetMinutes = exchange == "okx" ? 8 * 60 : 0;
+                    verifierOptions.intervalMs = 0;
+                } else {
+                    verifierOptions.intervalMs = gapsExpected
+                                                     ? 0
+                                                     : static_cast<std::int64_t>(barSizeInMinutes) * 60000;
+                }
             }
 
             const auto reports = CsvVerifier::verifyDirectory(verifyDir.string(), verifierOptions);

@@ -11,6 +11,7 @@ Copyright (c) 2026 Vitezslav Kot <vitezslav.kot@stonky.cz>, Stonky s.r.o.
 #include <filesystem>
 #include <fstream>
 #include <spdlog/spdlog.h>
+#include <stdexcept>
 
 namespace stonky {
 
@@ -47,8 +48,18 @@ CsvData::TailCheck CsvData::lastValidRecord(const std::string& path, const std::
     result.timestamp = fallback;
 
     std::error_code ec;
+    const bool exists = std::filesystem::exists(path, ec);
+    if (ec) {
+        throw std::filesystem::filesystem_error("cannot inspect CSV path", path, ec);
+    }
+    if (!exists) {
+        return result;
+    }
     const auto fileSize = std::filesystem::file_size(path, ec);
-    if (ec || fileSize == 0) {
+    if (ec) {
+        throw std::filesystem::filesystem_error("cannot determine CSV size", path, ec);
+    }
+    if (fileSize == 0) {
         return result;
     }
 
@@ -60,12 +71,17 @@ CsvData::TailCheck CsvData::lastValidRecord(const std::string& path, const std::
 
         std::ifstream ifs(path, std::ios::binary);
         if (!ifs.is_open()) {
-            spdlog::error(fmt::format("Couldn't open file: {}", path));
-            return result;
+            throw std::runtime_error(fmt::format("Couldn't open CSV file: {}", path));
         }
         ifs.seekg(static_cast<std::streamoff>(readStart));
+        if (!ifs.good()) {
+            throw std::runtime_error(fmt::format("Couldn't seek in CSV file: {}", path));
+        }
         std::string buf(readLen, '\0');
         ifs.read(buf.data(), static_cast<std::streamsize>(readLen));
+        if (ifs.gcount() != static_cast<std::streamsize>(readLen) || ifs.bad()) {
+            throw std::runtime_error(fmt::format("Short or failed read from CSV file: {}", path));
+        }
         ifs.close();
 
         // Walk lines backwards. `lineEnd` is one past the end of the current
@@ -99,12 +115,12 @@ CsvData::TailCheck CsvData::lastValidRecord(const std::string& path, const std::
                 if (validEnd < fileSize) {
                     std::filesystem::resize_file(path, validEnd, ec);
                     if (ec) {
-                        spdlog::error(fmt::format("Failed to truncate torn tail of {}: {}", path, ec.message()));
-                    } else {
-                        result.repairedTail = true;
-                        spdlog::warn(fmt::format("Repaired torn tail of {} ({} bytes truncated)",
-                                                 path, fileSize - validEnd));
+                        throw std::filesystem::filesystem_error(
+                            "failed to truncate torn CSV tail", path, ec);
                     }
+                    result.repairedTail = true;
+                    spdlog::warn(fmt::format("Repaired torn tail of {} ({} bytes truncated)",
+                                             path, fileSize - validEnd));
                 }
                 return result;
             }
@@ -117,12 +133,12 @@ CsvData::TailCheck CsvData::lastValidRecord(const std::string& path, const std::
                 if (keep < fileSize) {
                     std::filesystem::resize_file(path, keep, ec);
                     if (ec) {
-                        spdlog::error(fmt::format("Failed to truncate corrupt {}: {}", path, ec.message()));
-                    } else {
-                        result.repairedTail = true;
-                        spdlog::warn(fmt::format("No valid record in {}, truncated to header ({} bytes removed)",
-                                                 path, fileSize - keep));
+                        throw std::filesystem::filesystem_error(
+                            "failed to truncate corrupt CSV", path, ec);
                     }
+                    result.repairedTail = true;
+                    spdlog::warn(fmt::format("No valid record in {}, truncated to header ({} bytes removed)",
+                                             path, fileSize - keep));
                 }
                 return result;
             }

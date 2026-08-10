@@ -32,9 +32,15 @@
 *.app
 
 .idea
-/cmake-build-debug
-/cmake-build-release
-build
+/build/
+/build-*/
+/cmake-build-*/
+/CMakeFiles/
+/CMakeCache.txt
+/cmake_install.cmake
+/CTestTestfile.cmake
+/Testing/
+/_ci/
 
 .vs
 VS/x64
@@ -42,3 +48,9 @@ VS/x86
 VS/Release
 VS/Debug
 *.vcxproj.user
+
+# Runtime logs and local credentials
+*.log
+.env
+.env.*
+!.env.example

@@ -1,8 +1,8 @@
 # Crypto Data Downloader
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
-[![C++20](https://img.shields.io/badge/C%2B%2B-20-blue.svg)](https://en.cppreference.com/w/cpp/20)
-[![CMake](https://img.shields.io/badge/CMake-3.20+-green.svg)](https://cmake.org/)
+[![C++23](https://img.shields.io/badge/C%2B%2B-23-blue.svg)](https://en.cppreference.com/w/cpp/23)
+[![CMake](https://img.shields.io/badge/CMake-4.0+-green.svg)](https://cmake.org/)
 
 A high-performance command-line utility for downloading historical market data (OHLCV candles) and funding rates from major cryptocurrency exchanges.
 
@@ -37,7 +37,10 @@ Lighter supports **perpetuals only** (no Spot). Symbols are coin names without a
 
 Lighter's mainnet (zkLighter) launched in late 2024. API host: `mainnet.zklighter.elliot.ai`.
 
-On the **first run** for a symbol the downloader requests the most recent ~5 000 candles of the chosen interval; subsequent runs append only data since the last CSV record.
+On the **first run** for a symbol the downloader probes its listing date and
+paginates from that date; subsequent runs append only data since the last CSV
+record. If the listing-date probe fails, the run fails closed instead of
+silently committing a shortened history.
 
 **Funding rates** cadence is 1 hour, available from late 2024.
 
@@ -115,84 +118,111 @@ To download data for delisted MEXC futures symbols, maintain your own list of de
 
 ## Requirements
 
-- C++20 compatible compiler (GCC 11+, Clang 14+, MSVC 2022)
-- CMake 3.20 or later
+- C++23 compatible compiler (GCC 13+, Clang 17+, or a current MSVC 2022)
+- CMake 4.0 or later
 - Git (for submodules)
 
 ### Dependencies
 
 - [OpenSSL](https://www.openssl.org/) - TLS/SSL support
-- [Boost](https://www.boost.org/) - Networking (Beast, Asio)
+- [Boost 1.88+](https://www.boost.org/) - Networking (Beast, Asio)
+- [zlib](https://zlib.net/) - Bybit archive decompression
+- [minizip-ng 4.x](https://github.com/zlib-ng/minizip-ng) - OKX archive decompression (fetched only when no package is installed)
 - [spdlog](https://github.com/gabime/spdlog) - Logging
 - [nlohmann/json](https://github.com/nlohmann/json) - JSON parsing
 - [cxxopts](https://github.com/jarro2783/cxxopts) - Command-line parsing
-- [libpqxx](https://github.com/jtv/libpqxx) - PostgreSQL client (optional)
+- [magic_enum](https://github.com/Neargye/magic_enum) - enum reflection
+- [libsecp256k1](https://github.com/bitcoin-core/secp256k1) - Hyperliquid signing support
 
 ## Installation
 
-### Windows
+### Windows (canonical CMake workflow)
+
+CMake is the source of truth for Windows builds. The repository does not keep a
+hand-maintained Visual Studio solution or project files; generate them from
+`CMakeLists.txt` with Visual Studio 2022 as shown below.
 
 1. **Install CMake**: Download from [cmake.org](https://cmake.org/download/)
 
 2. **Install Visual Studio 2022**: Download [Visual Studio Community](https://visualstudio.microsoft.com/downloads/) and install with **Desktop development with C++** workload.
 
-3. **Install vcpkg** (package manager):
+3. **Install the pinned vcpkg release** (package manager):
    ```powershell
-   git clone https://github.com/Microsoft/vcpkg.git C:\vcpkg
+   git clone --branch 2025.10.17 https://github.com/Microsoft/vcpkg.git C:\vcpkg
    cd C:\vcpkg
    .\bootstrap-vcpkg.bat
-   .\vcpkg integrate install
    ```
 
-4. **Install dependencies**:
-   ```powershell
-   vcpkg install cxxopts:x64-windows
-   vcpkg install libpqxx:x64-windows
-   vcpkg install spdlog:x64-windows
-   vcpkg install openssl:x64-windows
-   vcpkg install boost:x64-windows
-   vcpkg install nlohmann-json:x64-windows
-   ```
-
-5. **Build the project**:
+4. **Clone the project and initialize every submodule**:
    ```powershell
    git clone https://github.com/vitakot/crypto_data_downloader.git
    cd crypto_data_downloader
    git submodule update --init --recursive
-   mkdir build && cd build
-   cmake -DCMAKE_BUILD_TYPE=Release -DCMAKE_TOOLCHAIN_FILE=C:\vcpkg\scripts\buildsystems\vcpkg.cmake ..
-   cmake --build . --config Release -j
    ```
+
+5. **Generate a Visual Studio 2022 build**. The vcpkg toolchain reads and
+   installs the checked-in dependency manifest during configuration:
+   ```powershell
+   cmake -S . -B build -G "Visual Studio 17 2022" -A x64 "-DCMAKE_TOOLCHAIN_FILE=C:/vcpkg/scripts/buildsystems/vcpkg.cmake"
+   cmake --build build --config Release --parallel
+   ctest --test-dir build -C Release --output-on-failure
+   ```
+
+   The checked-in `vcpkg.json` installs the complete dependency set, including
+   the `minizip-ng` port (not the unrelated legacy `minizip` port). Visual
+   Studio can also open the repository folder directly and consume the same
+   CMake project.
 
 ### Linux (Ubuntu/Debian)
 
-1. **Install build tools**:
+1. **Install build tools**. Verify that CMake is 4.0 or newer; older
+   Ubuntu/Debian releases may require the official CMake packages or binaries
+   instead of the distribution version:
    ```bash
    sudo apt update
-   sudo apt install -y cmake build-essential git
+   sudo apt install -y build-essential git ninja-build curl zip unzip tar pkg-config autoconf automake libtool
    ```
 
-2. **Install dependencies**:
-   ```bash
-   sudo apt install -y \
-       libssl-dev \
-       libboost-all-dev \
-       libspdlog-dev \
-       nlohmann-json3-dev \
-       libcxxopts-dev \
-       libpq-dev \
-       libpqxx-dev
-   ```
-
-3. **Build the project**:
+2. **Clone the project and initialize every submodule**:
    ```bash
    git clone https://github.com/vitakot/crypto_data_downloader.git
    cd crypto_data_downloader
    git submodule update --init --recursive
-   mkdir build && cd build
-   cmake -DCMAKE_BUILD_TYPE=Release ..
-   cmake --build . -j$(nproc)
    ```
+
+3. **Install the pinned vcpkg release, then build**:
+   ```bash
+   git clone --branch 2025.10.17 https://github.com/Microsoft/vcpkg.git ../vcpkg
+   ../vcpkg/bootstrap-vcpkg.sh -disableMetrics
+   cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release \
+       -DCMAKE_TOOLCHAIN_FILE=../vcpkg/scripts/buildsystems/vcpkg.cmake
+   cmake --build build --parallel 2
+   ctest --test-dir build --output-on-failure
+   ```
+
+The manifest uses `minizip-ng`; when building without vcpkg and without an
+installed minizip-ng CMake package, the OKX connector fetches minizip-ng 4.0.7.
+Set `-DOKX_FETCH_MINIZIP=OFF` for a fully offline, fail-closed configuration.
+
+### Tests, sanitizers, and coverage
+
+The deterministic regression suite does not need exchange connectivity. A
+minimal test-only build avoids all connector and minizip dependencies:
+
+```bash
+cmake -S . -B build-tests -DBUILD_DOWNLOADER=OFF -DBUILD_TESTING=ON
+cmake --build build-tests -j2
+ctest --test-dir build-tests --output-on-failure
+```
+
+With GCC or Clang, add `-DENABLE_SANITIZERS=ON` to run the same suite under
+AddressSanitizer and UndefinedBehaviorSanitizer. Use a separate build directory
+with `-DENABLE_COVERAGE=ON` for compiler coverage instrumentation; CI smoke-tests
+both modes but does not publish coverage to an external service. Both options
+fail configuration on unsupported compilers.
+
+Live MEXC account tools are not part of CTest; destructive tools require the
+explicit connector option `ENABLE_DESTRUCTIVE_MEXC_TOOLS=ON`.
 
 ## Usage
 
@@ -210,11 +240,12 @@ crypto_data_downloader [OPTIONS]
 | `-s` | `--symbols` | Symbols to download (comma-separated) or `all` | `all` |
 | `-a` | `--assets_file` | Path to Zorro Assets file (alternative to `-s`) | - |
 | `-j` | `--jobs` | Maximum parallel download jobs | auto |
-| `-b` | `--bar_size` | Bar size in minutes (1, 5, 15, 30, 60, etc.) | `1` |
+| `-b` | `--bar_size` | Bar size in minutes (1, 5, 15, 30, 60, etc.; exchange-native `1M` is `43200`) | `1` |
 | `-c` | `--category` | Market category: `f` (futures), `s` (spot) | `f` |
 | `-d` | `--delete_delisted` | Delete delisted symbols data files | - |
 | `-z` | `--t6_conversion` | Convert existing CSV data to T6 format (Zorro Trader) without downloading | - |
 | `-g` | `--aggregate` | Aggregate the `-b` bar size into coarser timeframes (comma-separated minutes) without downloading | - |
+| - | `--allow_partial_aggregation` | Emit coarse candles even when source bars are missing; without this flag incomplete buckets are skipped and aggregation fails | - |
 | `-x` | `--xperp` | OKX only: download X-Perps instead of USDT swaps, into `<output>/xperp/` | - |
 | `-y` | `--verify` | Verify CSV data integrity (torn lines, duplicates, ordering, gaps) without downloading | - |
 | `-r` | `--repair` | Verify and repair CSV data files in place | - |
@@ -248,6 +279,33 @@ crypto_data_downloader [OPTIONS]
 ./crypto_data_downloader -e okx -c f -b 1 -o /data/okx    # 1m only — see OKX notes below
 ./crypto_data_downloader -o /data/okx -b 1 -g 5,60        # local aggregation, no network
 ```
+
+Aggregation is strict by default: a closed target bucket is emitted only when
+all expected source bars are present and contiguous. If a historical source gap
+must deliberately be represented by a partial OHLCV candle, opt in explicitly:
+
+```bash
+./crypto_data_downloader -o /data/okx -b 1 -g 5 --allow_partial_aggregation
+```
+
+Derived files are rebuilt through an atomic replacement on each CLI run. A
+strict run that finds an incomplete or malformed historical bucket leaves the
+previous target untouched, so a later repair of the source can restore the
+bucket without being blocked by an append-only tail.
+
+The aggregator resolves columns by their exact header names and preserves the
+venue's schema. It keeps the first `open`, maximum `high`, minimum `low`, and
+last `close`; known quantity/count columns are summed with decimal
+multiprecision. Binance's `timestamp` remains the bucket open time,
+`close_time` becomes the bucket's inclusive end, and `ignore` is copied from
+the final source row. An unknown column, malformed numeric value, duplicate or
+out-of-order timestamp, or an unsupported header fails the file instead of
+guessing how it should be aggregated.
+
+The trailing in-progress bucket is always held back. Calendar-month aggregation
+is also intentionally unavailable through `-g`: `43200` selects the exchanges'
+native `1M` interval, but a real calendar month cannot be represented by a fixed
+number of minutes.
 
 ### OKX history — what the exchange actually serves
 
@@ -419,7 +477,22 @@ data does not exist on the exchange.
 
 ### Candle Data (CSV)
 
-Files are saved to `<output_dir>/futures/prices/csv/<timeframe>/<SYMBOL>.csv` (or `spot/prices/csv/` for spot):
+Files are saved to `<output_dir>/futures/prices/csv/<timeframe>/<SYMBOL>.csv`
+(or `spot/prices/csv/` for spot). Candle CSV is intentionally venue-native;
+the exact canonical headers are:
+
+| Exchange / market | Header |
+|-------------------|--------|
+| Binance Spot and Futures | `close_time,open,high,low,close,volume,timestamp,quote_av,trades,tb_base_av,tb_quote_av,ignore` |
+| Bybit Spot and Futures | `open_time,open,high,low,close,volume` |
+| OKX Spot and Futures | `open_time,open,high,low,close,volume,vol_ccy,vol_ccy_quote` |
+| MEXC Futures | `open_time,open,high,low,close,volume,amount` |
+| MEXC Spot | `open_time,open,high,low,close,volume,quote_asset_volume` |
+| Hyperliquid Futures | `open_time,open,high,low,close,volume` |
+| Lighter Futures | `open_time,open,high,low,close,volume` |
+
+All time fields are Unix milliseconds. For Binance, `timestamp` is the open
+time while `close_time` is the inclusive close time. A six-column example is:
 
 ```csv
 open_time,open,high,low,close,volume
@@ -461,6 +534,8 @@ crypto_data_downloader/
 ├── hyperliquid-cpp-api/      # Hyperliquid API wrapper (submodule)
 ├── lighter-cpp-api/          # Lighter API wrapper (submodule)
 ├── stonky-cpp-common/        # Common utilities (submodule)
+├── test/                     # Deterministic CTest regression suite
+├── vcpkg.json                # Pinned cross-platform dependency manifest
 ├── CMakeLists.txt            # Build configuration
 └── main.cpp                  # Entry point
 ```

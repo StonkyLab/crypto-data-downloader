@@ -8,25 +8,58 @@ Copyright (c) 2026 Vitezslav Kot <vitezslav.kot@stonky.cz>, Stonky s.r.o.
 
 #include "stonky/candle_aggregator.h"
 #include "stonky/csv_data.h"
+#include "stonky/csv_format.h"
 #include "stonky/interface/exchange_enums.h" // downloader.h expects CandleInterval to be declared
 #include "stonky/downloader.h"
+#include "stonky/future_utils.h"
 #include "stonky/utils/utils.h"
 #include "stonky/utils/semaphore.h"
 #include <algorithm>
+#include <boost/math/special_functions/fpclassify.hpp>
+#include <boost/multiprecision/cpp_dec_float.hpp>
 #include <charconv>
 #include <filesystem>
 #include <fstream>
 #include <future>
 #include <set>
 #include <spdlog/spdlog.h>
+#include <system_error>
+
+#ifdef _WIN32
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+#endif
 
 namespace stonky {
 
 namespace {
 constexpr std::int64_t MS_PER_MINUTE = 60000;
 
+bool replaceFile(const std::filesystem::path &source,
+                 const std::filesystem::path &destination,
+                 std::string &error) {
+#ifdef _WIN32
+    if (!::MoveFileExW(source.c_str(), destination.c_str(),
+                       MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)) {
+        error = fmt::format("Windows error {}", static_cast<unsigned long>(::GetLastError()));
+        return false;
+    }
+    return true;
+#else
+    std::error_code ec;
+    std::filesystem::rename(source, destination, ec);
+    if (ec) {
+        error = ec.message();
+        return false;
+    }
+    return true;
+#endif
+}
+
 /// Per-column handling inside a bucket
-enum class Role { Time, Open, High, Low, Close, Sum };
+enum class Role { TimeOpen, TimeClose, Open, High, Low, Close, Sum, Last };
 
 /// Extra value columns known to be additive across a bucket. A source column
 /// outside this set (and outside the OHLC set) is rejected rather than guessed
@@ -34,7 +67,8 @@ enum class Role { Time, Open, High, Low, Close, Sum };
 const std::set<std::string> &summableColumns() {
     static const std::set<std::string> cols{
         "volume", "vol", "vol_ccy", "vol_ccy_quote", "vol_quote",
-        "quote_volume", "turnover", "trades", "num_trades"
+        "quote_volume", "quote_asset_volume", "quote_av", "turnover", "amount",
+        "trades", "num_trades", "tb_base_av", "tb_quote_av"
     };
     return cols;
 }
@@ -47,30 +81,60 @@ bool parseInt64(const std::string &field, std::int64_t &out) {
     return ec == std::errc() && ptr == field.data() + field.size();
 }
 
-bool parseDouble(const std::string &field, long double &out) {
+using Decimal = boost::multiprecision::cpp_dec_float_50;
+
+bool parseDecimal(const std::string &field, Decimal &out) {
+    // Require the whole field to be a conventional finite decimal/scientific
+    // lexeme before handing it to multiprecision (which otherwise accepts some
+    // prefixes). This keeps NaN/Inf and glued text out of aggregate output.
+    std::size_t i = 0;
+    if (i < field.size() && (field[i] == '+' || field[i] == '-')) {
+        ++i;
+    }
+    bool haveDigit = false;
+    while (i < field.size() && field[i] >= '0' && field[i] <= '9') {
+        haveDigit = true;
+        ++i;
+    }
+    if (i < field.size() && field[i] == '.') {
+        ++i;
+        while (i < field.size() && field[i] >= '0' && field[i] <= '9') {
+            haveDigit = true;
+            ++i;
+        }
+    }
+    if (!haveDigit) {
+        return false;
+    }
+    if (i < field.size() && (field[i] == 'e' || field[i] == 'E')) {
+        ++i;
+        if (i < field.size() && (field[i] == '+' || field[i] == '-')) {
+            ++i;
+        }
+        const auto exponentStart = i;
+        while (i < field.size() && field[i] >= '0' && field[i] <= '9') {
+            ++i;
+        }
+        if (i == exponentStart) {
+            return false;
+        }
+    }
+    if (i != field.size()) {
+        return false;
+    }
+
     try {
-        std::size_t pos = 0;
-        out = std::stold(field, &pos);
-        return pos == field.size();
+        out = Decimal(field);
+        return boost::math::isfinite(out);
     } catch (const std::exception &) {
         return false;
     }
 }
 
-/// Fixed-notation formatting with trailing zeros trimmed. Default float
-/// formatting switches to scientific notation for small/large magnitudes,
-/// which the CSV readers of this dataset do not expect.
-std::string formatSum(const long double value) {
-    auto s = fmt::format("{:.10f}", static_cast<double>(value));
-    if (s.find('.') != std::string::npos) {
-        while (!s.empty() && s.back() == '0') {
-            s.pop_back();
-        }
-        if (!s.empty() && s.back() == '.') {
-            s.push_back('0');
-        }
-    }
-    return s;
+/// Preserve the precision of additive decimal columns. Scientific notation is
+/// valid CSV numeric syntax and is accepted by the project's CSV readers.
+std::string formatSum(const Decimal &value) {
+    return csvNumber(value);
 }
 
 struct Layout {
@@ -78,27 +142,43 @@ struct Layout {
     std::size_t timeIdx{};
     std::size_t highIdx{};
     std::size_t lowIdx{};
+    bool primaryTimeIsClose{};
 };
 
 /// Resolve column roles from the source header. Throws when the header is not
 /// an OHLCV layout this aggregator can reason about.
 Layout resolveLayout(const std::string &header) {
-    const auto names = splitString(header, ',');
+    auto names = splitString(header, ',');
+    for (auto &name: names) {
+        if (!name.empty() && name.back() == '\r') {
+            name.pop_back();
+        }
+    }
     Layout layout;
     layout.roles.reserve(names.size());
 
     bool haveTime = false, haveOpen = false, haveHigh = false, haveLow = false, haveClose = false;
+    const bool hasOpenTimeColumn = std::ranges::find(names, "open_time") != names.end() ||
+                                   std::ranges::find(names, "time") != names.end() ||
+                                   std::ranges::find(names, "timestamp") != names.end();
 
     for (std::size_t i = 0; i < names.size(); ++i) {
-        auto name = names[i];
-        if (!name.empty() && name.back() == '\r') {
-            name.pop_back();
-        }
+        const auto &name = names[i];
 
         if (name == "open_time" || name == "time" || name == "timestamp") {
-            layout.roles.push_back(Role::Time);
+            layout.roles.push_back(Role::TimeOpen);
             layout.timeIdx = i;
             haveTime = true;
+            layout.primaryTimeIsClose = false;
+        } else if (name == "close_time") {
+            layout.roles.push_back(Role::TimeClose);
+            // Binance also carries its exact open time in `timestamp`; prefer
+            // that for bucket membership while keeping close_time in column 0.
+            if (!hasOpenTimeColumn) {
+                layout.timeIdx = i;
+                haveTime = true;
+                layout.primaryTimeIsClose = true;
+            }
         } else if (name == "open") {
             layout.roles.push_back(Role::Open);
             haveOpen = true;
@@ -115,6 +195,10 @@ Layout resolveLayout(const std::string &header) {
             haveClose = true;
         } else if (summableColumns().contains(name)) {
             layout.roles.push_back(Role::Sum);
+        } else if (name == "ignore") {
+            // Binance's reserved final column is not additive. Preserve the
+            // value from the final contributing source row.
+            layout.roles.push_back(Role::Last);
         } else {
             throw std::runtime_error(fmt::format("unsupported column '{}' in header '{}'", name, header));
         }
@@ -122,6 +206,10 @@ Layout resolveLayout(const std::string &header) {
 
     if (!haveTime || !haveOpen || !haveHigh || !haveLow || !haveClose) {
         throw std::runtime_error(fmt::format("header is not an OHLCV layout: '{}'", header));
+    }
+    if (layout.roles.empty() ||
+        (layout.roles.front() != Role::TimeOpen && layout.roles.front() != Role::TimeClose)) {
+        throw std::runtime_error("the first CSV column must be an open/close timestamp");
     }
     return layout;
 }
@@ -131,41 +219,66 @@ Layout resolveLayout(const std::string &header) {
 /// assets quoted with many decimals); only Sum columns are accumulated.
 struct Bucket {
     std::int64_t start{};
+    std::int64_t firstTs{-1};
     std::int64_t lastTs{-1};
+    std::int64_t rows{};
     std::vector<std::string> fields; // output row, indexed like the source
-    std::vector<long double> sums;
-    long double high{};
-    long double low{};
+    std::vector<Decimal> sums;
+    Decimal high{};
+    Decimal low{};
+    bool contiguous{true};
+    bool valid{true};
     bool empty{true};
 };
 
 void applyRow(Bucket &bucket, const Layout &layout, const std::vector<std::string> &fields,
-              const std::int64_t ts, const std::int64_t bucketStart) {
+              const std::int64_t ts, const std::int64_t bucketStart, const std::int64_t sourceMs) {
+    std::vector<Decimal> values(fields.size());
+    const auto rowOpenTime = layout.primaryTimeIsClose ? ts - sourceMs + 1 : ts;
+    for (std::size_t i = 0; i < layout.roles.size(); ++i) {
+        if (layout.roles[i] == Role::TimeOpen || layout.roles[i] == Role::TimeClose) {
+            std::int64_t fieldTime{};
+            const auto expected = layout.roles[i] == Role::TimeOpen
+                                      ? rowOpenTime
+                                      : rowOpenTime + sourceMs - 1;
+            if (!parseInt64(fields[i], fieldTime) || fieldTime != expected) {
+                bucket.valid = false;
+            }
+        } else if (!parseDecimal(fields[i], values[i])) {
+            bucket.valid = false;
+        }
+    }
+
     if (bucket.empty) {
         bucket.start = bucketStart;
+        bucket.firstTs = ts;
         bucket.fields = fields;
-        bucket.sums.assign(fields.size(), 0.0L);
+        bucket.sums.assign(fields.size(), Decimal{0});
         bucket.empty = false;
-        parseDouble(fields[layout.highIdx], bucket.high);
-        parseDouble(fields[layout.lowIdx], bucket.low);
+        bucket.high = values[layout.highIdx];
+        bucket.low = values[layout.lowIdx];
     } else {
+        if (ts != bucket.lastTs + sourceMs) {
+            bucket.contiguous = false;
+        }
         for (std::size_t i = 0; i < layout.roles.size(); ++i) {
             switch (layout.roles[i]) {
                 case Role::High: {
-                    if (long double v = 0; parseDouble(fields[i], v) && v > bucket.high) {
-                        bucket.high = v;
+                    if (bucket.valid && values[i] > bucket.high) {
+                        bucket.high = values[i];
                         bucket.fields[i] = fields[i];
                     }
                     break;
                 }
                 case Role::Low: {
-                    if (long double v = 0; parseDouble(fields[i], v) && v < bucket.low) {
-                        bucket.low = v;
+                    if (bucket.valid && values[i] < bucket.low) {
+                        bucket.low = values[i];
                         bucket.fields[i] = fields[i];
                     }
                     break;
                 }
                 case Role::Close:
+                case Role::Last:
                     bucket.fields[i] = fields[i]; // rows arrive in ascending ts order
                     break;
                 default:
@@ -176,22 +289,25 @@ void applyRow(Bucket &bucket, const Layout &layout, const std::vector<std::strin
 
     for (std::size_t i = 0; i < layout.roles.size(); ++i) {
         if (layout.roles[i] == Role::Sum) {
-            if (long double v = 0; parseDouble(fields[i], v)) {
-                bucket.sums[i] += v;
+            if (bucket.valid) {
+                bucket.sums[i] += values[i];
             }
         }
     }
     bucket.lastTs = ts;
+    ++bucket.rows;
 }
 
-std::string renderBucket(const Bucket &bucket, const Layout &layout) {
+std::string renderBucket(const Bucket &bucket, const Layout &layout, const std::int64_t bucketMs) {
     std::string out;
     for (std::size_t i = 0; i < bucket.fields.size(); ++i) {
         if (i > 0) {
             out.push_back(',');
         }
-        if (i == layout.timeIdx) {
+        if (layout.roles[i] == Role::TimeOpen) {
             out += std::to_string(bucket.start);
+        } else if (layout.roles[i] == Role::TimeClose) {
+            out += std::to_string(bucket.start + bucketMs - 1);
         } else if (layout.roles[i] == Role::Sum) {
             out += formatSum(bucket.sums[i]);
         } else {
@@ -205,7 +321,8 @@ CandleAggregator::Report aggregateFile(const std::filesystem::path &sourcePath,
                                        const std::filesystem::path &targetPath,
                                        const std::int32_t sourceMinutes,
                                        const std::int32_t targetMinutes,
-                                       const bool rewrite) {
+                                       const bool rewrite,
+                                       const bool allowPartialBuckets) {
     CandleAggregator::Report report;
     report.symbol = sourcePath.stem().string();
     report.targetMinutes = targetMinutes;
@@ -219,7 +336,9 @@ CandleAggregator::Report aggregateFile(const std::filesystem::path &sourcePath,
 
     std::string header;
     if (!std::getline(ifs, header)) {
-        return report; // empty source — nothing to aggregate
+        report.failed = true;
+        report.error = "source file is empty";
+        return report;
     }
     if (!header.empty() && header.back() == '\r') {
         header.pop_back();
@@ -251,10 +370,33 @@ CandleAggregator::Report aggregateFile(const std::filesystem::path &sourcePath,
     Bucket bucket;
     std::string line;
     std::int64_t prevTs = -1;
+    bool sawData = false;
+    const auto expectedRows = bucketMs / sourceMs;
 
     const auto emit = [&] {
         if (!bucket.empty && bucket.start > resumeAfter) {
-            outputRows.push_back(renderBucket(bucket, layout));
+            const auto expectedFirst = bucket.start + (layout.primaryTimeIsClose ? sourceMs - 1 : 0);
+            const auto expectedLast = bucket.start + bucketMs -
+                                      (layout.primaryTimeIsClose ? 1 : sourceMs);
+            const bool structurallyComplete = bucket.contiguous && bucket.firstTs == expectedFirst &&
+                                              bucket.lastTs == expectedLast &&
+                                              bucket.rows == expectedRows;
+            const bool complete = bucket.valid && structurallyComplete;
+            // Partial mode relaxes only missing-source-bar completeness. It
+            // never permits malformed numeric content into the target file.
+            if (bucket.valid && (structurallyComplete || allowPartialBuckets)) {
+                outputRows.push_back(renderBucket(bucket, layout, bucketMs));
+            }
+            if (!complete) {
+                ++report.incompleteBuckets;
+                if (!bucket.valid) {
+                    report.failed = true;
+                    report.error = "one or more source buckets contain invalid numeric values";
+                } else if (!allowPartialBuckets) {
+                    report.failed = true;
+                    report.error = "one or more incomplete source buckets were skipped";
+                }
+            }
         }
         bucket = Bucket{};
     };
@@ -280,16 +422,38 @@ CandleAggregator::Report aggregateFile(const std::filesystem::path &sourcePath,
             continue; // duplicate or out-of-order row
         }
         prevTs = ts;
+        sawData = true;
 
-        // A closed bucket is always emitted, even when source bars inside it
-        // are missing: an exchange outage in the middle of the file would never
-        // be filled by a later run, so dropping the bucket would lose it
-        // permanently. Only the trailing bucket is held back (below).
         const std::int64_t bucketStart = ts - ts % bucketMs;
         if (!bucket.empty && bucketStart != bucket.start) {
+            const auto missingBuckets = (bucketStart - bucket.start) / bucketMs - 1;
             emit();
+            // A gap that spans one or more complete target intervals is not
+            // visible from either adjacent bucket: both can contain all of
+            // their own source rows.  Account for those absent buckets
+            // explicitly so strict aggregation cannot publish a target with a
+            // silent coarse-timeframe hole.
+            if (missingBuckets > 0 && bucketStart > resumeAfter) {
+                report.incompleteBuckets += static_cast<std::int64_t>(missingBuckets);
+                if (!allowPartialBuckets) {
+                    report.failed = true;
+                    report.error = "one or more complete target buckets are absent from the source";
+                }
+            }
         }
-        applyRow(bucket, layout, fields, ts, bucketStart);
+        applyRow(bucket, layout, fields, ts, bucketStart, sourceMs);
+    }
+
+    if (ifs.bad()) {
+        report.failed = true;
+        report.error = "failed while reading source file";
+        return report;
+    }
+
+    if (!sawData) {
+        report.failed = true;
+        report.error = "source file contains no data rows";
+        return report;
     }
 
     // The trailing bucket is written only once the source reaches its final
@@ -299,14 +463,51 @@ CandleAggregator::Report aggregateFile(const std::filesystem::path &sourcePath,
         emit();
     }
 
+    // Strict mode is fail-closed: never append later buckets past an invalid
+    // or incomplete bucket, because their new tail would make the skipped
+    // interval impossible to fill on a subsequent incremental run.
+    if (report.failed) {
+        return report;
+    }
+
+    // A rewrite must never publish a header-only target. This happens when the
+    // source contains only the still-open trailing bucket (for example three
+    // one-minute rows requested as a five-minute file). Treat that as no
+    // usable output and preserve any existing target.
+    if (rewrite && outputRows.empty()) {
+        report.failed = true;
+        report.error = "source contains no complete target buckets";
+        return report;
+    }
+
     if (outputRows.empty() && !rewrite) {
         return report; // already up to date
+    }
+
+    if (rewrite && std::filesystem::exists(targetPath)) {
+        const auto oldTail = CsvData::lastValidRecord(targetPath.string(), layout.roles.size(), -1);
+        if (oldTail.foundValid) {
+            std::int64_t newTail = -1;
+            if (!outputRows.empty()) {
+                const auto lastFields = splitString(outputRows.back(), ',');
+                (void) parseInt64(lastFields[0], newTail);
+            }
+            if (newTail < oldTail.timestamp) {
+                report.failed = true;
+                report.error = "rebuilt target would move backwards; existing file was preserved";
+                return report;
+            }
+        }
     }
 
     const bool writeHeader = rewrite || !std::filesystem::exists(targetPath) ||
                              std::filesystem::file_size(targetPath) == 0;
 
-    std::ofstream ofs(targetPath, rewrite ? std::ios::trunc : std::ios::app);
+    auto outputPath = targetPath;
+    if (rewrite) {
+        outputPath += ".aggregate.tmp";
+    }
+    std::ofstream ofs(outputPath, rewrite ? std::ios::trunc : std::ios::app);
     if (!ofs.is_open()) {
         report.failed = true;
         report.error = "cannot open target file";
@@ -318,7 +519,38 @@ CandleAggregator::Report aggregateFile(const std::filesystem::path &sourcePath,
     for (const auto &row: outputRows) {
         ofs << row << "\n";
     }
+    ofs.flush();
+    if (!ofs.good()) {
+        report.failed = true;
+        report.error = "write to target file failed";
+        ofs.close();
+        if (rewrite) {
+            std::error_code ec;
+            std::filesystem::remove(outputPath, ec);
+        }
+        return report;
+    }
     ofs.close();
+    if (!ofs.good()) {
+        report.failed = true;
+        report.error = "closing target file failed";
+        if (rewrite) {
+            std::error_code ec;
+            std::filesystem::remove(outputPath, ec);
+        }
+        return report;
+    }
+
+    if (rewrite) {
+        std::string replaceError;
+        if (!replaceFile(outputPath, targetPath, replaceError)) {
+            report.failed = true;
+            report.error = fmt::format("cannot atomically replace target file: {}", replaceError);
+            std::error_code ec;
+            std::filesystem::remove(outputPath, ec);
+            return report;
+        }
+    }
 
     report.barsWritten = static_cast<std::int64_t>(outputRows.size());
     return report;
@@ -373,12 +605,11 @@ std::vector<CandleAggregator::Report> CandleAggregator::aggregateDirectory(const
             std::filesystem::path targetFile = targetDir;
             targetFile.append(sourceFile.filename().string());
 
-            futures.push_back(std::async(std::launch::async,
-                                         [&options, &maxJobs, target](const std::filesystem::path &src,
+            futures.push_back(launchBounded(maxJobs,
+                                         [&options, target](const std::filesystem::path &src,
                                                                       const std::filesystem::path &dst) -> Report {
-                                             std::scoped_lock w(maxJobs);
                                              return aggregateFile(src, dst, options.sourceMinutes, target,
-                                                                  options.rewrite);
+                                                                  options.rewrite, options.allowPartialBuckets);
                                          }, sourceFile, targetFile));
         }
 
@@ -390,6 +621,14 @@ std::vector<CandleAggregator::Report> CandleAggregator::aggregateDirectory(const
                 failed++;
                 spdlog::error(fmt::format("Aggregation of {} to {} failed: {}", report.symbol,
                                           Downloader::minutesToString(target), report.error));
+            }
+            if (report.incompleteBuckets > 0) {
+                spdlog::warn(fmt::format("Aggregation of {} to {} found {} incomplete buckets; {}",
+                                         report.symbol, Downloader::minutesToString(target),
+                                         report.incompleteBuckets,
+                                         options.allowPartialBuckets && !report.failed
+                                             ? "accepted by request"
+                                             : "skipped"));
             }
             totalBars += report.barsWritten;
             reports.push_back(std::move(report));

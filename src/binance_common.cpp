@@ -8,8 +8,10 @@ Copyright (c) 2025 Vitezslav Kot <vitezslav.kot@stonky.cz>, Stonky s.r.o.
 
 #include "stonky/binance/binance_common.h"
 #include "stonky/binance/binance_models.h"
+#include "stonky/atomic_file.h"
 #include "stonky/csv_data.h"
 #include "stonky/csv_format.h"
+#include "stonky/future_utils.h"
 #include "stonky/utils/utils.h"
 #include "stonky/utils/semaphore.h"
 #include <filesystem>
@@ -23,9 +25,8 @@ Copyright (c) 2025 Vitezslav Kot <vitezslav.kot@stonky.cz>, Stonky s.r.o.
 namespace stonky::binance {
 struct BinanceCommon::P {
     mutable Semaphore maxConcurrentConvertJobs;
-    Semaphore maxConcurrentDownloadJobs{3};
 
-    explicit P(const std::uint32_t maxJobs) : maxConcurrentConvertJobs(maxJobs) {
+    explicit P(const std::uint32_t maxJobs) : maxConcurrentConvertJobs(normalizedJobCount(maxJobs)) {
     }
 };
 
@@ -37,16 +38,15 @@ BinanceCommon::~BinanceCommon() = default;
 bool BinanceCommon::writeCSVCandlesToZorroT6File(const std::string &csvPath, const std::string &t6Path) {
     const std::filesystem::path pathToT6File{t6Path};
 
-    std::ofstream ofs;
-    ofs.open(pathToT6File.string(), std::ios::trunc | std::ios::binary);
-
-    if (!ofs.is_open()) {
-        spdlog::error(fmt::format("Couldn't open file: {}", t6Path));
+    AtomicFileWriter output(pathToT6File);
+    if (!output.isOpen()) {
+        spdlog::error(fmt::format("Couldn't prepare file {}: {}", t6Path, output.error()));
         return false;
     }
+    auto &ofs = output.stream();
 
     std::vector<Candle> candles;
-    if (!readCandlesFromCSVFile(csvPath, candles)) {
+    if (!readCandlesFromCSVFile(csvPath, candles) || candles.empty()) {
         spdlog::error(fmt::format("Couldn't read candles from csv file: {}", csvPath));
         return false;
     }
@@ -63,7 +63,11 @@ bool BinanceCommon::writeCSVCandlesToZorroT6File(const std::string &csvPath, con
         ofs.write(reinterpret_cast<char *>(&t6), sizeof(T6));
     }
 
-    ofs.close();
+    std::string error;
+    if (!output.commit(error)) {
+        spdlog::error(fmt::format("Write to T6 file failed: {}: {}", t6Path, error));
+        return false;
+    }
     return true;
 }
 
@@ -131,7 +135,66 @@ bool BinanceCommon::writeCandlesToCSVFile(const std::vector<Candle> &candles, co
         return false;
     }
     ofs.close();
-    return true;
+    return ofs.good();
+}
+
+std::size_t BinanceCommon::downloadCandlesToCSVFile(const CandlePageFetcher &fetchPage,
+                                                    const std::int64_t startTime,
+                                                    const std::int64_t endTime,
+                                                    const std::string &path,
+                                                    const std::int32_t pageLimit) {
+    if (!fetchPage) {
+        throw std::invalid_argument("Binance candle page fetcher is empty");
+    }
+    if (pageLimit <= 0) {
+        throw std::invalid_argument("Binance candle page limit must be positive");
+    }
+    if (startTime >= endTime) {
+        return 0;
+    }
+
+    std::int64_t cursor = startTime;
+    std::int64_t persistedTail = startTime;
+    std::size_t written = 0;
+
+    while (cursor < endTime) {
+        auto response = fetchPage(cursor, endTime, pageLimit);
+        if (response.empty()) {
+            break;
+        }
+
+        for (std::size_t i = 1; i < response.size(); ++i) {
+            if (response[i].closeTime <= response[i - 1].closeTime) {
+                throw std::runtime_error("Binance candle page is not strictly chronological");
+            }
+        }
+
+        const auto nextCursor = response.back().closeTime;
+        if (nextCursor <= cursor) {
+            throw std::runtime_error("Binance candle pagination made no forward progress");
+        }
+
+        // Binance filters pages by open time, so the final response can include
+        // a candle whose close lies beyond endTime. Never persist that candle.
+        std::vector<Candle> complete;
+        complete.reserve(response.size());
+        for (const auto &candle: response) {
+            if (candle.closeTime > persistedTail && candle.closeTime <= endTime) {
+                complete.push_back(candle);
+            }
+        }
+
+        if (!complete.empty()) {
+            if (!writeCandlesToCSVFile(complete, path)) {
+                throw std::runtime_error("failed to write Binance candle CSV page");
+            }
+            persistedTail = complete.back().closeTime;
+            written += complete.size();
+        }
+        cursor = nextCursor;
+    }
+
+    return written;
 }
 
 int64_t BinanceCommon::checkSymbolCSVFile(const std::string &path) {
@@ -158,28 +221,22 @@ void BinanceCommon::convertFromCSVToT6(const std::vector<std::filesystem::path> 
         spdlog::info(fmt::format("Converting symbol: {}...", path.filename().replace_extension("").string()));
 
         futures.push_back(
-            std::async(std::launch::async,
-                       [](const std::filesystem::path &csvPath, const std::filesystem::path &t6Path,
-                          Semaphore &maxJobs) -> std::pair<std::string, bool> {
-                           std::scoped_lock w(maxJobs);
+            launchBounded(m_p->maxConcurrentConvertJobs,
+                       [](const std::filesystem::path &csvPath, const std::filesystem::path &t6Path) -> std::pair<std::string, bool> {
                            std::pair<std::string, bool> retVal;
                            retVal.first = csvPath.filename().replace_extension("").string();
                            retVal.second = writeCSVCandlesToZorroT6File(csvPath.string(), t6Path.string());
                            return retVal;
-                       }, path, t6FilePath, std::ref(m_p->maxConcurrentConvertJobs)));
+                       }, path, t6FilePath));
     }
 
-    do {
-        for (auto &future: futures) {
-            if (isReady(future)) {
-                readyFutures.push_back(future.get());
-                if (readyFutures.back().second) {
-                    spdlog::info(fmt::format("Symbol: {} converted", readyFutures.back().first));
-                } else {
-                    spdlog::error(fmt::format("Symbol: {} conversion failed", readyFutures.back().first));
-                }
-            }
+    readyFutures = waitAllOrThrow(futures);
+    for (const auto &[symbol, converted]: readyFutures) {
+        if (converted) {
+            spdlog::info(fmt::format("Symbol: {} converted", symbol));
+        } else {
+            throw std::runtime_error(fmt::format("Symbol: {} conversion failed", symbol));
         }
-    } while (readyFutures.size() < futures.size());
+    }
 }
 }

@@ -8,6 +8,11 @@ Copyright (c) 2025 Vitezslav Kot <vitezslav.kot@stonky.cz>, Stonky s.r.o.
 
 #ifndef INCLUDE_STONKY_DEFINITIONS_H
 #define INCLUDE_STONKY_DEFINITIONS_H
+#include "stonky/interface/exchange_enums.h"
+#include <chrono>
+#include <cstdint>
+#include <stdexcept>
+#include <string>
 #include <thread>
 #include <spdlog/fmt/ostr.h>
 
@@ -57,7 +62,7 @@ public:
             return "3d";
         case 10080:
             return "1w";
-        case 40320:
+        case 43200:
             return "1M";
         default:
             throw std::runtime_error(fmt::format("Invalid minutes number: {} ", minutes));
@@ -94,11 +99,28 @@ public:
             return CandleInterval::_3d;
         case 10080:
             return CandleInterval::_1w;
-        case 40320:
+        case 43200:
             return CandleInterval::_1M;
         default:
             throw std::runtime_error(fmt::format("Invalid minutes number: {} ", minutes));
         }
+    }
+
+    /// T6 timestamps represent the end boundary. Month bars need calendar
+    /// arithmetic; adding a fixed 30 days is wrong for 28/29/31-day months.
+    static std::int64_t candleCloseTimestampMs(const std::int64_t openTimestampMs,
+                                               const CandleInterval interval,
+                                               const std::int32_t utcOffsetMinutes = 0) {
+        if (interval != CandleInterval::_1M) {
+            return openTimestampMs + static_cast<std::int64_t>(interval) * 1000;
+        }
+
+        using namespace std::chrono;
+        const auto offset = minutes{utcOffsetMinutes};
+        const sys_time<milliseconds> localOpen{milliseconds{openTimestampMs} + offset};
+        const year_month_day current{floor<days>(localOpen)};
+        const year_month_day next = current.year() / current.month() / day{1} + months{1};
+        return duration_cast<milliseconds>((sys_days{next} - offset).time_since_epoch()).count();
     }
 
     static std::int32_t determineMaxJobs() {

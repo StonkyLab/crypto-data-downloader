@@ -7,8 +7,10 @@ Copyright (c) 2025 Vitezslav Kot <vitezslav.kot@stonky.cz>, Stonky s.r.o.
 */
 
 #include "stonky/okx/okx_downloader.h"
+#include "stonky/atomic_file.h"
 #include "stonky/csv_data.h"
 #include "stonky/csv_format.h"
+#include "stonky/future_utils.h"
 #include "stonky/okx/okx.h"
 #include "stonky/okx/okx_rest_client.h"
 #include "stonky/okx/okx_market_data_utils.h"
@@ -182,9 +184,9 @@ std::vector<MarketDataFileInfo> listArchiveFiles(const RESTClient &client,
         }
 
         if (!mismatched.empty()) {
-            spdlog::error(fmt::format(
-                "{}: archive kept linking foreign files for {} after {} listing attempts — those periods "
-                "are MISSING from this run: {}",
+            throw std::runtime_error(fmt::format(
+                "{}: archive kept linking foreign files for {} after {} listing attempts; refusing to "
+                "append newer data past the unresolved periods: {}",
                 instFamilyOrId, mismatched.size(), MAX_LISTING_ATTEMPTS, fmt::join(mismatched, ", ")));
         }
 
@@ -207,7 +209,7 @@ struct OKXDownloader::P {
     std::unique_ptr<RESTClient> okxClient;
     mutable Semaphore maxConcurrentConvertJobs;
     mutable std::recursive_mutex locker;
-    Semaphore maxConcurrentDownloadJobs{3};
+    Semaphore maxConcurrentDownloadJobs;
     bool deleteDelistedData = false;
     bool xperp = false;
     MarketCategory marketCategory = MarketCategory::Futures;
@@ -224,24 +226,27 @@ struct OKXDownloader::P {
         return instruments;
     }
 
-    static bool writeCSVCandlesToZorroT6File(const std::string &csvPath, const std::string &t6Path);
+    static bool writeCSVCandlesToZorroT6File(const std::string &csvPath, const std::string &t6Path,
+                                             stonky::CandleInterval candleInterval);
 
-    static int64_t checkSymbolCSVFile(const std::string &path);
+    static CsvData::TailCheck checkSymbolCSVFile(const std::string &path);
 
     static bool writeCandlesToCSVFile(const std::vector<Candle> &candles, const std::string &path, bool rewrite);
 
     static bool readCandlesFromCSVFile(const std::string &path, std::vector<Candle> &candles);
 
-    void convertFromCSVToT6(const std::vector<std::filesystem::path> &filePaths, const std::string &outDirPath) const;
+    void convertFromCSVToT6(const std::vector<std::filesystem::path> &filePaths, const std::string &outDirPath,
+                            stonky::CandleInterval candleInterval) const;
 
-    static int64_t checkFundingRatesCSVFile(const std::string &path);
+    static CsvData::TailCheck checkFundingRatesCSVFile(const std::string &path);
 
     static bool writeFundingRatesToCSVFile(const std::vector<FundingRate> &fr, const std::string &path);
 
     explicit P(const std::uint32_t maxJobs, const bool deleteDelistedData) : okxClient(
                                                                                  std::make_unique<RESTClient>(
                                                                                      "", "", "")),
-                                                                             maxConcurrentConvertJobs(maxJobs),
+                                                                             maxConcurrentConvertJobs(normalizedJobCount(maxJobs)),
+                                                                             maxConcurrentDownloadJobs(boundedJobCount(maxJobs, 3)),
                                                                              deleteDelistedData(deleteDelistedData) {
     }
 };
@@ -277,24 +282,22 @@ bool OKXDownloader::P::readCandlesFromCSVFile(const std::string &path, std::vect
     return true;
 }
 
-bool OKXDownloader::P::writeCSVCandlesToZorroT6File(const std::string &csvPath, const std::string &t6Path) {
+bool OKXDownloader::P::writeCSVCandlesToZorroT6File(const std::string &csvPath, const std::string &t6Path,
+                                                    const stonky::CandleInterval candleInterval) {
     const std::filesystem::path pathToT6File{t6Path};
 
-    std::ofstream ofs;
-    ofs.open(pathToT6File.string(), std::ios::trunc | std::ios::binary);
-
-    if (!ofs.is_open()) {
-        spdlog::error(fmt::format("Couldn't open file: {}", t6Path));
+    AtomicFileWriter output(pathToT6File);
+    if (!output.isOpen()) {
+        spdlog::error(fmt::format("Couldn't prepare file {}: {}", t6Path, output.error()));
         return false;
     }
+    auto &ofs = output.stream();
 
     std::vector<Candle> candles;
-    if (!readCandlesFromCSVFile(csvPath, candles)) {
+    if (!readCandlesFromCSVFile(csvPath, candles) || candles.empty()) {
         spdlog::error(fmt::format("Couldn't read candles from csv file: {}", csvPath));
         return false;
     }
-
-    const auto numMsForInterval = OKX::numberOfMsForBarSize(BarSize::_1m) / 1000;
 
     for (auto &candle: std::ranges::reverse_view(candles)) {
         T6 t6;
@@ -304,16 +307,22 @@ bool OKXDownloader::P::writeCSVCandlesToZorroT6File(const std::string &csvPath, 
         t6.fClose = candle.c.convert_to<float>();
         t6.fVal = 0.0;
         t6.fVol = candle.vol.convert_to<float>();
-        t6.time = convertTimeMs(candle.ts + numMsForInterval);
+        // OKX non-UTC calendar bars roll at midnight UTC+8.
+        t6.time = convertTimeMs(Downloader::candleCloseTimestampMs(candle.ts, candleInterval, 8 * 60));
         ofs.write(reinterpret_cast<char *>(&t6), sizeof(T6));
     }
 
-    ofs.close();
+    std::string error;
+    if (!output.commit(error)) {
+        spdlog::error(fmt::format("Failed while writing T6 file {}: {}", t6Path, error));
+        return false;
+    }
     return true;
 }
 
 void OKXDownloader::P::convertFromCSVToT6(const std::vector<std::filesystem::path> &filePaths,
-                                          const std::string &outDirPath) const {
+                                          const std::string &outDirPath,
+                                          const stonky::CandleInterval candleInterval) const {
     std::vector<std::future<std::pair<std::string, bool> > > futures;
     std::vector<std::pair<std::string, bool> > readyFutures;
 
@@ -328,29 +337,25 @@ void OKXDownloader::P::convertFromCSVToT6(const std::vector<std::filesystem::pat
         spdlog::info(fmt::format("Converting symbol: {}...", path.filename().replace_extension("").string()));
 
         futures.push_back(
-            std::async(std::launch::async,
-                       [](const std::filesystem::path &csvPath, const std::filesystem::path &t6Path,
-                          Semaphore &maxJobs) -> std::pair<std::string, bool> {
-                           std::scoped_lock w(maxJobs);
+            launchBounded(maxConcurrentConvertJobs,
+                       [candleInterval](const std::filesystem::path &csvPath,
+                                          const std::filesystem::path &t6Path) -> std::pair<std::string, bool> {
                            std::pair<std::string, bool> retVal;
                            retVal.first = csvPath.filename().replace_extension("").string();
-                           retVal.second = writeCSVCandlesToZorroT6File(csvPath.string(), t6Path.string());
+                           retVal.second = writeCSVCandlesToZorroT6File(csvPath.string(), t6Path.string(),
+                                                                       candleInterval);
                            return retVal;
-                       }, path, t6FilePath, std::ref(maxConcurrentConvertJobs)));
+                       }, path, t6FilePath));
     }
 
-    do {
-        for (auto &future: futures) {
-            if (isReady(future)) {
-                readyFutures.push_back(future.get());
-                if (readyFutures.back().second) {
-                    spdlog::info(fmt::format("Symbol: {} converted", readyFutures.back().first));
-                } else {
-                    spdlog::error(fmt::format("Symbol: {} conversion failed", readyFutures.back().first));
-                }
-            }
+    readyFutures = waitAllOrThrow(futures);
+    for (const auto &[symbol, converted]: readyFutures) {
+        if (converted) {
+            spdlog::info(fmt::format("Symbol: {} converted", symbol));
+        } else {
+            throw std::runtime_error(fmt::format("Symbol: {} conversion failed", symbol));
         }
-    } while (readyFutures.size() < futures.size());
+    }
 }
 
 bool OKXDownloader::P::writeCandlesToCSVFile(const std::vector<Candle> &candles, const std::string &path,
@@ -393,21 +398,27 @@ bool OKXDownloader::P::writeCandlesToCSVFile(const std::vector<Candle> &candles,
         ofs << csvNumber(candle.volCcyQuote) << std::endl;
     }
 
+    ofs.flush();
+    const bool writeSucceeded = ofs.good();
     ofs.close();
+    if (!writeSucceeded || ofs.fail()) {
+        spdlog::error(fmt::format("Failed while writing CSV file: {}", path));
+        return false;
+    }
     return true;
 }
 
-int64_t OKXDownloader::P::checkSymbolCSVFile(const std::string &path) {
+CsvData::TailCheck OKXDownloader::P::checkSymbolCSVFile(const std::string &path) {
     constexpr int64_t oldestBybitDate = 1420070400000; /// Thursday 1. January 2015 0:00:00
     // Self-healing read: a torn tail (interrupted write) is truncated instead of
     // resetting the resume point to the oldest-date sentinel, which used to
     // silently re-download and append the entire history.
-    return CsvData::lastValidRecord(path, 8, oldestBybitDate).timestamp;
+    return CsvData::lastValidRecord(path, 8, oldestBybitDate);
 }
 
-int64_t OKXDownloader::P::checkFundingRatesCSVFile(const std::string &path) {
+CsvData::TailCheck OKXDownloader::P::checkFundingRatesCSVFile(const std::string &path) {
     constexpr int64_t oldestDate = 1420070400000; /// Thursday 1. January 2015 0:00:00
-    return CsvData::lastValidRecord(path, 2, oldestDate).timestamp;
+    return CsvData::lastValidRecord(path, 2, oldestDate);
 }
 
 bool OKXDownloader::P::writeFundingRatesToCSVFile(const std::vector<FundingRate> &fr, const std::string &path) {
@@ -440,8 +451,13 @@ bool OKXDownloader::P::writeFundingRatesToCSVFile(const std::vector<FundingRate>
         ofs << csvNumber(record.fundingRate) << std::endl;
     }
 
+    ofs.flush();
+    const bool writeSucceeded = ofs.good();
     ofs.close();
-
+    if (!writeSucceeded || ofs.fail()) {
+        spdlog::error(fmt::format("Failed while writing funding-rate CSV file: {}", path));
+        return false;
+    }
     return true;
 }
 
@@ -469,6 +485,7 @@ void OKXDownloader::updateMarketData(const std::string &dirPath,
 
     std::vector<std::future<std::filesystem::path> > futures;
     const std::filesystem::path finalPath(dirPath);
+    validateSymbolFileComponents(symbols);
     std::vector<std::string> symbolsToUpdate = symbols;
     std::vector<std::filesystem::path> csvFilePaths;
     std::vector<std::string> symbolsToDelete;
@@ -586,14 +603,18 @@ void OKXDownloader::updateMarketData(const std::string &dirPath,
         symbolsToUpdate = tempSymbols;
     }
 
+    deduplicatePreserveOrder(symbolsToUpdate);
+    validateSymbolFileComponents(symbolsToUpdate);
+    if (onSymbolsToUpdateCB) {
+        onSymbolsToUpdateCB(symbolsToUpdate);
+    }
+
     for (const auto &s: symbolsToUpdate) {
         futures.push_back(
-            std::async(std::launch::async,
+            launchBounded(m_p->maxConcurrentDownloadJobs,
                        [finalPath, this, &barSizeInMinutes, &csvDirName, &t6DirName, convertToT6, &instrumentMap,
                         instrumentType](
-                   const std::string &symbol,
-                   Semaphore &maxJobs) -> std::filesystem::path {
-                           std::scoped_lock w(maxJobs);
+                   const std::string &symbol) -> std::filesystem::path {
                            std::filesystem::path symbolFilePathCsv = finalPath;
                            std::filesystem::path symbolFilePathT6 = finalPath;
 
@@ -624,7 +645,12 @@ void OKXDownloader::updateMarketData(const std::string &dirPath,
 
                            spdlog::info(fmt::format("Updating candles for symbol: {}...", symbol));
 
-                           int64_t fromTimeStamp = P::checkSymbolCSVFile(symbolFilePathCsv.string());
+                           const auto tailCheck = P::checkSymbolCSVFile(symbolFilePathCsv.string());
+                           int64_t fromTimeStamp = tailCheck.timestamp;
+                           // Only a CSV containing at least one valid record is a legitimate
+                           // delisted-symbol no-op. Merely finding an empty/header-only file must
+                           // not turn an explicit typo or an unknown instrument into success.
+                           bool hasUsableCsv = tailCheck.foundValid;
 
                            // Get instFamily and listTime for market data history API
                            std::string instFamilyOrId;
@@ -670,7 +696,7 @@ void OKXDownloader::updateMarketData(const std::string &dirPath,
                             try {
                                 int64_t totalNewCandles = 0;
                                 int64_t lastSavedTimestamp = fromTimeStamp;
-                                bool stoppedEarly = false;
+                                bool hasSavedTimestamp = tailCheck.foundValid && tailCheck.timestamp == fromTimeStamp;
 
                                 // Monthly files exist only for complete UTC+8 months; the running
                                 // month is served by daily files and the last hours by REST.
@@ -698,26 +724,17 @@ void OKXDownloader::updateMarketData(const std::string &dirPath,
                                         continue; // fully covered by what is already stored
                                     }
 
-                                    std::vector<Candle> candles;
-                                    try {
-                                        candles = withRetry(fmt::format("download {}", fileInfo.filename), [&] {
-                                            const auto zipData = RESTClient::downloadMarketDataFile(fileInfo.url);
-                                            const auto csvData = okx::utils::extractZip(zipData);
-                                            // Archive files are keyed by instrument family, so keep
-                                            // only this contract's rows — see parseCandlesCsv()
-                                            return okx::utils::parseCandlesCsv(csvData, symbol);
-                                        });
-                                    } catch (const std::exception &e) {
-                                        // Never skip forward past a failed file: the CSV is append-only
-                                        // and resumes from its last record, so a skipped file would turn
-                                        // into a permanent hole. Stop here and let the next run retry.
-                                        spdlog::warn(fmt::format(
-                                            "Symbol: {}: archive file {} could not be downloaded ({}), "
-                                            "stopping at {} — the next run resumes from there",
-                                            symbol, fileInfo.filename, e.what(), lastSavedTimestamp));
-                                        stoppedEarly = true;
-                                        break;
-                                    }
+                                    // Never skip forward past a failed file. Propagating the bounded
+                                    // retry failure makes the whole command fail while preserving the
+                                    // last successfully persisted timestamp for the next run.
+                                    auto candles = withRetry(
+                                        fmt::format("download {} for {}", fileInfo.filename, symbol), [&] {
+                                        const auto zipData = RESTClient::downloadMarketDataFile(fileInfo.url);
+                                        const auto csvData = okx::utils::extractZip(zipData);
+                                        // Archive files are keyed by instrument family, so keep
+                                        // only this contract's rows — see parseCandlesCsv()
+                                        return okx::utils::parseCandlesCsv(csvData, symbol);
+                                    });
 
                                     if (candles.empty()) {
                                         continue;
@@ -729,21 +746,28 @@ void OKXDownloader::updateMarketData(const std::string &dirPath,
 
                                     std::vector<Candle> newCandles;
                                     for (const auto &candle: candles) {
-                                        if (candle.ts > lastSavedTimestamp) {
+                                        if (candle.ts > lastSavedTimestamp ||
+                                            (!hasSavedTimestamp && candle.ts == lastSavedTimestamp)) {
                                             newCandles.push_back(candle);
                                         }
                                     }
 
                                     if (!newCandles.empty()) {
-                                        P::writeCandlesToCSVFile(newCandles, symbolFilePathCsv.string(), false);
+                                        if (!P::writeCandlesToCSVFile(newCandles, symbolFilePathCsv.string(), false)) {
+                                            throw std::runtime_error(fmt::format(
+                                                "failed to persist archive file {} for {}", fileInfo.filename,
+                                                symbol));
+                                        }
                                         totalNewCandles += static_cast<int64_t>(newCandles.size());
                                         lastSavedTimestamp = newCandles.back().ts;
+                                        hasSavedTimestamp = true;
+                                        hasUsableCsv = true;
                                     }
                                 }
 
                                // Bulk files only cover complete days, so the last hours come from the
                                // paginated REST endpoint.
-                               if (!stoppedEarly && lastSavedTimestamp < nowTimestamp) {
+                               if (lastSavedTimestamp < nowTimestamp) {
                                    auto recentCandles = m_p->okxClient->getHistoricalPrices(
                                        symbol, BarSize::_1m, lastSavedTimestamp, nowTimestamp);
 
@@ -756,14 +780,22 @@ void OKXDownloader::updateMarketData(const std::string &dirPath,
                                        // Filter out candles we already have
                                        std::vector<Candle> newCandles;
                                        for (const auto &candle : recentCandles) {
-                                           if (candle.ts > lastSavedTimestamp) {
+                                           if (candle.ts > lastSavedTimestamp ||
+                                               (!hasSavedTimestamp && candle.ts == lastSavedTimestamp)) {
                                                newCandles.push_back(candle);
                                            }
                                        }
 
                                        if (!newCandles.empty()) {
-                                           P::writeCandlesToCSVFile(newCandles, symbolFilePathCsv.string(), false);
+                                           if (!P::writeCandlesToCSVFile(newCandles, symbolFilePathCsv.string(),
+                                                                        false)) {
+                                               throw std::runtime_error(fmt::format(
+                                                   "failed to persist REST candles for {}", symbol));
+                                           }
                                            totalNewCandles += static_cast<int64_t>(newCandles.size());
+                                           lastSavedTimestamp = newCandles.back().ts;
+                                           hasSavedTimestamp = true;
+                                           hasUsableCsv = true;
                                        }
                                    }
                                }
@@ -773,33 +805,40 @@ void OKXDownloader::updateMarketData(const std::string &dirPath,
                                                             symbol, totalNewCandles));
                                }
 
-                               // Return the path if the CSV file exists (for T6 conversion)
-                               if (std::filesystem::exists(symbolFilePathCsv)) {
+                               // An existing, valid local dataset for a delisted symbol is an
+                               // expected no-op. A request that produced no usable output is not.
+                               if (hasUsableCsv) {
                                    return symbolFilePathCsv;
                                }
-                               if (totalNewCandles == 0 && !std::filesystem::exists(symbolFilePathCsv)) {
-                                   spdlog::warn(fmt::format("No data available for symbol: {}", symbol));
-                               }
+                               throw std::runtime_error(fmt::format(
+                                   "No OKX candle data available for symbol: {}", symbol));
                            } catch (const std::exception &e) {
                                const std::string errStr = e.what();
-                               if (errStr.find("code: 51001") != std::string::npos || errStr.find("code: 51000") != std::string::npos) {
-                                   spdlog::info(fmt::format("Symbol: {} is delisted or does not exist on OKX", symbol));
+                               if (errStr.find("code: 51001") != std::string::npos) {
+                                   if (hasUsableCsv) {
+                                       spdlog::info(fmt::format(
+                                           "Symbol: {} is delisted; keeping its existing local candle data",
+                                           symbol));
+                                       return symbolFilePathCsv;
+                                   }
+                                   spdlog::warn(fmt::format(
+                                       "Symbol: {} does not exist on OKX and no usable local candle data exists",
+                                       symbol));
                                } else {
                                    spdlog::warn(fmt::format("Updating candles for symbol: {} failed, reason: {}",
                                                             symbol, e.what()));
                                }
+                               throw std::runtime_error(fmt::format(
+                                   "Updating OKX candles for {} failed: {}", symbol, e.what()));
                            }
-                           return "";
-                       }, s, std::ref(m_p->maxConcurrentDownloadJobs)));
+                       }, s));
     }
 
-    do {
-        for (auto &future: futures) {
-            if (isReady(future)) {
-                csvFilePaths.push_back(future.get());
-            }
+    csvFilePaths = waitAllOrThrow(futures, [&onSymbolCompletedCB](const std::filesystem::path &path) {
+        if (onSymbolCompletedCB && !path.empty()) {
+            onSymbolCompletedCB(path.stem().string());
         }
-    } while (csvFilePaths.size() < futures.size());
+    });
 
     std::filesystem::path T6Directory = finalPath;
 
@@ -826,7 +865,7 @@ void OKXDownloader::updateMarketData(const std::string &dirPath,
                                                      err.message().c_str()));
             }
             spdlog::info(fmt::format("Converting from csv to t6..."));
-            m_p->convertFromCSVToT6(allCsvFiles, T6Directory.string());
+            m_p->convertFromCSVToT6(allCsvFiles, T6Directory.string(), candleInterval);
         }
     }
 
@@ -874,6 +913,7 @@ void OKXDownloader::updateFundingRateData(const std::string &dirPath,
                                           const onSymbolCompleted &onSymbolCompletedCB) const {
     std::vector<std::future<std::filesystem::path> > futures;
     const std::filesystem::path finalPath(dirPath);
+    validateSymbolFileComponents(symbols);
     std::vector<std::string> symbolsToUpdate = symbols;
     std::vector<std::filesystem::path> csvFilePaths;
     std::vector<std::string> symbolsToDelete;
@@ -980,12 +1020,16 @@ void OKXDownloader::updateFundingRateData(const std::string &dirPath,
         symbolsToUpdate = tempSymbols;
     }
 
+    deduplicatePreserveOrder(symbolsToUpdate);
+    validateSymbolFileComponents(symbolsToUpdate);
+    if (onSymbolsToUpdateCB) {
+        onSymbolsToUpdateCB(symbolsToUpdate);
+    }
+
     for (const auto &s: symbolsToUpdate) {
         futures.push_back(
-            std::async(std::launch::async,
-                       [finalPath, this, &frDirName](const std::string &symbol,
-                                                     Semaphore &maxJobs) -> std::filesystem::path {
-                           std::scoped_lock w(maxJobs);
+            launchBounded(m_p->maxConcurrentDownloadJobs,
+                       [finalPath, this, &frDirName](const std::string &symbol) -> std::filesystem::path {
                            std::filesystem::path symbolFilePathCsv = finalPath;
 
 
@@ -1002,7 +1046,11 @@ void OKXDownloader::updateFundingRateData(const std::string &dirPath,
 
                            spdlog::info(fmt::format("Updating FR for symbol: {}...", symbol));
 
-                           int64_t fromTimeStamp = P::checkFundingRatesCSVFile(symbolFilePathCsv.string());
+                           const auto tailCheck = P::checkFundingRatesCSVFile(symbolFilePathCsv.string());
+                           int64_t fromTimeStamp = tailCheck.timestamp;
+                           // A valid previously persisted record makes a delisted instrument an
+                           // expected no-op. Empty/header-only artifacts do not count as output.
+                           bool hasUsableCsv = tailCheck.foundValid;
 
                            // Extract instFamily from symbol ("BTC-USDT-SWAP" -> "BTC-USDT")
                            std::string instFamily;
@@ -1021,7 +1069,7 @@ void OKXDownloader::updateFundingRateData(const std::string &dirPath,
                            try {
                                int64_t totalNewRates = 0;
                                int64_t lastSavedTimestamp = fromTimeStamp;
-                               bool stoppedEarly = false;
+                               bool hasSavedTimestamp = tailCheck.foundValid && tailCheck.timestamp == fromTimeStamp;
 
                                // Funding rates have no daily aggregation — monthly files for complete
                                // UTC+8 months, REST for the running month. For X-Perps there are no
@@ -1037,23 +1085,14 @@ void OKXDownloader::updateFundingRateData(const std::string &dirPath,
                                        continue; // fully covered by what is already stored
                                    }
 
-                                   std::vector<FundingRate> rates;
-                                   try {
-                                       rates = withRetry(fmt::format("download {}", fileInfo.filename), [&] {
-                                           const auto zipData = RESTClient::downloadMarketDataFile(fileInfo.url);
-                                           const auto csvData = okx::utils::extractZip(zipData);
-                                           return okx::utils::parseFundingRateCsv(csvData, symbol);
-                                       });
-                                   } catch (const std::exception &e) {
-                                       // Append-only file: skipping forward past a failure would leave a
-                                       // permanent hole, so stop and let the next run resume from here.
-                                       spdlog::warn(fmt::format(
-                                           "Symbol: {}: archive file {} could not be downloaded ({}), "
-                                           "stopping at {} — the next run resumes from there",
-                                           symbol, fileInfo.filename, e.what(), lastSavedTimestamp));
-                                       stoppedEarly = true;
-                                       break;
-                                   }
+                                   // Fail the command instead of silently accepting a partial update;
+                                   // the next run resumes after the last successful append.
+                                   auto rates = withRetry(
+                                       fmt::format("download {} for {}", fileInfo.filename, symbol), [&] {
+                                       const auto zipData = RESTClient::downloadMarketDataFile(fileInfo.url);
+                                       const auto csvData = okx::utils::extractZip(zipData);
+                                       return okx::utils::parseFundingRateCsv(csvData, symbol);
+                                   });
 
                                    if (rates.empty()) {
                                        continue;
@@ -1065,20 +1104,27 @@ void OKXDownloader::updateFundingRateData(const std::string &dirPath,
 
                                    std::vector<FundingRate> newRates;
                                    for (const auto &rate : rates) {
-                                       if (rate.fundingTime > lastSavedTimestamp) {
+                                       if (rate.fundingTime > lastSavedTimestamp ||
+                                           (!hasSavedTimestamp && rate.fundingTime == lastSavedTimestamp)) {
                                            newRates.push_back(rate);
                                        }
                                    }
 
                                    if (!newRates.empty()) {
-                                       P::writeFundingRatesToCSVFile(newRates, symbolFilePathCsv.string());
+                                       if (!P::writeFundingRatesToCSVFile(newRates, symbolFilePathCsv.string())) {
+                                           throw std::runtime_error(fmt::format(
+                                               "failed to persist archive file {} for {}", fileInfo.filename,
+                                               symbol));
+                                       }
                                        totalNewRates += static_cast<int64_t>(newRates.size());
                                        lastSavedTimestamp = newRates.back().fundingTime;
+                                       hasSavedTimestamp = true;
+                                       hasUsableCsv = true;
                                    }
                                }
 
                                // 2. Fill the gap between last bulk file and now using REST API
-                               if (!stoppedEarly && lastSavedTimestamp < nowTimestamp) {
+                               if (lastSavedTimestamp < nowTimestamp) {
                                    auto recentRates = m_p->okxClient->getFundingRates(
                                        symbol, lastSavedTimestamp, nowTimestamp, 1000);
 
@@ -1089,14 +1135,21 @@ void OKXDownloader::updateFundingRateData(const std::string &dirPath,
 
                                        std::vector<FundingRate> newRates;
                                        for (const auto &rate : recentRates) {
-                                           if (rate.fundingTime > lastSavedTimestamp) {
+                                           if (rate.fundingTime > lastSavedTimestamp ||
+                                               (!hasSavedTimestamp && rate.fundingTime == lastSavedTimestamp)) {
                                                newRates.push_back(rate);
                                            }
                                        }
 
                                        if (!newRates.empty()) {
-                                           P::writeFundingRatesToCSVFile(newRates, symbolFilePathCsv.string());
+                                           if (!P::writeFundingRatesToCSVFile(newRates, symbolFilePathCsv.string())) {
+                                               throw std::runtime_error(fmt::format(
+                                                   "failed to persist REST funding rates for {}", symbol));
+                                           }
                                            totalNewRates += static_cast<int64_t>(newRates.size());
+                                           lastSavedTimestamp = newRates.back().fundingTime;
+                                           hasSavedTimestamp = true;
+                                           hasUsableCsv = true;
                                        }
                                    }
                                }
@@ -1105,28 +1158,42 @@ void OKXDownloader::updateFundingRateData(const std::string &dirPath,
                                    spdlog::info(fmt::format("CSV file for symbol: {} updated ({} new FR records)",
                                                             symbol, totalNewRates));
                                }
-                               return symbolFilePathCsv;
+                               if (hasUsableCsv) {
+                                   return symbolFilePathCsv;
+                               }
+                               throw std::runtime_error(fmt::format(
+                                   "No OKX funding-rate data available for symbol: {}", symbol));
 
                            } catch (const std::exception &e) {
                                const std::string errStr = e.what();
-                               if (errStr.find("code: 51001") != std::string::npos || errStr.find("code: 51000") != std::string::npos) {
-                                   spdlog::debug("REST API confirmed symbol {} is delisted (no latest data)", symbol);
+                               if (errStr.find("code: 51001") != std::string::npos) {
+                                   if (hasUsableCsv) {
+                                       spdlog::debug(
+                                           "REST API confirmed symbol {} is delisted; keeping its existing local funding data",
+                                           symbol);
+                                       return symbolFilePathCsv;
+                                   }
+                                   spdlog::warn(
+                                       "Symbol {} does not exist on OKX and no usable local funding data exists", symbol);
                                } else {
                                    spdlog::warn(fmt::format("Updating symbol: {} failed, reason: {}",
                                                             symbol, e.what()));
                                }
+                               throw std::runtime_error(fmt::format(
+                                   "Updating OKX funding rates for {} failed: {}", symbol, e.what()));
                            }
-                           return "";
-                       }, s, std::ref(m_p->maxConcurrentDownloadJobs)));
+                       }, s));
     }
 
-    do {
-        for (auto &future: futures) {
-            if (isReady(future)) {
-                csvFilePaths.push_back(future.get());
+    csvFilePaths = waitAllOrThrow(futures, [&onSymbolCompletedCB](const std::filesystem::path &path) {
+        if (onSymbolCompletedCB && !path.empty()) {
+            auto symbol = path.stem().string();
+            if (symbol.ends_with("_fr")) {
+                symbol.resize(symbol.size() - 3);
             }
+            onSymbolCompletedCB(symbol);
         }
-    } while (csvFilePaths.size() < futures.size());
+    });
 
     if (m_p->deleteDelistedData) {
         for (const auto &symbol: symbolsToDelete) {
@@ -1162,6 +1229,11 @@ void OKXDownloader::convertToT6(const std::string &dirPath, const CandleInterval
             break;
     }
 
+    if (m_p->xperp) {
+        csvDirName = CSV_XPERP_DIR;
+        t6DirName = T6_XPERP_DIR;
+    }
+
     std::filesystem::path csvDirectory = finalPath;
     csvDirectory.append(csvDirName);
     csvDirectory.append(Downloader::minutesToString(barSizeInMinutes));
@@ -1185,7 +1257,7 @@ void OKXDownloader::convertToT6(const std::string &dirPath, const CandleInterval
                                                  err.message().c_str()));
         }
         spdlog::info("Converting from csv to t6...");
-        m_p->convertFromCSVToT6(allCsvFiles, T6Directory.string());
+        m_p->convertFromCSVToT6(allCsvFiles, T6Directory.string(), candleInterval);
     }
 }
 }

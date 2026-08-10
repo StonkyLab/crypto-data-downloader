@@ -39,14 +39,19 @@ public:
         std::vector<std::int32_t> targetMinutes;
         /// Maximum number of symbols aggregated in parallel
         std::uint32_t maxJobs{1};
-        /// Rebuild target files from scratch instead of appending after their tail
+        /// Atomically rebuild target files from scratch instead of appending after their tail
         bool rewrite{false};
+        /// Emit buckets even when one or more source bars are missing. Disabled
+        /// by default because a partial bucket is indistinguishable from a
+        /// complete OHLCV row in the resulting CSV.
+        bool allowPartialBuckets{false};
     };
 
     struct Report {
         std::string symbol;
         std::int32_t targetMinutes{};
         std::int64_t barsWritten{};
+        std::int64_t incompleteBuckets{};
         bool failed{false};
         std::string error;
     };

@@ -7,9 +7,11 @@ Copyright (c) 2026 Vitezslav Kot <vitezslav.kot@stonky.cz>, Stonky s.r.o.
 */
 
 #include "stonky/lighter/lighter_downloader.h"
+#include "stonky/atomic_file.h"
 #include "stonky/csv_data.h"
 #include "stonky/csv_format.h"
 #include "stonky/downloader.h"
+#include "stonky/future_utils.h"
 #include "stonky/lighter/lighter_rest_client.h"
 #include "stonky/lighter/lighter.h"
 #include "stonky/utils/utils.h"
@@ -32,7 +34,7 @@ struct LighterDownloader::P {
     std::unique_ptr<RESTClient> ltClient;
     mutable Semaphore maxConcurrentConvertJobs;
     mutable std::recursive_mutex locker;
-    Semaphore maxConcurrentDownloadJobs{1};
+    Semaphore maxConcurrentDownloadJobs;
     bool deleteDelistedData = false;
 
     static bool writeCSVCandlesToZorroT6File(const std::string &csvPath, const std::string &t6Path,
@@ -102,7 +104,8 @@ struct LighterDownloader::P {
 
     explicit P(const std::uint32_t maxJobs, const bool deleteDelistedData)
         : ltClient(makeClient()),
-          maxConcurrentConvertJobs(maxJobs),
+          maxConcurrentConvertJobs(normalizedJobCount(maxJobs)),
+          maxConcurrentDownloadJobs(boundedJobCount(maxJobs, 1)),
           deleteDelistedData(deleteDelistedData) {
     }
 };
@@ -133,16 +136,15 @@ bool LighterDownloader::P::writeCSVCandlesToZorroT6File(const std::string &csvPa
                                                         lighter::CandleInterval interval) {
     const std::filesystem::path pathToT6File{t6Path};
 
-    std::ofstream ofs;
-    ofs.open(pathToT6File.string(), std::ios::trunc | std::ios::binary);
-
-    if (!ofs.is_open()) {
-        spdlog::error(fmt::format("Couldn't open file: {}", t6Path));
+    AtomicFileWriter output(pathToT6File);
+    if (!output.isOpen()) {
+        spdlog::error(fmt::format("Couldn't prepare file {}: {}", t6Path, output.error()));
         return false;
     }
+    auto &ofs = output.stream();
 
     std::vector<Candle> candles;
-    if (!readCandlesFromCSVFile(csvPath, candles)) {
+    if (!readCandlesFromCSVFile(csvPath, candles) || candles.empty()) {
         spdlog::error(fmt::format("Couldn't read candles from csv file: {}", csvPath));
         return false;
     }
@@ -161,7 +163,11 @@ bool LighterDownloader::P::writeCSVCandlesToZorroT6File(const std::string &csvPa
         ofs.write(reinterpret_cast<char *>(&t6), sizeof(T6));
     }
 
-    ofs.close();
+    std::string error;
+    if (!output.commit(error)) {
+        spdlog::error(fmt::format("Couldn't commit T6 file {}: {}", t6Path, error));
+        return false;
+    }
     return true;
 }
 
@@ -182,29 +188,23 @@ void LighterDownloader::P::convertFromCSVToT6(const std::vector<std::filesystem:
         spdlog::info(fmt::format("Converting symbol: {}...", path.filename().replace_extension("").string()));
 
         futures.push_back(
-            std::async(std::launch::async,
-                       [interval](const std::filesystem::path &csvPath, const std::filesystem::path &t6Path,
-                                  Semaphore &maxJobs) -> std::pair<std::string, bool> {
-                           std::scoped_lock w(maxJobs);
+            launchBounded(maxConcurrentConvertJobs,
+                       [interval](const std::filesystem::path &csvPath, const std::filesystem::path &t6Path) -> std::pair<std::string, bool> {
                            std::pair<std::string, bool> retVal;
                            retVal.first = csvPath.filename().replace_extension("").string();
                            retVal.second = writeCSVCandlesToZorroT6File(csvPath.string(), t6Path.string(), interval);
                            return retVal;
-                       }, path, t6FilePath, std::ref(maxConcurrentConvertJobs)));
+                       }, path, t6FilePath));
     }
 
-    do {
-        for (auto &future: futures) {
-            if (isReady(future)) {
-                readyFutures.push_back(future.get());
-                if (readyFutures.back().second) {
-                    spdlog::info(fmt::format("Symbol: {} converted", readyFutures.back().first));
-                } else {
-                    spdlog::error(fmt::format("Symbol: {} conversion failed", readyFutures.back().first));
-                }
-            }
+    readyFutures = waitAllOrThrow(futures);
+    for (const auto &[symbol, converted]: readyFutures) {
+        if (converted) {
+            spdlog::info(fmt::format("Symbol: {} converted", symbol));
+        } else {
+            throw std::runtime_error(fmt::format("Symbol: {} conversion failed", symbol));
         }
-    } while (readyFutures.size() < futures.size());
+    }
 }
 
 bool LighterDownloader::P::writeCandlesToCSVFile(const std::vector<Candle> &candles, const std::string &path,
@@ -250,7 +250,7 @@ bool LighterDownloader::P::writeCandlesToCSVFile(const std::vector<Candle> &cand
         return false;
     }
     ofs.close();
-    return true;
+    return ofs.good();
 }
 
 int64_t LighterDownloader::P::checkSymbolCSVFile(const std::string &path) {
@@ -293,8 +293,14 @@ bool LighterDownloader::P::writeFundingRatesToCSVFile(const std::vector<FundingR
         ofs << csvNumber(record.fundingRate) << std::endl;
     }
 
+    ofs.flush();
+    if (!ofs.good()) {
+        spdlog::error(fmt::format("Write to file failed (disk full?): {}", path));
+        ofs.close();
+        return false;
+    }
     ofs.close();
-    return true;
+    return ofs.good();
 }
 
 void LighterDownloader::updateMarketData(const std::string &dirPath,
@@ -312,6 +318,7 @@ void LighterDownloader::updateMarketData(const std::string &dirPath,
 
     std::vector<std::future<std::filesystem::path> > futures;
     const std::filesystem::path finalPath(dirPath);
+    validateSymbolFileComponents(symbols);
     std::vector<std::string> symbolsToUpdate = symbols;
     std::vector<std::string> symbolsToDelete;
     std::vector<std::filesystem::path> csvFilePaths;
@@ -381,13 +388,17 @@ void LighterDownloader::updateMarketData(const std::string &dirPath,
         symbolsToUpdate = tempSymbols;
     }
 
+    deduplicatePreserveOrder(symbolsToUpdate);
+    validateSymbolFileComponents(symbolsToUpdate);
+    if (onSymbolsToUpdateCB) {
+        onSymbolsToUpdateCB(symbolsToUpdate);
+    }
+
     for (const auto &s: symbolsToUpdate) {
         futures.push_back(
-            std::async(std::launch::async,
+            launchBounded(m_p->maxConcurrentDownloadJobs,
                        [finalPath, this, &ltInterval, &barSizeInMinutes, convertToT6](
-                   const std::string &symbol,
-                   Semaphore &maxJobs) -> std::filesystem::path {
-                           std::scoped_lock w(maxJobs);
+                   const std::string &symbol) -> std::filesystem::path {
                            std::filesystem::path symbolFilePathCsv = finalPath;
                            std::filesystem::path symbolFilePathT6 = finalPath;
 
@@ -438,20 +449,28 @@ void LighterDownloader::updateMarketData(const std::string &dirPath,
                            // Probe is skipped when the CSV already has data (we resume from CSV).
                            int64_t listingDate = nowTimestamp;
                            if (P::checkSymbolCSVFile(symbolFilePathCsv.string()) == oldestLighterDate) {
-                               try {
-                                   const auto probe = m_p->ltClient->getHistoricalPrices(
-                                       symbol, lighter::CandleInterval::_1d, oldestLighterDate, nowTimestamp);
-                                   if (!probe.empty()) {
-                                       listingDate = probe.front().openTime;
-                                   } else {
-                                       // No 1d candles at all — newly listed market with no full day yet.
-                                       // Fall back to 24h of history; subsequent runs append from CSV.
-                                       listingDate = nowTimestamp - 86400000LL;
+                               constexpr int probeRetries = 5;
+                               for (int attempt = 0; attempt < probeRetries; ++attempt) {
+                                   try {
+                                       const auto probe = m_p->ltClient->getHistoricalPrices(
+                                           symbol, lighter::CandleInterval::_1d, oldestLighterDate, nowTimestamp);
+                                       // An empty but valid response is not an authoritative listing
+                                       // date. Starting at the venue floor is slower, but cannot
+                                       // permanently truncate a newly-created CSV.
+                                       listingDate = probe.empty() ? oldestLighterDate : probe.front().openTime;
+                                       break;
+                                   } catch (const std::exception &e) {
+                                       if (attempt == probeRetries - 1) {
+                                           throw std::runtime_error(fmt::format(
+                                               "Listing-date probe failed for {} after {} attempts: {}",
+                                               symbol, probeRetries, e.what()));
+                                       }
+                                       const int waitMs = 1000 * (1 << attempt);
+                                       spdlog::warn(fmt::format(
+                                           "Listing-date probe failed for {}, retry {}/{} in {} ms: {}",
+                                           symbol, attempt + 1, probeRetries - 1, waitMs, e.what()));
+                                       std::this_thread::sleep_for(std::chrono::milliseconds(waitMs));
                                    }
-                               } catch (const std::exception &e) {
-                                   spdlog::warn(fmt::format("Listing-date probe failed for {}: {} — falling back to last 30 days",
-                                                            symbol, e.what()));
-                                   listingDate = nowTimestamp - 30LL * 86400000LL;
                                }
                            }
 
@@ -494,24 +513,21 @@ void LighterDownloader::updateMarketData(const std::string &dirPath,
                                            symbol, attempt + 1, maxRetries - 1, waitMs, errMsg));
                                        std::this_thread::sleep_for(std::chrono::milliseconds(waitMs));
                                    } else {
-                                       spdlog::warn(fmt::format(
-                                           "Updating candles for symbol: {} failed (attempt {}/{}): {}",
+                                       throw std::runtime_error(fmt::format(
+                                           "Updating candles for symbol {} failed (attempt {}/{}): {}",
                                            symbol, attempt + 1, maxRetries, errMsg));
-                                       break;
                                    }
                                }
                            }
                            return "";
-                       }, s, std::ref(m_p->maxConcurrentDownloadJobs)));
+                       }, s));
     }
 
-    do {
-        for (auto &future: futures) {
-            if (isReady(future)) {
-                csvFilePaths.push_back(future.get());
-            }
+    csvFilePaths = waitAllOrThrow(futures, [&onSymbolCompletedCB](const std::filesystem::path &path) {
+        if (onSymbolCompletedCB && !path.empty()) {
+            onSymbolCompletedCB(path.stem().string());
         }
-    } while (csvFilePaths.size() < futures.size());
+    });
 
     if (convertToT6) {
         std::filesystem::path csvDirectory = finalPath;
@@ -584,6 +600,7 @@ void LighterDownloader::updateFundingRateData(const std::string &dirPath,
                                               const onSymbolCompleted &onSymbolCompletedCB) const {
     std::vector<std::future<std::filesystem::path> > futures;
     const std::filesystem::path finalPath(dirPath);
+    validateSymbolFileComponents(symbols);
     std::vector<std::string> symbolsToUpdate = symbols;
     std::vector<std::filesystem::path> csvFilePaths;
     std::vector<std::string> symbolsToDelete;
@@ -655,12 +672,16 @@ void LighterDownloader::updateFundingRateData(const std::string &dirPath,
         symbolsToUpdate = tempSymbols;
     }
 
+    deduplicatePreserveOrder(symbolsToUpdate);
+    validateSymbolFileComponents(symbolsToUpdate);
+    if (onSymbolsToUpdateCB) {
+        onSymbolsToUpdateCB(symbolsToUpdate);
+    }
+
     for (const auto &s: symbolsToUpdate) {
         futures.push_back(
-            std::async(std::launch::async,
-                       [finalPath, this](const std::string &symbol,
-                                         Semaphore &maxJobs) -> std::filesystem::path {
-                           std::scoped_lock w(maxJobs);
+            launchBounded(m_p->maxConcurrentDownloadJobs,
+                       [finalPath, this](const std::string &symbol) -> std::filesystem::path {
                            std::filesystem::path symbolFilePathCsv = finalPath;
 
                            symbolFilePathCsv.append(CSV_FUT_FR_DIR);
@@ -701,6 +722,8 @@ void LighterDownloader::updateFundingRateData(const std::string &dirPath,
                                            spdlog::info(fmt::format("CSV file for symbol: {} updated", symbol));
                                            return symbolFilePathCsv;
                                        }
+                                       throw std::runtime_error(fmt::format(
+                                           "CSV funding-rate write failed for symbol {}", symbol));
                                    }
                                    break;
                                } catch (const std::exception &e) {
@@ -713,24 +736,25 @@ void LighterDownloader::updateFundingRateData(const std::string &dirPath,
                                            symbol, attempt + 1, maxRetries - 1, waitMs, errMsg));
                                        std::this_thread::sleep_for(std::chrono::milliseconds(waitMs));
                                    } else {
-                                       spdlog::warn(fmt::format(
-                                           "Updating symbol: {} failed (attempt {}/{}): {}",
+                                       throw std::runtime_error(fmt::format(
+                                           "Updating funding rates for symbol {} failed (attempt {}/{}): {}",
                                            symbol, attempt + 1, maxRetries, errMsg));
-                                       break;
                                    }
                                }
                            }
                            return "";
-                       }, s, std::ref(m_p->maxConcurrentDownloadJobs)));
+                       }, s));
     }
 
-    do {
-        for (auto &future: futures) {
-            if (isReady(future)) {
-                csvFilePaths.push_back(future.get());
+    csvFilePaths = waitAllOrThrow(futures, [&onSymbolCompletedCB](const std::filesystem::path &path) {
+        if (onSymbolCompletedCB && !path.empty()) {
+            auto symbol = path.stem().string();
+            if (symbol.ends_with("_fr")) {
+                symbol.resize(symbol.size() - 3);
             }
+            onSymbolCompletedCB(symbol);
         }
-    } while (csvFilePaths.size() < futures.size());
+    });
 
     if (m_p->deleteDelistedData) {
         for (const auto &symbol: symbolsToDelete) {

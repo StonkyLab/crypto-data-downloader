@@ -34,13 +34,19 @@ public:
     struct Options {
         /// Canonical number of comma-separated fields of a data record
         std::size_t expectedFields = 6;
-        /// Accept records with more fields than expectedFields (MEXC layout)
+        /// Deprecated compatibility switch. Data records are still required to
+        /// match the selected canonical schema exactly; accepting arbitrary
+        /// extra fields can hide two records glued together after a torn write.
         bool allowMoreFields = false;
         /// Salvage rows with exactly expectedFields+1 fields by dropping the
         /// last column (legacy Bybit 1h layout with a trailing turnover field)
         bool salvageExtraField = false;
         /// Bar interval in ms for gap analysis; 0 disables gap reporting
         std::int64_t intervalMs = 0;
+        /// Use calendar-month adjacency instead of a fixed millisecond delta
+        bool calendarMonth = false;
+        /// Exchange month boundary offset from UTC (OKX uses UTC+8)
+        std::int32_t calendarUtcOffsetMinutes = 0;
         /// Rewrite the file (atomic replace) when issues are found
         bool repair = false;
         /// Parallel file jobs for directory verification
