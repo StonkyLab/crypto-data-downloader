@@ -392,7 +392,15 @@ int main(int argc, char **argv) {
             const bool anyFailure = std::ranges::any_of(reports, [](const CandleAggregator::Report &r) {
                 return r.failed;
             });
-            return anyFailure ? 1 : 0;
+            if (anyFailure) {
+                return 1;
+            }
+            // Same split as verification: 2 means the output is written and
+            // usable but has holes where source bars were missing.
+            const bool anyIncomplete = std::ranges::any_of(reports, [](const CandleAggregator::Report &r) {
+                return r.incompleteBuckets > 0;
+            });
+            return anyIncomplete ? 2 : 0;
         }
 
         if (verifyData || repairData) {

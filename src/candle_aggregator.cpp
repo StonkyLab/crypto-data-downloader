@@ -389,13 +389,20 @@ CandleAggregator::Report aggregateFile(const std::filesystem::path &sourcePath,
             }
             if (!complete) {
                 ++report.incompleteBuckets;
+                // Malformed numbers mean the source file itself is untrustworthy,
+                // so that still aborts the symbol.
                 if (!bucket.valid) {
                     report.failed = true;
                     report.error = "one or more source buckets contain invalid numeric values";
-                } else if (!allowPartialBuckets) {
-                    report.failed = true;
-                    report.error = "one or more incomplete source buckets were skipped";
                 }
+                // A merely INCOMPLETE bucket does not. Missing source bars are
+                // exchange outages: they never fill, so abandoning the whole file
+                // over them means the target never gets written at all. Measured
+                // on the OKX futures set, 140 of 567 symbols carry at least one
+                // such gap — BTC-USDT-SWAP loses 3 minutes in 4.9 years and used
+                // to produce zero 5m and zero 1h bars because of it. The bucket
+                // is omitted, everything else is written, and the count is
+                // reported so the run still exits non-zero.
             }
         }
         bucket = Bucket{};
@@ -623,12 +630,11 @@ std::vector<CandleAggregator::Report> CandleAggregator::aggregateDirectory(const
                                           Downloader::minutesToString(target), report.error));
             }
             if (report.incompleteBuckets > 0) {
-                spdlog::warn(fmt::format("Aggregation of {} to {} found {} incomplete buckets; {}",
+                spdlog::warn(fmt::format("Aggregation of {} to {}: {} incomplete buckets {} "
+                                         "(the remaining complete buckets were written)",
                                          report.symbol, Downloader::minutesToString(target),
                                          report.incompleteBuckets,
-                                         options.allowPartialBuckets && !report.failed
-                                             ? "accepted by request"
-                                             : "skipped"));
+                                         options.allowPartialBuckets ? "accepted by request" : "omitted"));
             }
             totalBars += report.barsWritten;
             reports.push_back(std::move(report));

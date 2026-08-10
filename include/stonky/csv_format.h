@@ -42,17 +42,26 @@ inline std::string csvNumber(const double value) {
 }
 
 /**
- * Same for the arbitrary-precision type the OKX and MEXC models use. Keep the
- * value in decimal form throughout: narrowing to double here would silently
- * discard every significant digit beyond the double's precision. With zero
- * requested digits Boost emits the backend's full available precision in its
- * general format and suppresses insignificant trailing zeroes.
+ * Same for the arbitrary-precision type the OKX and MEXC models use.
+ *
+ * This is deliberately a NORMALISATION, not a general lossless serialisation of
+ * a 50-digit decimal: the value goes through a double first. It is safe here
+ * because the source value already IS a double. OKX ships prices such as
+ * 47415.400000000001455192, which is the exact decimal expansion of the binary64
+ * nearest to 47415.4 — the two parse to bit-identical doubles, so the extra
+ * seventeen characters carry no information for any consumer, and every consumer
+ * of these files (pandas, polars, the Nautilus catalog builder) reads them as
+ * float64 anyway. Writing the expansion verbatim cost 35 % file size for
+ * nothing: BTC-USDT-SWAP 1m grew from 156 MB to 210 MB.
+ *
+ * Should a venue ever quote finer than binary64 can hold, this is the function
+ * that has to change — market data does not come close today.
  */
 inline std::string csvNumber(const boost::multiprecision::cpp_dec_float_50 &value) {
     if (!boost::math::isfinite(value)) {
         throw std::domain_error("non-finite decimal cannot be serialized to market-data CSV");
     }
-    return value.str(0, std::ios_base::fmtflags{});
+    return csvNumber(value.convert_to<double>());
 }
 
 } // namespace stonky
