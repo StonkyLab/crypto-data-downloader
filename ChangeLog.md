@@ -72,3 +72,18 @@ All notable changes to this project will be documented in this file. This projec
 - Return a non-zero exit code on fatal errors; verification exits 1 for repairable damage and 2 for gaps, so cron can tell them apart
 - Refuse to fall back to "all exchange symbols" when `-a` points at an empty or unreadable file
 
+## [2.6.1](https://github.com/vitakot/crypto_data_downloader/releases/tag/v2.6.1) (2026-08-10)
+- Complete the lossless-number fix: the Binance funding-rate writer was missed in 2.6.0 and still wrote six significant digits
+- Serialise decimal values as normalised binary64, shortest round-tripping form. Writing the 50-digit expansion verbatim carried no information (the source values are doubles) and grew BTC-USDT-SWAP 1m from 156 MB to 210 MB
+- Aggregation (`-g`) no longer abandons a whole symbol over incomplete source buckets: a bucket with missing bars is omitted, everything else is written, and the run exits 2. Exchange outages never backfill, so failing on them meant 140 of 567 OKX futures symbols would never get a 5m or 1h file at all
+- Aggregation reads each source twice and localises damage to the affected bucket: a forward timestamp outlier or a malformed number costs one bucket instead of poisoning everything after it. Rewrites are protected by a per-target advisory lock, atomic replacement and a subset proof so a corrupted source cannot authorise mass deletion of previously published rows
+- OKX: stop appending newer archive files past an unresolved foreign-link listing entry; the missing period stays the tail instead of becoming a permanent internal hole. Candle and funding writers check stream state after flush/close and no longer advance the resume timestamp on a failed write
+- MEXC spot pagination respects the exclusive `endTime`, so one candle is no longer lost at every 1000-row page boundary; historical requests send both bounds so the API cannot ignore a lone historical `endTime` and answer with current data
+- MEXC downloads go through transactional staging: a manifest with numbered batches, schema/alignment/monotonicity validation, per-symbol advisory locks and atomic replacement. An interrupted run can no longer splice a newest-first fragment past the old tail and create a permanent middle gap
+- MEXC records unproven history boundaries in `.prefix.pending` / `.prefix-provisional` sidecar files next to the CSV; later runs keep probing for the older prefix and merge it in by timestamp union. These sidecars and the `.lock` files are recovery state — do not delete them
+- Propagate per-symbol worker failures to the process exit code; a run where symbols failed can no longer exit 0. Aggregation over a missing dataset exits 1
+- Cap the number of concurrently created download threads by acquiring the slot before `std::async`, deduplicate symbol lists, validate symbols used as filename components, switch log sinks to the multithreaded variants
+- T6 writers publish via locked sibling temp files and atomic replacement, and use the actual interval for close timestamps instead of a hardcoded minute; Bybit/MEXC/OKX monthly and MEXC weekly conversions use calendar boundaries (Monday weeks, UTC+8 for OKX)
+- Add deterministic regression tests (11 CTest targets) covering number round-trips, tail recovery, pagination, staging, atomic writes, intervals, aggregation policy and the verifier
+- Remove the GitHub Actions workflow; sanitizer and coverage remain as local, opt-in CMake configurations
+
