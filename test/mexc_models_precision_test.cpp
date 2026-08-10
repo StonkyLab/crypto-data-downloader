@@ -1,8 +1,24 @@
 #include "stonky/csv_format.h"
 #include "stonky/mexc/mexc_models.h"
 
+#include <bit>
+#include <cstdint>
 #include <iostream>
 #include <nlohmann/json.hpp>
+#include <string>
+
+namespace {
+
+bool sameBinary64Value(const boost::multiprecision::cpp_dec_float_50 &parsed,
+                       const std::string &source) {
+    const double expected = std::stod(source);
+    const double modelValue = parsed.convert_to<double>();
+    const double csvValue = std::stod(stonky::csvNumber(parsed));
+    return std::bit_cast<std::uint64_t>(modelValue) == std::bit_cast<std::uint64_t>(expected) &&
+           std::bit_cast<std::uint64_t>(csvValue) == std::bit_cast<std::uint64_t>(expected);
+}
+
+} // namespace
 
 int main() {
     const auto payload = nlohmann::json::parse(R"({
@@ -29,10 +45,10 @@ int main() {
         std::cerr << "Small numeric MEXC price was rounded through six decimal places\n";
         return 1;
     }
-    if (stonky::csvNumber(response.candles[1].open) !=
-            "0.12345678901234567890123456789" ||
-        stonky::csvNumber(response.candles[1].volume) != "1234567890123456.78") {
-        std::cerr << "String-valued MEXC decimal lost multiprecision digits\n";
+    if (!sameBinary64Value(response.candles[1].open,
+                           "0.123456789012345678901234567890") ||
+        !sameBinary64Value(response.candles[1].volume, "1234567890123456.78")) {
+        std::cerr << "String-valued MEXC decimal changed its binary64 market value\n";
         return 1;
     }
 

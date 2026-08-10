@@ -14,13 +14,14 @@ Copyright (c) 2026 Vitezslav Kot <vitezslav.kot@stonky.cz>, Stonky s.r.o.
 #include <spdlog/fmt/fmt.h>
 #include <cmath>
 #include <ios>
+#include <limits>
 #include <stdexcept>
 #include <string>
 
 namespace stonky {
 
 /**
- * Format a number for a CSV cell without losing information.
+ * Format a binary64 number for a CSV cell without losing any of its bits.
  *
  * Streaming a value with `ofs << value` uses the stream's default precision of
  * SIX SIGNIFICANT DIGITS. That silently truncated every value needing more:
@@ -30,9 +31,9 @@ namespace stonky {
  * which is why the damage stayed invisible.
  *
  * The shortest representation that parses back to the same double is used
- * instead. Besides being lossless it also normalises the noise exchanges put
- * in their own archives: OKX ships 19557.900000000001455192, which round-trips
- * to a clean 19557.9.
+ * instead. Besides being lossless for binary64 it also normalises the noise
+ * exchanges put in their own archives: OKX ships
+ * 19557.900000000001455192, which round-trips to a clean 19557.9.
  */
 inline std::string csvNumber(const double value) {
     if (!std::isfinite(value)) {
@@ -42,26 +43,54 @@ inline std::string csvNumber(const double value) {
 }
 
 /**
- * Same for the arbitrary-precision type the OKX and MEXC models use.
+ * Same for the decimal type the OKX and MEXC models use while parsing and
+ * aggregating.
  *
- * This is deliberately a NORMALISATION, not a general lossless serialisation of
- * a 50-digit decimal: the value goes through a double first. It is safe here
- * because the source value already IS a double. OKX ships prices such as
- * 47415.400000000001455192, which is the exact decimal expansion of the binary64
- * nearest to 47415.4 — the two parse to bit-identical doubles, so the extra
- * seventeen characters carry no information for any consumer, and every consumer
- * of these files (pandas, polars, the Nautilus catalog builder) reads them as
- * float64 anyway. Writing the expansion verbatim cost 35 % file size for
- * nothing: BTC-USDT-SWAP 1m grew from 156 MB to 210 MB.
+ * This is deliberately a NORMALISATION to the project's storage contract, not
+ * a general lossless serialisation of a 50-digit decimal. Market prices,
+ * quantities and derived sums are persisted as binary64 values because the
+ * downstream backtest stack consumes them as float64. Converting here and
+ * writing the shortest round-tripping representation guarantees that loading
+ * the CSV produces exactly that same double, regardless of whether the venue
+ * supplied the source number as JSON numeric data or as a decimal string.
  *
- * Should a venue ever quote finer than binary64 can hold, this is the function
- * that has to change — market data does not come close today.
+ * This also removes binary64 expansions found in exchange archives. For
+ * example, 47415.400000000001455192 and 47415.4 map to the same double; keeping
+ * the extra digits would increase file size without changing a supported
+ * consumer's value.
+ *
+ * Timestamps and identifiers must use their integer/string serializers and
+ * must never pass through this overload.
  */
 inline std::string csvNumber(const boost::multiprecision::cpp_dec_float_50 &value) {
     if (!boost::math::isfinite(value)) {
         throw std::domain_error("non-finite decimal cannot be serialized to market-data CSV");
     }
-    return csvNumber(value.convert_to<double>());
+
+    using Decimal = boost::multiprecision::cpp_dec_float_50;
+    const auto absoluteValue = boost::multiprecision::abs(value);
+    static const Decimal maxBinary64{std::numeric_limits<double>::max()};
+    if (absoluteValue > maxBinary64) {
+        throw std::domain_error("decimal is outside the finite binary64 range");
+    }
+
+    const double narrowed = value.convert_to<double>();
+    if (!std::isfinite(narrowed) || (value != 0 && narrowed == 0)) {
+        throw std::domain_error("decimal cannot be represented by finite non-zero binary64");
+    }
+
+    // Normal binary64 rounding is far below the project's 0.001 % market-data
+    // tolerance. Near the subnormal boundary, however, a finite conversion can
+    // still have a large relative error, so validate that exceptional range.
+    if (value != 0 && std::abs(narrowed) < std::numeric_limits<double>::min()) {
+        static const Decimal maxRelativeError{"0.00001"}; // 0.001 %
+        const Decimal restored{narrowed};
+        const auto relativeError = boost::multiprecision::abs((restored - value) / value);
+        if (relativeError > maxRelativeError) {
+            throw std::domain_error("decimal loses more than 0.001 percent in binary64");
+        }
+    }
+    return csvNumber(narrowed);
 }
 
 } // namespace stonky

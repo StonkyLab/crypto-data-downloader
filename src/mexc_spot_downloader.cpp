@@ -22,6 +22,7 @@ Copyright (c) 2026 Vitezslav Kot <vitezslav.kot@stonky.cz>, Stonky s.r.o.
 #include <fstream>
 #include <spdlog/spdlog.h>
 #include <future>
+#include <optional>
 #include <set>
 #include <spdlog/fmt/ranges.h>
 #include <ranges>
@@ -506,11 +507,12 @@ void MEXCSpotDownloader::updateMarketData(const std::string &dirPath, const std:
                         P::recoverAndMergeTempFiles(tempDir.string(), symbolFilePathCsv.string(), symbol);
 
                         auto tail = P::checkSymbolCSVFile(symbolFilePathCsv.string());
+                        const std::string csvHeader =
+                            "open_time,open,high,low,close,volume,quote_asset_volume";
                         if (tail.foundValid && tail.timestamp > lastCompletedOpen) {
                             std::string repairError;
                             if (!mexc_staging::truncateAfter(symbolFilePathCsv, lastCompletedOpen,
-                                                             repairError,
-                                                             "open_time,open,high,low,close,volume,quote_asset_volume",
+                                                             repairError, csvHeader,
                                                              intervalMs, alignment)) {
                                 throw std::runtime_error(fmt::format(
                                     "Could not remove old open/future MEXC Spot tail: {}", repairError));
@@ -520,19 +522,111 @@ void MEXCSpotDownloader::updateMarketData(const std::string &dirPath, const std:
                                 lastCompletedOpen));
                             tail = P::checkSymbolCSVFile(symbolFilePathCsv.string());
                         }
-                        if (tail.foundValid && tail.timestamp == lastCompletedOpen) {
+
+                        mexc_staging::CsvTail currentCsv;
+                        std::string prefixError;
+                        if (!mexc_staging::inspectCsvTail(symbolFilePathCsv, csvHeader, currentCsv,
+                                                          prefixError, intervalMs, alignment)) {
+                            throw std::runtime_error(fmt::format(
+                                "Cannot inspect MEXC Spot CSV before prefix recovery: {}", prefixError));
+                        }
+                        if (tail.foundValid != currentCsv.hasData ||
+                            (tail.foundValid && tail.timestamp != currentCsv.timestamp)) {
+                            throw std::runtime_error(
+                                "MEXC Spot tail readers disagree before prefix recovery");
+                        }
+
+                        std::optional<mexc_staging::PrefixMarker> prefixMarker;
+                        if (!mexc_staging::readPrefixMarker(symbolFilePathCsv, prefixMarker,
+                                                            prefixError)) {
+                            throw std::runtime_error(fmt::format(
+                                "Cannot read MEXC Spot unresolved-prefix marker: {}", prefixError));
+                        }
+                        if (prefixMarker &&
+                            (prefixMarker->intervalMs != intervalMs ||
+                             prefixMarker->alignment != alignment)) {
+                            throw std::runtime_error(
+                                "MEXC Spot unresolved-prefix marker belongs to a different interval");
+                        }
+
+                        bool rebuildPrefix = false;
+                        if (prefixMarker && currentCsv.hasData) {
+                            if (currentCsv.firstTimestamp <= prefixMarker->requestedStart) {
+                                if (!mexc_staging::removePrefixMarker(symbolFilePathCsv,
+                                                                      prefixError)) {
+                                    throw std::runtime_error(prefixError);
+                                }
+                                prefixMarker.reset();
+                            } else {
+                                const auto probe = m_p->mexcSpotClient->probeHistoricalPrices(
+                                    symbol, mexcCandleInterval, prefixMarker->requestedStart,
+                                    currentCsv.firstTimestamp);
+                                rebuildPrefix = !probe.empty();
+                                if (rebuildPrefix) {
+                                    spdlog::info(fmt::format(
+                                        "Symbol {}: older MEXC Spot history became available; rebuilding prefix",
+                                        symbol));
+                                }
+                            }
+                        }
+
+                        if (!rebuildPrefix && tail.foundValid &&
+                            tail.timestamp == lastCompletedOpen) {
                             spdlog::info(fmt::format("No new candles for symbol: {}", symbol));
                             return symbolFilePathCsv;
                         }
 
-                        const auto actualFromTimeStamp = tail.foundValid
-                            ? mexc_staging::nextTimestamp(tail.timestamp, intervalMs, alignment)
-                            : tail.timestamp;
+                        const auto actualFromTimeStamp = rebuildPrefix
+                            ? prefixMarker->requestedStart
+                            : (!currentCsv.hasData && prefixMarker
+                                ? prefixMarker->requestedStart
+                                : (tail.foundValid
+                                    ? mexc_staging::nextTimestamp(tail.timestamp, intervalMs, alignment)
+                                    : tail.timestamp));
                         if (actualFromTimeStamp > lastCompletedOpen) {
                             throw std::runtime_error("Invalid MEXC Spot download range");
                         }
-                        const auto apiEndTime = mexc_staging::nextTimestamp(lastCompletedOpen,
-                                                                           intervalMs, alignment);
+
+                        // A known delisted symbol may have years of empty time
+                        // after its last candle.  One bounded probe avoids
+                        // walking that suffix page by page.  A negative probe
+                        // never advances state: existing data is a safe no-op,
+                        // while a fresh symbol produces no false-success CSV.
+                        auto authoritativeLastOpen = lastCompletedOpen;
+                        if (!expectedLive) {
+                            std::optional<std::int64_t> newestProbeTimestamp;
+                            if (!rebuildPrefix) {
+                                const auto probeEnd = mexc_staging::nextTimestamp(
+                                    lastCompletedOpen, intervalMs, alignment);
+                                const auto probe = m_p->mexcSpotClient->probeHistoricalPrices(
+                                    symbol, mexcCandleInterval, actualFromTimeStamp, probeEnd);
+                                if (!probe.empty()) {
+                                    newestProbeTimestamp = probe.back().openTime;
+                                }
+                            }
+                            const auto decision = mexc_staging::decideDelistedProbe(
+                                rebuildPrefix,
+                                currentCsv.hasData
+                                    ? std::optional<std::int64_t>{currentCsv.timestamp}
+                                    : std::nullopt,
+                                newestProbeTimestamp);
+                            if (decision.action ==
+                                mexc_staging::DelistedProbeAction::NoOpExisting) {
+                                spdlog::info(fmt::format(
+                                    "No newer candles in bounded probe for delisted MEXC Spot symbol: {}",
+                                    symbol));
+                                return symbolFilePathCsv;
+                            }
+                            if (decision.action ==
+                                mexc_staging::DelistedProbeAction::RefuseFresh) {
+                                throw std::runtime_error(
+                                    "MEXC Spot bounded delisted-symbol probe returned no candles for a fresh file");
+                            }
+                            authoritativeLastOpen = decision.authoritativeLastOpen;
+                        }
+
+                        const auto apiEndTime = mexc_staging::nextTimestamp(
+                            authoritativeLastOpen, intervalMs, alignment);
                         spdlog::debug(fmt::format("Symbol {}: Calling API from {} to {}", symbol,
                                                   actualFromTimeStamp, apiEndTime));
 
@@ -540,15 +634,60 @@ void MEXCSpotDownloader::updateMarketData(const std::string &dirPath, const std:
                         // return value.  Stage only after it completes, in
                         // chronological chunks, so an interrupted pagination
                         // cannot leave a recoverable newest-only prefix.
-                        const auto candles = m_p->mexcSpotClient->getHistoricalPrices(
+                        auto history = m_p->mexcSpotClient->getHistoricalPricesWithOutcome(
                             symbol, mexcCandleInterval, actualFromTimeStamp, apiEndTime);
+                        const auto &candles = history.candles;
                         if (candles.empty()) {
-                            if (!expectedLive && tail.foundValid) {
-                                spdlog::info(fmt::format(
-                                    "No newer candles for delisted MEXC Spot symbol: {}", symbol));
+                            if (!rebuildPrefix && tail.foundValid) {
+                                spdlog::warn(fmt::format(
+                                    "MEXC Spot returned no candles after existing tail for {}; preserving CSV and retrying next run",
+                                    symbol));
                                 return symbolFilePathCsv;
                             }
                             throw std::runtime_error("MEXC Spot returned no candles for a non-empty range");
+                        }
+                        if (candles.back().openTime > authoritativeLastOpen ||
+                            candles.back().openTime > lastCompletedOpen) {
+                            throw std::runtime_error(
+                                "MEXC Spot returned a candle beyond the authoritative closed range");
+                        }
+                        if (rebuildPrefix &&
+                            (candles.front().openTime >= currentCsv.firstTimestamp ||
+                             candles.back().openTime < currentCsv.timestamp)) {
+                            throw std::runtime_error(
+                                "MEXC Spot prefix rebuild did not extend history without truncating its suffix");
+                        }
+                        std::size_t gapBoundaries = 0;
+                        std::uint64_t missingGapSlots = 0;
+                        std::optional<std::int64_t> previousTimestamp;
+                        if (!rebuildPrefix && tail.foundValid) {
+                            previousTimestamp = tail.timestamp;
+                        }
+                        for (const auto &candle : candles) {
+                            if (previousTimestamp &&
+                                !mexc_staging::isNextTimestamp(*previousTimestamp, candle.openTime,
+                                                               intervalMs, alignment)) {
+                                ++gapBoundaries;
+                                missingGapSlots += mexc_staging::missingCandleSlotsAfter(
+                                    *previousTimestamp, candle.openTime,
+                                    intervalMs, alignment) - 1;
+                            }
+                            previousTimestamp = candle.openTime;
+                        }
+                        if (gapBoundaries > 0) {
+                            spdlog::warn(fmt::format(
+                                "Symbol {}: preserving {} missing MEXC Spot candle slot(s) across {} gap boundary/boundaries",
+                                symbol, missingGapSlots, gapBoundaries));
+                        }
+                        const auto trailingMissing = mexc_staging::missingCandleSlotsAfter(
+                            candles.back().openTime, authoritativeLastOpen, intervalMs, alignment);
+                        if (trailingMissing > 0) {
+                            spdlog::warn(fmt::format(
+                                "Symbol {}: preserving {} missing trailing MEXC Spot candle slot(s) [{}..{}]",
+                                symbol, trailingMissing,
+                                mexc_staging::nextTimestamp(candles.back().openTime,
+                                                            intervalMs, alignment),
+                                authoritativeLastOpen));
                         }
 
                         mexc_staging::discard(tempDir);
@@ -575,21 +714,65 @@ void MEXCSpotDownloader::updateMarketData(const std::string &dirPath, const std:
                         manifest.batchCount = tempFileCounter;
                         manifest.intervalMs = intervalMs;
                         manifest.alignment = alignment;
-                        manifest.baseTimestamp = tail.timestamp;
-                        manifest.baseHasData = tail.foundValid;
+                        manifest.baseTimestamp = rebuildPrefix ? 0 : tail.timestamp;
+                        manifest.baseHasData = rebuildPrefix ? false : tail.foundValid;
                         manifest.requestedStart = actualFromTimeStamp;
-                        manifest.expectedEnd = expectedLive ? lastCompletedOpen : candles.back().openTime;
+                        // The venue may omit the latest closed candle during
+                        // an outage.  Publish all valid rows and retry from the
+                        // actual tail on the next run instead of rejecting the
+                        // whole transaction.
+                        manifest.expectedEnd = candles.back().openTime;
                         manifest.firstTimestamp = candles.front().openTime;
                         manifest.lastTimestamp = candles.back().openTime;
 
                         std::string manifestError;
+                        // Validate first, then persist the marker, and only then
+                        // publish the recoverable manifest.  A crash between a
+                        // manifest and marker in the opposite order could let
+                        // startup recovery expose an unmarked newest-only suffix.
+                        if (!mexc_staging::validate(tempDir, manifest, manifestError)) {
+                            throw std::runtime_error(fmt::format("Invalid MEXC Spot staging: {}",
+                                                                 manifestError));
+                        }
+                        if (!prefixMarker && !manifest.baseHasData &&
+                            history.completion ==
+                                mexc::detail::PaginationCompletion::ProvisionalAvailabilityBoundary) {
+                            prefixMarker = mexc_staging::PrefixMarker{
+                                1, actualFromTimeStamp, intervalMs, alignment};
+                            if (!mexc_staging::writePrefixMarker(symbolFilePathCsv, *prefixMarker,
+                                                                 manifestError)) {
+                                throw std::runtime_error(fmt::format(
+                                    "Failed to persist MEXC Spot unresolved prefix before publish: {}",
+                                    manifestError));
+                            }
+                        }
                         if (!mexc_staging::writeManifest(tempDir, manifest, manifestError)) {
                             throw std::runtime_error(fmt::format("Invalid MEXC Spot staging: {}",
                                                                  manifestError));
                         }
-                        if (!P::mergeTempFilesToCSV(tempDir.string(), symbolFilePathCsv.string(), symbol)) {
-                            throw std::runtime_error(fmt::format("Failed to commit MEXC Spot data for {}",
-                                                                 symbol));
+
+                        if (rebuildPrefix) {
+                            if (!mexc_staging::replaceCsv(tempDir, manifest, symbolFilePathCsv,
+                                                          csvHeader, currentCsv, manifestError)) {
+                                throw std::runtime_error(fmt::format(
+                                    "Failed to replace MEXC Spot data after prefix rebuild for {}: {}",
+                                    symbol, manifestError));
+                            }
+                            mexc_staging::discard(tempDir);
+                        } else if (!P::mergeTempFilesToCSV(tempDir.string(),
+                                                           symbolFilePathCsv.string(), symbol)) {
+                            throw std::runtime_error(fmt::format(
+                                "Failed to commit MEXC Spot data for {}", symbol));
+                        }
+
+                        if (prefixMarker &&
+                            actualFromTimeStamp == prefixMarker->requestedStart &&
+                            history.completion ==
+                                mexc::detail::PaginationCompletion::RequestedRangeScanned) {
+                            if (!mexc_staging::removePrefixMarker(symbolFilePathCsv,
+                                                                  manifestError)) {
+                                throw std::runtime_error(manifestError);
+                            }
                         }
                         spdlog::info(fmt::format("CSV file for symbol: {} updated ({} candles in {} staged batches)",
                                                  symbol, candles.size(), tempFileCounter));
@@ -649,10 +832,18 @@ void MEXCSpotDownloader::updateMarketData(const std::string &dirPath, const std:
             symbolFilePathCsv = symbolFilePathCsv.lexically_normal();
             symbolFilePathCsv.append(symbol + ".csv");
 
+            std::filesystem::path tempDir = symbolFilePathCsv.parent_path();
+            tempDir.append("temp_" + symbol);
+            mexc_staging::DirectoryLock symbolLock(tempDir.string() + ".lock");
             if (std::filesystem::exists(symbolFilePathCsv)) {
                 std::filesystem::remove(symbolFilePathCsv);
                 spdlog::info(fmt::format("Removing csv file for delisted symbol: {}, file: {}...", symbol, symbolFilePathCsv.string()));
             }
+            std::string markerError;
+            if (!mexc_staging::removePrefixMarker(symbolFilePathCsv, markerError)) {
+                throw std::runtime_error(markerError);
+            }
+            mexc_staging::discard(tempDir);
         }
     }
 }

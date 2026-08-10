@@ -106,6 +106,31 @@ MEXC API has **undocumented limits** for historical candlestick data:
 
 > **Recommendation:** Use **1h (hourly)** or larger intervals for complete MEXC historical data.
 
+MEXC candle downloads deliberately tolerate exchange outages. A committed CSV
+must have the exact venue schema, finite binary64-compatible values, aligned
+timestamps and strictly increasing rows, but missing aligned candle slots are
+preserved as gaps instead of invalidating the rest of the history. Duplicate,
+out-of-order, misaligned or malformed rows still fail the transaction.
+
+Each symbol update is serialized by an OS advisory lock and published through
+validated staging plus atomic replacement. If a first download reaches only a
+provisional MEXC availability boundary, the usable suffix may be published, but
+`<SYMBOL>.csv.prefix.pending` is written first. Every later run holding the same
+symbol lock probes the missing interval. If older candles become available, the
+downloaded range is merged by timestamp with every row already stored locally
+and the union atomically replaces the suffix. A transient API omission therefore
+cannot erase a candle that is already on disk; conflicting values at the same
+timestamp fail closed. The marker is removed only after a positive scan reaches
+the originally requested start. Negative probes never silently declare a
+shortened history complete.
+
+The regular `*.lock` files are persistent lock identities and are not stale just
+because they remain on disk; ownership is held and released by the operating
+system, including after a killed process. A directory at one of these lock paths
+comes from the former directory-lock implementation and is rejected fail-closed.
+After confirming that no old downloader process is running, remove that legacy
+directory once so the new regular lock file can be created.
+
 #### MEXC Delisted Symbols
 
 MEXC Futures API does not provide a bulk endpoint for delisted contracts — the `/api/v1/contract/detail` endpoint returns only active symbols. However, historical data for delisted symbols **is still available** when queried individually.
@@ -115,6 +140,11 @@ To download data for delisted MEXC futures symbols, maintain your own list of de
 ```bash
 ./crypto_data_downloader -e mexc -c f -s "HOOK_USDT,BNKR_USDT,LUNA2USDT" -o /data/mexc
 ```
+
+For a known delisted symbol the downloader uses a bounded newest-candle probe
+instead of walking years of empty post-delisting windows. An empty probe safely
+preserves an existing CSV as a no-op; for a fresh symbol it refuses to create a
+false-success file with no data.
 
 ## Requirements
 
@@ -217,9 +247,9 @@ ctest --test-dir build-tests --output-on-failure
 
 With GCC or Clang, add `-DENABLE_SANITIZERS=ON` to run the same suite under
 AddressSanitizer and UndefinedBehaviorSanitizer. Use a separate build directory
-with `-DENABLE_COVERAGE=ON` for compiler coverage instrumentation; CI smoke-tests
-both modes but does not publish coverage to an external service. Both options
-fail configuration on unsupported compilers.
+with `-DENABLE_COVERAGE=ON` for compiler coverage instrumentation. Both options
+fail configuration on unsupported compilers. No hosted CI workflow is committed;
+run these checks locally before publishing a change.
 
 Live MEXC account tools are not part of CTest; destructive tools require the
 explicit connector option `ENABLE_DESTRUCTIVE_MEXC_TOOLS=ON`.
@@ -245,7 +275,7 @@ crypto_data_downloader [OPTIONS]
 | `-d` | `--delete_delisted` | Delete delisted symbols data files | - |
 | `-z` | `--t6_conversion` | Convert existing CSV data to T6 format (Zorro Trader) without downloading | - |
 | `-g` | `--aggregate` | Aggregate the `-b` bar size into coarser timeframes (comma-separated minutes) without downloading | - |
-| - | `--allow_partial_aggregation` | Emit coarse candles even when source bars are missing; without this flag incomplete buckets are skipped and aggregation fails | - |
+| - | `--allow_partial_aggregation` | Emit a partial coarse candle from the available valid source bars; by default an incomplete bucket alone is skipped | - |
 | `-x` | `--xperp` | OKX only: download X-Perps instead of USDT swaps, into `<output>/xperp/` | - |
 | `-y` | `--verify` | Verify CSV data integrity (torn lines, duplicates, ordering, gaps) without downloading | - |
 | `-r` | `--repair` | Verify and repair CSV data files in place | - |
@@ -280,27 +310,44 @@ crypto_data_downloader [OPTIONS]
 ./crypto_data_downloader -o /data/okx -b 1 -g 5,60        # local aggregation, no network
 ```
 
-Aggregation is strict by default: a closed target bucket is emitted only when
-all expected source bars are present and contiguous. If a historical source gap
-must deliberately be represented by a partial OHLCV candle, opt in explicitly:
+Aggregation is gap-tolerant by default. A closed target bucket is emitted only
+when all expected source bars are present and contiguous; an incomplete bucket
+is skipped without discarding any complete buckets before or after the outage.
+This includes outages spanning one or more entire target intervals. The command
+processes every symbol and target, publishes the usable output, and exits with
+code `2` when at least one closed bucket had to be omitted.
+
+If a bucket with at least one valid source bar should deliberately be represented
+by a partial OHLCV candle, opt in explicitly:
 
 ```bash
 ./crypto_data_downloader -o /data/okx -b 1 -g 5 --allow_partial_aggregation
 ```
 
-Derived files are rebuilt through an atomic replacement on each CLI run. A
-strict run that finds an incomplete or malformed historical bucket leaves the
-previous target untouched, so a later repair of the source can restore the
-bucket without being blocked by an append-only tail.
+An entirely absent target interval cannot be synthesized even in partial mode;
+it remains omitted and is reported through exit code `2`. Derived files are
+rebuilt through an atomic replacement on each CLI run, so a later repair of the
+source can insert a previously missing bucket. A fatal unsupported schema or
+I/O failure still preserves the previous target and exits with code `1`.
+
+Before that atomic rewrite is committed, every row that already exists in the
+target must either reappear in the new output or correspond to a source bucket
+that was explicitly observed and classified as damaged. An unseen prefix,
+tail, or isolated rogue timestamp therefore cannot authorize bulk deletion,
+while a gap that was already absent from the target does not block later
+updates.
 
 The aggregator resolves columns by their exact header names and preserves the
 venue's schema. It keeps the first `open`, maximum `high`, minimum `low`, and
 last `close`; known quantity/count columns are summed with decimal
-multiprecision. Binance's `timestamp` remains the bucket open time,
+multiprecision and stored as the shortest round-tripping binary64 text used by
+the backtest pipeline. Binance's `timestamp` remains the bucket open time,
 `close_time` becomes the bucket's inclusive end, and `ignore` is copied from
-the final source row. An unknown column, malformed numeric value, duplicate or
-out-of-order timestamp, or an unsupported header fails the file instead of
-guessing how it should be aggregated.
+the final source row. An unknown/unsupported header or a read/write failure is
+fatal. Torn-width, invalid-timestamp, non-finite numeric, duplicate and
+out-of-order source rows taint their affected bucket, which is never emitted;
+the remaining safe buckets are still published. The source damage can be
+diagnosed separately with `--verify`.
 
 The trailing in-progress bucket is always held back. Calendar-month aggregation
 is also intentionally unavailable through `-g`: `43200` selects the exchanges'
@@ -381,6 +428,18 @@ The data sources are asymmetric, and one of them decays:
 ./crypto_data_downloader -e mexc -t fr -o /data/mexc
 ```
 
+MEXC funding updates use a separate per-symbol lock and atomic whole-file
+replacement. Empty first pages are retried and ambiguous pagination fails
+closed. Before the first update with this version, every fresh or legacy CSV is
+preceded by `<SYMBOL>_fr.csv.prefix-provisional`; the marker is created before
+any data write. Every run then scans all declared pages, validates stable
+pagination metadata, merges the complete download with the complete local CSV
+by timestamp, and atomically publishes the union. Thus a temporarily shortened
+but internally consistent API snapshot can add records but cannot hide an older
+or middle gap forever; a later wider snapshot fills it. The marker is
+intentionally retained because MEXC exposes no independent authoritative
+start-of-history proof.
+
 **Download Hyperliquid perpetuals — 1h candles (all symbols):**
 ```bash
 ./crypto_data_downloader -e hl -c f -b 60 -o /data/hyperliquid
@@ -459,6 +518,12 @@ current 6-column format. Gaps are only reported — missing data cannot be
 restored locally; delete the affected file and re-download where the exchange
 still serves the range.
 
+A reported gap is not by itself structural corruption: it may be a real
+exchange outage that no re-download can fill. In particular, MEXC persistence
+keeps valid aligned rows on both sides of such a gap, and local aggregation
+omits only the affected coarse bucket instead of rejecting the symbol's full
+history.
+
 Gap analysis is automatically skipped for Binance Spot, where missing bars are
 exchange-native rather than a data defect (the kline API omits zero-trade
 intervals entirely; exchange-wide outages in 2021 also left holes in every
@@ -499,6 +564,13 @@ open_time,open,high,low,close,volume
 1704067200000,42000.50,42150.00,41980.25,42100.75,1234.56
 ...
 ```
+
+Numeric market-data cells use the project's binary64 storage contract. Values
+are written as the shortest decimal text that parses back to exactly the same
+`double`; non-finite and out-of-range values are rejected. Decimal strings may
+be parsed through a multiprecision type internally, but CSV persistence is not
+an arbitrary-precision decimal contract: it intentionally normalizes to the
+same float64 representation consumed by the backtest pipeline.
 
 ### Funding Rate Data (CSV)
 

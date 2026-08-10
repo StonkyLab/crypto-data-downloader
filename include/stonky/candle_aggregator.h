@@ -24,11 +24,19 @@ namespace stonky {
  * agnostic: columns are resolved by header name, so the output file carries
  * exactly the same columns as its source.
  *
+ * Historical exchange outages are localized: an incomplete, absent or unsafe
+ * source bucket is omitted without preventing complete buckets on either side
+ * from being published. Report::incompleteBuckets records the degradation so
+ * callers can distinguish a complete result from one with holes.
+ * To prevent a forward timestamp outlier from poisoning a long valid suffix,
+ * each source is read twice and a compact timestamp/keep index is retained for
+ * the second pass; rendered CSV rows themselves are streamed to disk.
+ *
  * OHLC values are carried through as the ORIGINAL text of the contributing
- * source rows (open of the first minute, close of the last, text of the
- * min/max rows) - no parse/format round trip, so no precision is lost on
- * assets quoted with many decimals. Only volume columns are summed
- * numerically.
+ * source rows (open of the first minute, close of the last, text of the min/max
+ * rows). Every numeric input and aggregate sum must fit the project's binary64
+ * storage contract within 0.001 %; damage is localized to its target bucket
+ * instead of aborting unrelated symbols or years.
  */
 class CandleAggregator {
 public:
@@ -39,7 +47,8 @@ public:
         std::vector<std::int32_t> targetMinutes;
         /// Maximum number of symbols aggregated in parallel
         std::uint32_t maxJobs{1};
-        /// Atomically rebuild target files from scratch instead of appending after their tail
+        /// Atomically rebuild target files from scratch instead of appending after their tail.
+        /// Rewrites and appends are cross-process serialized per target file.
         bool rewrite{false};
         /// Emit buckets even when one or more source bars are missing. Disabled
         /// by default because a partial bucket is indistinguishable from a
@@ -52,6 +61,12 @@ public:
         std::int32_t targetMinutes{};
         std::int64_t barsWritten{};
         std::int64_t incompleteBuckets{};
+        /// Structurally incomplete but numerically safe buckets emitted by
+        /// explicit --allow_partial_aggregation request.
+        std::int64_t partialBucketsWritten{};
+        /// Incomplete buckets not written (unsafe, wholly absent, or partial
+        /// output not explicitly enabled).
+        std::int64_t omittedIncompleteBuckets{};
         bool failed{false};
         std::string error;
     };
@@ -60,9 +75,9 @@ public:
      * Aggregate every `<pricesCsvDir>/<source>/*.csv` file into
      * `<pricesCsvDir>/<target>/` for each requested target timeframe.
      *
-     * Incomplete trailing buckets are never emitted: a bucket is written only
-     * once the source file reaches its final minute. A later incremental run
-     * therefore completes it instead of freezing a partial bar.
+     * A wall-clock-current trailing bucket is never emitted. A trailing bucket
+     * whose interval has already closed is treated like every other historical
+     * gap: omitted by default or emitted only by explicit partial mode.
      *
      * @param pricesCsvDir directory holding the per-timeframe subdirectories
      *                     (e.g. `<out>/futures/prices/csv`)

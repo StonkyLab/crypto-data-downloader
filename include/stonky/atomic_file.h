@@ -9,6 +9,8 @@ Copyright (c) 2026 Vitezslav Kot <vitezslav.kot@stonky.cz>, Stonky s.r.o.
 #ifndef INCLUDE_STONKY_ATOMIC_FILE_H
 #define INCLUDE_STONKY_ATOMIC_FILE_H
 
+#include "stonky/advisory_file_lock.h"
+
 #include <filesystem>
 #include <fstream>
 #include <string>
@@ -28,15 +30,12 @@ class AtomicFileWriter {
 public:
     explicit AtomicFileWriter(std::filesystem::path target,
                               const std::ios::openmode mode = std::ios::binary)
-        : target_(std::move(target)), temporary_(target_), lock_(target_) {
+        : target_(std::move(target)), temporary_(target_), lockPath_(target_) {
         temporary_ += ".writing";
-        lock_ += ".lock";
+        lockPath_ += ".lock";
 
-        std::error_code ec;
-        locked_ = std::filesystem::create_directory(lock_, ec);
-        if (!locked_) {
-            error_ = ec ? "cannot create output lock: " + ec.message()
-                        : "output lock already exists: " + lock_.string();
+        if (!lockHandle_.acquire(lockPath_)) {
+            error_ = lockHandle_.error();
             return;
         }
 
@@ -106,7 +105,7 @@ public:
         ownsTemporary_ = false;
         std::string lockError;
         if (!releaseLock(&lockError)) {
-            error = "output was committed, but lock cleanup failed: " + lockError;
+            error = "output was committed, but lock release failed: " + lockError;
             return false;
         }
         return true;
@@ -114,30 +113,15 @@ public:
 
 private:
     bool releaseLock(std::string *error = nullptr) noexcept {
-        if (!locked_) {
-            return true;
-        }
-
-        std::error_code ec;
-        const bool removed = std::filesystem::remove(lock_, ec);
-        if (removed || !ec) {
-            locked_ = false;
-            return true;
-        }
-        if (error) {
-            *error = "cannot remove " + lock_.string() + ": " + ec.message();
-        }
-        // Keep ownership set so a later destructor call can retry a transient
-        // cleanup failure instead of silently abandoning a stale lock.
-        return false;
+        return lockHandle_.release(error);
     }
 
     std::filesystem::path target_;
     std::filesystem::path temporary_;
-    std::filesystem::path lock_;
+    std::filesystem::path lockPath_;
+    AdvisoryFileLock lockHandle_;
     std::ofstream stream_;
     std::string error_;
-    bool locked_{};
     bool ownsTemporary_{};
     bool committed_{};
 };

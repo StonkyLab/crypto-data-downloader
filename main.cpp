@@ -116,7 +116,7 @@ int main(int argc, char **argv) {
             ("z,t6_conversion", R"(Convert existing CSV data to T6 format (Zorro Trader format) without downloading new data)")
             ("g,aggregate", R"(Aggregate the existing -b bar size into coarser timeframes (minutes, comma separated) without downloading, example: -o /data/okx -b 1 -g 5,60. OKX only publishes 1m bars in its bulk archive, so higher timeframes are built locally)",
              cxxopts::value<std::vector<std::string> >()->default_value(""))
-            ("allow_partial_aggregation", R"(Allow aggregation to emit a coarse candle even when source bars are missing; by default incomplete buckets are skipped and the command fails)")
+            ("allow_partial_aggregation", R"(Emit a partial coarse candle from available valid source bars; by default only the affected incomplete bucket is skipped)")
             ("x,xperp", R"(OKX only: download X-Perps (USD-settled perpetual-style futures, instType FUTURES / ruleType xperp) instead of USDT swaps. Data land in <output>/xperp/. Their funding rates come from the REST endpoint only, which serves ~3 months)")
             ("y,verify", R"(Verify CSV data integrity (torn lines, duplicates, ordering, gaps) without downloading, example: -e bybit -o /data/bybit -b 1 -y)")
             ("r,repair", R"(Verify and repair CSV data files in place (removes torn lines and duplicates, restores ordering), example: -e bybit -o /data/bybit -b 1 -r)")

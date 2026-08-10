@@ -7,6 +7,12 @@
 #include <iterator>
 #include <string>
 
+#ifndef _WIN32
+#include <csignal>
+#include <sys/wait.h>
+#include <unistd.h>
+#endif
+
 namespace {
 std::string read(const std::filesystem::path &path) {
     std::ifstream input(path, std::ios::binary);
@@ -42,8 +48,29 @@ int main() {
     temporary += ".writing";
     auto lock = target;
     lock += ".lock";
-    if (std::filesystem::exists(temporary) || std::filesystem::exists(lock)) {
-        std::cerr << "Abandoned transaction did not clean up its owned artifacts\n";
+    if (std::filesystem::exists(temporary) || !std::filesystem::is_regular_file(lock)) {
+        std::cerr << "Abandoned transaction did not clean its output or retain its advisory lock file\n";
+        return 1;
+    }
+
+    {
+        stonky::AtomicFileWriter failedWrite(target);
+        if (!failedWrite.isOpen()) {
+            std::cerr << failedWrite.error() << '\n';
+            return 1;
+        }
+        failedWrite.stream() << "disk-full-partial";
+        // Model an ENOSPC/writeback failure observed by flush/close without
+        // requiring a privileged tiny filesystem in the unit test.
+        failedWrite.stream().setstate(std::ios::badbit);
+        std::string error;
+        if (failedWrite.commit(error) || error.find("failed to flush") == std::string::npos) {
+            std::cerr << "Failed output stream was committed\n";
+            return 1;
+        }
+    }
+    if (read(target) != "old" || std::filesystem::exists(temporary)) {
+        std::cerr << "Write/flush failure damaged the previous output\n";
         return 1;
     }
 
@@ -79,37 +106,95 @@ int main() {
         std::cerr << "Committed transaction did not atomically replace the target\n";
         return 1;
     }
-    if (std::filesystem::exists(temporary) || std::filesystem::exists(lock)) {
-        std::cerr << "Committed transaction left temporary artifacts behind\n";
+    if (std::filesystem::exists(temporary) || !std::filesystem::is_regular_file(lock)) {
+        std::cerr << "Committed transaction left temporary output or lost its advisory lock file\n";
+        return 1;
+    }
+
+#ifndef _WIN32
+    // A hard process exit bypasses every C++ destructor.  The sibling output
+    // stays partial, but the kernel releases the advisory lock.  A subsequent
+    // writer must therefore be able to replace the stale sibling safely while
+    // the committed target remains intact until that replacement commits.
+    int readyPipe[2]{};
+    if (::pipe(readyPipe) != 0) {
+        std::cerr << "Could not create crash-test pipes\n";
+        return 1;
+    }
+    const auto child = ::fork();
+    if (child < 0) {
+        std::cerr << "Could not fork crash-test process\n";
+        return 1;
+    }
+    if (child == 0) {
+        ::close(readyPipe[0]);
+        stonky::AtomicFileWriter crashed(target);
+        if (!crashed.isOpen()) {
+            ::_exit(2);
+        }
+        crashed.stream() << "crash-partial";
+        crashed.stream().flush();
+        const char ready = 'R';
+        if (::write(readyPipe[1], &ready, 1) != 1) {
+            ::_exit(3);
+        }
+        for (;;) {
+            ::pause();
+        }
+    }
+
+    ::close(readyPipe[1]);
+    char ready{};
+    if (::read(readyPipe[0], &ready, 1) != 1 || ready != 'R') {
+        std::cerr << "Crash-test child did not acquire the output lock\n";
+        return 1;
+    }
+    bool liveProcessWasExcluded = true;
+    {
+        stonky::AtomicFileWriter blocked(target);
+        if (blocked.isOpen()) {
+            std::cerr << "Advisory lock did not exclude a live process\n";
+            liveProcessWasExcluded = false;
+        }
+    }
+    if (::kill(child, SIGKILL) != 0) {
+        std::cerr << "Could not SIGKILL crash-test child\n";
+        return 1;
+    }
+    ::close(readyPipe[0]);
+    int childStatus{};
+    if (::waitpid(child, &childStatus, 0) != child || !WIFSIGNALED(childStatus) ||
+        WTERMSIG(childStatus) != SIGKILL) {
+        std::cerr << "Crash-test child did not terminate through SIGKILL\n";
+        return 1;
+    }
+    if (!liveProcessWasExcluded) {
+        return 1;
+    }
+    if (read(target) != "new") {
+        std::cerr << "Uncommitted child modified the existing target\n";
         return 1;
     }
 
     {
-        stonky::AtomicFileWriter cleanupFailure(target);
-        if (!cleanupFailure.isOpen()) {
-            std::cerr << cleanupFailure.error() << '\n';
+        stonky::AtomicFileWriter recovered(target);
+        if (!recovered.isOpen()) {
+            std::cerr << "Kernel did not release advisory lock after process exit: "
+                      << recovered.error() << '\n';
             return 1;
         }
-        cleanupFailure.stream() << "committed despite lock cleanup failure";
-        const auto blocker = lock / "blocker";
-        {
-            std::ofstream blockRemoval(blocker, std::ios::binary);
-            blockRemoval << "x";
-        }
+        recovered.stream() << "recovered";
         std::string error;
-        if (cleanupFailure.commit(error) ||
-            error.find("output was committed, but lock cleanup failed") == std::string::npos ||
-            read(target) != "committed despite lock cleanup failure") {
-            std::cerr << "Post-commit lock cleanup failure was not reported accurately\n";
+        if (!recovered.commit(error)) {
+            std::cerr << "Could not commit after crashed writer: " << error << '\n';
             return 1;
         }
-        std::filesystem::remove(blocker);
-        // Destructor retries releaseLock after the transient blocker is gone.
     }
-    if (std::filesystem::exists(lock)) {
-        std::cerr << "Destructor did not retry a failed lock cleanup\n";
+    if (read(target) != "recovered" || std::filesystem::exists(temporary)) {
+        std::cerr << "Writer did not recover safely after a crashed process\n";
         return 1;
     }
+#endif
 
     std::error_code cleanupError;
     std::filesystem::remove_all(dir, cleanupError);

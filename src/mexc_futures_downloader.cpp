@@ -17,9 +17,12 @@ Copyright (c) 2026 Vitezslav Kot <vitezslav.kot@stonky.cz>, Stonky s.r.o.
 #include "stonky/utils/utils.h"
 #include "stonky/interface/exchange_enums.h"
 #include "stonky/future_utils.h"
+#include "mexc_funding_csv.h"
+#include "mexc_funding_pagination.h"
 #include "mexc_staging.h"
 #include <filesystem>
 #include <fstream>
+#include <optional>
 #include <spdlog/spdlog.h>
 #include <future>
 #include <set>
@@ -27,6 +30,7 @@ Copyright (c) 2026 Vitezslav Kot <vitezslav.kot@stonky.cz>, Stonky s.r.o.
 #include <spdlog/fmt/ranges.h>
 #include <ranges>
 #include <algorithm>
+#include <thread>
 #include "csv.h"
 
 using namespace stonky::mexc;
@@ -57,12 +61,6 @@ struct MEXCFuturesDownloader::P {
     // Recover only complete staging.  Interrupted partial staging is discarded.
     static bool recoverAndMergeTempFiles(const std::string &tempDir, const std::string &csvPath,
                                          const std::string &symbol);
-
-    static int64_t checkFundingRatesCSVFile(const std::string &path);
-
-    static bool writeFundingRatesToCSVFile(const std::vector<FundingRate> &fr, const std::string &path);
-
-    static bool writeHistoricalFundingRatesToCSVFile(const std::vector<HistoricalFundingRate> &fr, const std::string &path);
 
     static mexc::CandleInterval vkIntervalToMexcInterval(stonky::CandleInterval interval);
 
@@ -368,85 +366,6 @@ bool MEXCFuturesDownloader::P::recoverAndMergeTempFiles(const std::string &tempD
     return true;
 }
 
-int64_t MEXCFuturesDownloader::P::checkFundingRatesCSVFile(const std::string &path) {
-    constexpr int64_t oldestDate = 1577836800000; // Wednesday 1. January 2020 0:00:00
-    return CsvData::lastValidRecord(path, 2, oldestDate).timestamp;
-}
-
-bool MEXCFuturesDownloader::P::writeFundingRatesToCSVFile(const std::vector<FundingRate> &fr, const std::string &path) {
-    const std::filesystem::path pathToCSVFile{path};
-
-    std::ofstream ofs;
-    ofs.open(pathToCSVFile.string(), std::ios::app);
-
-    if (!ofs.is_open()) {
-        spdlog::error(fmt::format("Couldn't open file: {}", path));
-        return false;
-    }
-
-    uint64_t fileSize;
-
-    try {
-        fileSize = std::filesystem::file_size(pathToCSVFile.string());
-    } catch (const std::filesystem::filesystem_error &) {
-        fileSize = 0;
-    }
-
-    if (fileSize == 0) {
-        ofs << "funding_time,funding_rate" << std::endl;
-    }
-
-    for (const auto &record: fr) {
-        ofs << record.timestamp << ",";
-        ofs << csvNumber(record.fundingRate) << std::endl;
-    }
-
-    ofs.flush();
-    if (!ofs.good()) {
-        spdlog::error(fmt::format("Couldn't flush file: {}", path));
-        return false;
-    }
-    ofs.close();
-    return ofs.good();
-}
-
-bool MEXCFuturesDownloader::P::writeHistoricalFundingRatesToCSVFile(const std::vector<HistoricalFundingRate> &fr, const std::string &path) {
-    const std::filesystem::path pathToCSVFile{path};
-
-    std::ofstream ofs;
-    ofs.open(pathToCSVFile.string(), std::ios::app);
-
-    if (!ofs.is_open()) {
-        spdlog::error(fmt::format("Couldn't open file: {}", path));
-        return false;
-    }
-
-    uint64_t fileSize;
-
-    try {
-        fileSize = std::filesystem::file_size(pathToCSVFile.string());
-    } catch (const std::filesystem::filesystem_error &) {
-        fileSize = 0;
-    }
-
-    if (fileSize == 0) {
-        ofs << "funding_time,funding_rate" << std::endl;
-    }
-
-    for (const auto &record: fr) {
-        ofs << record.settleTime << ",";
-        ofs << csvNumber(record.fundingRate) << std::endl;
-    }
-
-    ofs.flush();
-    if (!ofs.good()) {
-        spdlog::error(fmt::format("Couldn't flush file: {}", path));
-        return false;
-    }
-    ofs.close();
-    return ofs.good();
-}
-
 MEXCFuturesDownloader::MEXCFuturesDownloader(std::uint32_t maxJobs, bool deleteDelistedData) : m_p(std::make_unique<P>(maxJobs, deleteDelistedData)) {}
 
 MEXCFuturesDownloader::~MEXCFuturesDownloader() = default;
@@ -610,11 +529,12 @@ void MEXCFuturesDownloader::updateMarketData(const std::string &dirPath, const s
                         P::recoverAndMergeTempFiles(tempDir.string(), symbolFilePathCsv.string(), symbol);
 
                         auto tail = P::checkSymbolCSVFile(symbolFilePathCsv.string());
+                        const std::string csvHeader =
+                            "open_time,open,high,low,close,volume,amount";
                         if (tail.foundValid && tail.timestamp > lastCompletedOpen) {
                             std::string repairError;
                             if (!mexc_staging::truncateAfter(symbolFilePathCsv, lastCompletedOpen,
-                                                             repairError,
-                                                             "open_time,open,high,low,close,volume,amount",
+                                                             repairError, csvHeader,
                                                              intervalMs, alignment)) {
                                 throw std::runtime_error(fmt::format(
                                     "Could not remove old open/future MEXC Futures tail: {}", repairError));
@@ -624,35 +544,174 @@ void MEXCFuturesDownloader::updateMarketData(const std::string &dirPath, const s
                                 lastCompletedOpen));
                             tail = P::checkSymbolCSVFile(symbolFilePathCsv.string());
                         }
-                        if (tail.foundValid && tail.timestamp == lastCompletedOpen) {
+
+                        mexc_staging::CsvTail currentCsv;
+                        std::string prefixError;
+                        if (!mexc_staging::inspectCsvTail(symbolFilePathCsv, csvHeader, currentCsv,
+                                                          prefixError, intervalMs, alignment)) {
+                            throw std::runtime_error(fmt::format(
+                                "Cannot inspect MEXC Futures CSV before prefix recovery: {}", prefixError));
+                        }
+                        if (tail.foundValid != currentCsv.hasData ||
+                            (tail.foundValid && tail.timestamp != currentCsv.timestamp)) {
+                            throw std::runtime_error(
+                                "MEXC Futures tail readers disagree before prefix recovery");
+                        }
+
+                        std::optional<mexc_staging::PrefixMarker> prefixMarker;
+                        if (!mexc_staging::readPrefixMarker(symbolFilePathCsv, prefixMarker,
+                                                            prefixError)) {
+                            throw std::runtime_error(fmt::format(
+                                "Cannot read MEXC Futures unresolved-prefix marker: {}", prefixError));
+                        }
+                        if (prefixMarker &&
+                            (prefixMarker->intervalMs != intervalMs ||
+                             prefixMarker->alignment != alignment ||
+                             prefixMarker->requestedStart % 1000 != 0)) {
+                            throw std::runtime_error(
+                                "MEXC Futures unresolved-prefix marker belongs to a different interval");
+                        }
+
+                        bool rebuildPrefix = false;
+                        if (prefixMarker && currentCsv.hasData) {
+                            if (currentCsv.firstTimestamp <= prefixMarker->requestedStart) {
+                                if (!mexc_staging::removePrefixMarker(symbolFilePathCsv,
+                                                                      prefixError)) {
+                                    throw std::runtime_error(prefixError);
+                                }
+                                prefixMarker.reset();
+                            } else {
+                                const auto probeEndSeconds = currentCsv.firstTimestamp / 1000 - 1;
+                                const auto probe = m_p->mexcFuturesClient->probeHistoricalPrices(
+                                    symbol, mexcCandleInterval,
+                                    prefixMarker->requestedStart / 1000, probeEndSeconds);
+                                rebuildPrefix = !probe.empty();
+                                if (rebuildPrefix) {
+                                    spdlog::info(fmt::format(
+                                        "Symbol {}: older MEXC Futures history became available; rebuilding prefix",
+                                        symbol));
+                                }
+                            }
+                        }
+
+                        if (!rebuildPrefix && tail.foundValid &&
+                            tail.timestamp == lastCompletedOpen) {
                             spdlog::info(fmt::format("No new candles for symbol: {}", symbol));
                             return symbolFilePathCsv;
                         }
 
-                        const auto actualFromMs = tail.foundValid
-                            ? mexc_staging::nextTimestamp(tail.timestamp, intervalMs, alignment)
-                            : tail.timestamp;
+                        const auto actualFromMs = rebuildPrefix
+                            ? prefixMarker->requestedStart
+                            : (!currentCsv.hasData && prefixMarker
+                                ? prefixMarker->requestedStart
+                                : (tail.foundValid
+                                    ? mexc_staging::nextTimestamp(tail.timestamp, intervalMs, alignment)
+                                    : tail.timestamp));
                         if (actualFromMs > lastCompletedOpen || actualFromMs % 1000 != 0) {
                             throw std::runtime_error("Invalid MEXC Futures download range");
                         }
 
-                        // Futures end is inclusive.  Include the current open
-                        // bar so the client can discard it and retain the last
-                        // completed bar at lastCompletedOpen.
+                        // Bound a known delisted contract at positively found
+                        // data instead of traversing an arbitrarily long empty
+                        // post-delisting suffix.  Empty probes never advance
+                        // state: keep an existing CSV for a future retry, and
+                        // refuse to create a fresh false-success file.
+                        auto authoritativeLastOpen = lastCompletedOpen;
+                        if (!expectedLive) {
+                            std::optional<std::int64_t> newestProbeTimestamp;
+                            if (!rebuildPrefix) {
+                                const auto probe = m_p->mexcFuturesClient->probeHistoricalPrices(
+                                    symbol, mexcCandleInterval, actualFromMs / 1000,
+                                    currentOpen / 1000);
+                                if (!probe.empty()) {
+                                    newestProbeTimestamp = probe.back().openTime;
+                                }
+                            }
+                            const auto decision = mexc_staging::decideDelistedProbe(
+                                rebuildPrefix,
+                                currentCsv.hasData
+                                    ? std::optional<std::int64_t>{currentCsv.timestamp}
+                                    : std::nullopt,
+                                newestProbeTimestamp);
+                            if (decision.action ==
+                                mexc_staging::DelistedProbeAction::NoOpExisting) {
+                                spdlog::info(fmt::format(
+                                    "No newer candles in bounded probe for delisted MEXC Futures symbol: {}",
+                                    symbol));
+                                return symbolFilePathCsv;
+                            }
+                            if (decision.action ==
+                                mexc_staging::DelistedProbeAction::RefuseFresh) {
+                                throw std::runtime_error(
+                                    "MEXC Futures bounded delisted-symbol probe returned no candles for a fresh file");
+                            }
+                            authoritativeLastOpen = decision.authoritativeLastOpen;
+                        }
+
+                        // Futures bounds are inclusive.  Query through one
+                        // period after the authoritative candle and filter the
+                        // extra/open row below.
                         const auto apiStartTime = actualFromMs / 1000;
-                        const auto apiEndTime = currentOpen / 1000;
-                        auto candles = m_p->mexcFuturesClient->getHistoricalPrices(
+                        const auto apiEndTime = mexc_staging::nextTimestamp(
+                            authoritativeLastOpen, intervalMs, alignment) / 1000;
+                        auto history = m_p->mexcFuturesClient->getHistoricalPricesWithOutcome(
                             symbol, mexcCandleInterval, apiStartTime, apiEndTime);
-                        std::erase_if(candles, [actualFromMs, lastCompletedOpen](const Candle &candle) {
-                            return candle.openTime < actualFromMs || candle.openTime > lastCompletedOpen;
+                        auto &candles = history.candles;
+                        std::erase_if(candles, [actualFromMs, authoritativeLastOpen](const Candle &candle) {
+                            return candle.openTime < actualFromMs ||
+                                   candle.openTime > authoritativeLastOpen;
                         });
                         if (candles.empty()) {
-                            if (!expectedLive && tail.foundValid) {
-                                spdlog::info(fmt::format(
-                                    "No newer candles for delisted MEXC Futures symbol: {}", symbol));
+                            if (!rebuildPrefix && tail.foundValid) {
+                                spdlog::warn(fmt::format(
+                                    "MEXC Futures returned no candles after existing tail for {}; preserving CSV and retrying next run",
+                                    symbol));
                                 return symbolFilePathCsv;
                             }
                             throw std::runtime_error("MEXC Futures returned no candles for a non-empty range");
+                        }
+                        if (candles.back().openTime > authoritativeLastOpen ||
+                            candles.back().openTime > lastCompletedOpen) {
+                            throw std::runtime_error(
+                                "MEXC Futures returned a candle beyond the authoritative closed range");
+                        }
+                        if (rebuildPrefix &&
+                            (candles.front().openTime >= currentCsv.firstTimestamp ||
+                             candles.back().openTime < currentCsv.timestamp)) {
+                            throw std::runtime_error(
+                                "MEXC Futures prefix rebuild did not extend history without truncating its suffix");
+                        }
+                        std::size_t gapBoundaries = 0;
+                        std::uint64_t missingGapSlots = 0;
+                        std::optional<std::int64_t> previousTimestamp;
+                        if (!rebuildPrefix && tail.foundValid) {
+                            previousTimestamp = tail.timestamp;
+                        }
+                        for (const auto &candle : candles) {
+                            if (previousTimestamp &&
+                                !mexc_staging::isNextTimestamp(*previousTimestamp, candle.openTime,
+                                                               intervalMs, alignment)) {
+                                ++gapBoundaries;
+                                missingGapSlots += mexc_staging::missingCandleSlotsAfter(
+                                    *previousTimestamp, candle.openTime,
+                                    intervalMs, alignment) - 1;
+                            }
+                            previousTimestamp = candle.openTime;
+                        }
+                        if (gapBoundaries > 0) {
+                            spdlog::warn(fmt::format(
+                                "Symbol {}: preserving {} missing MEXC Futures candle slot(s) across {} gap boundary/boundaries",
+                                symbol, missingGapSlots, gapBoundaries));
+                        }
+                        const auto trailingMissing = mexc_staging::missingCandleSlotsAfter(
+                            candles.back().openTime, authoritativeLastOpen, intervalMs, alignment);
+                        if (trailingMissing > 0) {
+                            spdlog::warn(fmt::format(
+                                "Symbol {}: preserving {} missing trailing MEXC Futures candle slot(s) [{}..{}]",
+                                symbol, trailingMissing,
+                                mexc_staging::nextTimestamp(candles.back().openTime,
+                                                            intervalMs, alignment),
+                                authoritativeLastOpen));
                         }
 
                         mexc_staging::discard(tempDir);
@@ -679,21 +738,59 @@ void MEXCFuturesDownloader::updateMarketData(const std::string &dirPath, const s
                         manifest.batchCount = tempFileCounter;
                         manifest.intervalMs = intervalMs;
                         manifest.alignment = alignment;
-                        manifest.baseTimestamp = tail.timestamp;
-                        manifest.baseHasData = tail.foundValid;
+                        manifest.baseTimestamp = rebuildPrefix ? 0 : tail.timestamp;
+                        manifest.baseHasData = rebuildPrefix ? false : tail.foundValid;
                         manifest.requestedStart = actualFromMs;
-                        manifest.expectedEnd = expectedLive ? lastCompletedOpen : candles.back().openTime;
+                        manifest.expectedEnd = candles.back().openTime;
                         manifest.firstTimestamp = candles.front().openTime;
                         manifest.lastTimestamp = candles.back().openTime;
 
                         std::string manifestError;
+                        // The marker precedes the recoverable manifest.  This
+                        // ordering keeps startup recovery from committing an
+                        // unmarked provisional suffix after a process crash.
+                        if (!mexc_staging::validate(tempDir, manifest, manifestError)) {
+                            throw std::runtime_error(fmt::format("Invalid MEXC Futures staging: {}",
+                                                                 manifestError));
+                        }
+                        if (!prefixMarker && !manifest.baseHasData &&
+                            history.completion ==
+                                mexc::detail::PaginationCompletion::ProvisionalAvailabilityBoundary) {
+                            prefixMarker = mexc_staging::PrefixMarker{
+                                1, actualFromMs, intervalMs, alignment};
+                            if (!mexc_staging::writePrefixMarker(symbolFilePathCsv, *prefixMarker,
+                                                                 manifestError)) {
+                                throw std::runtime_error(fmt::format(
+                                    "Failed to persist MEXC Futures unresolved prefix before publish: {}",
+                                    manifestError));
+                            }
+                        }
                         if (!mexc_staging::writeManifest(tempDir, manifest, manifestError)) {
                             throw std::runtime_error(fmt::format("Invalid MEXC Futures staging: {}",
                                                                  manifestError));
                         }
-                        if (!P::mergeTempFilesToCSV(tempDir.string(), symbolFilePathCsv.string(), symbol)) {
-                            throw std::runtime_error(fmt::format("Failed to commit MEXC Futures data for {}",
-                                                                 symbol));
+
+                        if (rebuildPrefix) {
+                            if (!mexc_staging::replaceCsv(tempDir, manifest, symbolFilePathCsv,
+                                                          csvHeader, currentCsv, manifestError)) {
+                                throw std::runtime_error(fmt::format(
+                                    "Failed to replace MEXC Futures data after prefix rebuild for {}: {}",
+                                    symbol, manifestError));
+                            }
+                            mexc_staging::discard(tempDir);
+                        } else if (!P::mergeTempFilesToCSV(tempDir.string(),
+                                                           symbolFilePathCsv.string(), symbol)) {
+                            throw std::runtime_error(fmt::format(
+                                "Failed to commit MEXC Futures data for {}", symbol));
+                        }
+
+                        if (prefixMarker && actualFromMs == prefixMarker->requestedStart &&
+                            history.completion ==
+                                mexc::detail::PaginationCompletion::RequestedRangeScanned) {
+                            if (!mexc_staging::removePrefixMarker(symbolFilePathCsv,
+                                                                  manifestError)) {
+                                throw std::runtime_error(manifestError);
+                            }
                         }
                         spdlog::info(fmt::format("CSV file for symbol: {} updated ({} candles in {} staged batches)",
                                                  symbol, candles.size(), tempFileCounter));
@@ -753,10 +850,18 @@ void MEXCFuturesDownloader::updateMarketData(const std::string &dirPath, const s
             symbolFilePathCsv = symbolFilePathCsv.lexically_normal();
             symbolFilePathCsv.append(symbol + ".csv");
 
+            std::filesystem::path tempDir = symbolFilePathCsv.parent_path();
+            tempDir.append("temp_" + symbol);
+            mexc_staging::DirectoryLock symbolLock(tempDir.string() + ".lock");
             if (std::filesystem::exists(symbolFilePathCsv)) {
                 std::filesystem::remove(symbolFilePathCsv);
                 spdlog::info(fmt::format("Removing csv file for delisted symbol: {}, file: {}...", symbol, symbolFilePathCsv.string()));
             }
+            std::string markerError;
+            if (!mexc_staging::removePrefixMarker(symbolFilePathCsv, markerError)) {
+                throw std::runtime_error(markerError);
+            }
+            mexc_staging::discard(tempDir);
         }
     }
 }
@@ -875,50 +980,150 @@ void MEXCFuturesDownloader::updateFundingRateData(const std::string &dirPath, co
 
                     std::filesystem::path symbolFilePathCsv = frDir;
                     symbolFilePathCsv.append(symbol + "_fr.csv");
-                    const int64_t lastTimestamp = P::checkFundingRatesCSVFile(symbolFilePathCsv.string());
+
+                    // The lock covers the complete read-tail/fetch/commit transaction.  Without
+                    // it two cron processes can observe the same tail and both append the same
+                    // pages.  Publication below is also an atomic whole-file replacement, so a
+                    // failed flush, close or disk-full write cannot damage the old CSV.
+                    mexc_staging::DirectoryLock fundingLock(
+                        mexc_funding_csv::updateLockPath(symbolFilePathCsv));
+                    mexc_funding_csv::Tail base;
+                    std::vector<mexc_funding_csv::Record> existingRecords;
+                    std::string fundingCsvError;
+                    if (!mexc_funding_csv::readRecords(
+                            symbolFilePathCsv, base, existingRecords, fundingCsvError)) {
+                        throw std::runtime_error(fmt::format(
+                            "invalid existing funding-rate CSV: {}", fundingCsvError));
+                    }
+
+                    bool provisionalPrefix = false;
+                    if (!mexc_funding_csv::inspectProvisionalMarker(
+                            symbolFilePathCsv, provisionalPrefix, fundingCsvError)) {
+                        throw std::runtime_error(fmt::format(
+                            "invalid funding prefix state: {}", fundingCsvError));
+                    }
+                    if (!provisionalPrefix) {
+                        // Migrate every fresh or legacy/unmarked CSV before fetching or writing.
+                        // MEXC does not expose an authoritative oldest-history boundary, so even
+                        // an exact local-tail overlap cannot prove that a self-consistent snapshot
+                        // did not omit a middle page.  The durable marker therefore makes all
+                        // future runs full-scan unions; a crash can leave marker-without-new-data
+                        // (safe to retry), never an unmarked suffix that permanently hides a gap.
+                        if (!mexc_funding_csv::ensureProvisionalMarker(
+                                symbolFilePathCsv, fundingCsvError)) {
+                            throw std::runtime_error(fmt::format(
+                                "failed to persist provisional funding prefix: {}", fundingCsvError));
+                        }
+                    }
+
+                    constexpr std::int64_t oldestDate = 1577836800000; // 2020-01-01 UTC
+                    const std::int64_t cutoffTimestamp = oldestDate;
 
                     std::vector<HistoricalFundingRate> newRates;
                     int32_t currentPage = 1;
                     bool hasMoreData = true;
+                    std::optional<std::int64_t> previousRemoteTimestamp;
+                    std::optional<mexc_funding_pagination::SnapshotMetadata> pageSnapshot;
 
                     while (hasMoreData) {
                         constexpr int32_t pageSize = 1000;
-                        auto response = m_p->mexcFuturesClient->getContractFundingRateHistory(
-                            symbol, currentPage, pageSize);
+                        auto response = currentPage == 1
+                            ? mexc_funding_pagination::fetchFirstPage(
+                                  [this, &symbol] {
+                                      constexpr int32_t firstPage = 1;
+                                      constexpr int32_t firstPageSize = 1000;
+                                      return m_p->mexcFuturesClient->getContractFundingRateHistory(
+                                          symbol, firstPage, firstPageSize);
+                                  },
+                                  [&symbol](const std::chrono::milliseconds delay,
+                                            const std::int32_t nextAttempt) {
+                                      spdlog::warn(fmt::format(
+                                          "Symbol {}: MEXC funding page 1 was empty; retrying "
+                                          "attempt {} after {} ms",
+                                          symbol, nextAttempt, delay.count()));
+                                      std::this_thread::sleep_for(delay);
+                                  })
+                            : m_p->mexcFuturesClient->getContractFundingRateHistory(
+                                  symbol, currentPage, pageSize);
                         if (response.resultList.empty()) {
-                            break;
+                            // Page 1 cannot reach this branch without an explicitly
+                            // authoritative no-op decision, which this downloader does not make.
+                            throw std::runtime_error(fmt::format(
+                                "MEXC returned an empty funding page {} before the declared end",
+                                currentPage));
+                        }
+                        std::string paginationError;
+                        if (!mexc_funding_pagination::validatePageMetadata(
+                                currentPage, pageSize, response.resultList.size(),
+                                response.currentPage, response.pageSize, response.totalCount,
+                                response.totalPage, pageSnapshot, paginationError)) {
+                            throw std::runtime_error(fmt::format(
+                                "MEXC returned invalid funding page {}: {}", currentPage,
+                                paginationError));
                         }
 
-                        bool foundOldData = false;
                         for (const auto &rate: response.resultList) {
-                            if (rate.settleTime <= lastTimestamp) {
-                                foundOldData = true;
-                                break;
+                            if (rate.settleTime < 0 ||
+                                (previousRemoteTimestamp &&
+                                 rate.settleTime >= *previousRemoteTimestamp)) {
+                                throw std::runtime_error(fmt::format(
+                                    "MEXC funding pages are not strictly newest-first at timestamp {}",
+                                    rate.settleTime));
                             }
-                            newRates.push_back(rate);
+                            previousRemoteTimestamp = rate.settleTime;
+
+                            if (rate.settleTime > cutoffTimestamp) {
+                                newRates.push_back(rate);
+                            }
                         }
 
-                        if (foundOldData || currentPage >= response.totalPage) {
-                            hasMoreData = false;
-                        } else {
-                            ++currentPage;
+                        const auto downloadedPage = currentPage;
+                        switch (mexc_funding_pagination::decideScanProgress(
+                            false, false, currentPage, response.totalPage)) {
+                            case mexc_funding_pagination::ScanDecision::Continue:
+                                ++currentPage;
+                                break;
+                            case mexc_funding_pagination::ScanDecision::Complete:
+                                hasMoreData = false;
+                                break;
+                            case mexc_funding_pagination::ScanDecision::RejectMissingBaseOverlap:
+                                throw std::runtime_error(fmt::format(
+                                    "MEXC funding scan reached page {} of {} without finding "
+                                    "the existing CSV tail {}",
+                                    currentPage, response.totalPage, base.timestamp));
                         }
                         spdlog::info(fmt::format(
                             "Symbol {}: downloaded page {}/{}, {} new rates so far", symbol,
-                            currentPage - 1, response.totalPage, newRates.size()));
+                            downloadedPage, response.totalPage, newRates.size()));
                     }
 
-                    if (!newRates.empty()) {
-                        std::ranges::reverse(newRates);
-                        if (!P::writeHistoricalFundingRatesToCSVFile(newRates,
-                                                                     symbolFilePathCsv.string())) {
-                            throw std::runtime_error("failed to write funding-rate CSV");
-                        }
-                        spdlog::info(fmt::format("Symbol {}: saved {} funding rates to CSV",
-                                                 symbol, newRates.size()));
-                    } else {
-                        spdlog::info(fmt::format("Symbol {}: no new funding rates", symbol));
+                    std::ranges::sort(newRates, {}, &HistoricalFundingRate::settleTime);
+                    std::vector<mexc_funding_csv::Record> records;
+                    records.reserve(newRates.size());
+                    for (const auto &rate : newRates) {
+                        records.push_back({rate.settleTime, csvNumber(rate.fundingRate)});
                     }
+
+                    if (records.empty()) {
+                        throw std::runtime_error(
+                            "MEXC returned no funding records newer than the supported history floor");
+                    }
+                    std::vector<mexc_funding_csv::Record> mergedRecords;
+                    if (!mexc_funding_csv::mergeRecords(
+                            existingRecords, records, mergedRecords, fundingCsvError)) {
+                        throw std::runtime_error(fmt::format(
+                            "failed to merge provisional funding history: {}", fundingCsvError));
+                    }
+                    if (mergedRecords != existingRecords &&
+                        !mexc_funding_csv::replaceAtomically(
+                            symbolFilePathCsv, base, mergedRecords, fundingCsvError)) {
+                        throw std::runtime_error(fmt::format(
+                            "failed to commit provisional funding history: {}", fundingCsvError));
+                    }
+                    spdlog::info(fmt::format(
+                        "Symbol {}: provisional full scan retained {} funding rates; "
+                        "prefix marker remains until an authoritative boundary is available",
+                        symbol, mergedRecords.size()));
 
                     return symbol;
                 } catch (const std::exception &e) {
@@ -942,9 +1147,26 @@ void MEXCFuturesDownloader::updateFundingRateData(const std::string &dirPath, co
             symbolFilePathCsv = symbolFilePathCsv.lexically_normal();
             symbolFilePathCsv.append(symbol + "_fr.csv");
 
-            if (std::filesystem::exists(symbolFilePathCsv)) {
-                std::filesystem::remove(symbolFilePathCsv);
+            mexc_staging::DirectoryLock fundingLock(
+                mexc_funding_csv::updateLockPath(symbolFilePathCsv));
+            std::error_code removeError;
+            const bool removedCsv = std::filesystem::remove(symbolFilePathCsv, removeError);
+            if (removeError) {
+                throw std::runtime_error(fmt::format(
+                    "Could not remove delisted funding CSV {}: {}",
+                    symbolFilePathCsv.string(), removeError.message()));
+            }
+            if (removedCsv) {
                 spdlog::info(fmt::format("Removing csv file for delisted symbol: {}, file: {}...", symbol, symbolFilePathCsv.string()));
+            }
+            const auto provisionalMarker =
+                mexc_funding_csv::provisionalMarkerPath(symbolFilePathCsv);
+            removeError.clear();
+            std::filesystem::remove(provisionalMarker, removeError);
+            if (removeError) {
+                throw std::runtime_error(fmt::format(
+                    "Could not remove delisted funding prefix marker {}: {}",
+                    provisionalMarker.string(), removeError.message()));
             }
         }
     }

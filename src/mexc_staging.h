@@ -6,16 +6,21 @@ SPDX-License-Identifier: MIT
 Copyright (c) 2026 Vitezslav Kot <vitezslav.kot@stonky.cz>, Stonky s.r.o.
 
 A staging directory is intentionally disposable until complete.manifest has
-been flushed. A process interrupted while downloading or writing batches
-therefore cannot append a newest-first fragment across an unvisited gap.
+been flushed. MEXC/venue outages may legitimately leave missing candle slots,
+so aligned strictly-increasing rows may contain gaps. Pagination completion and
+the persistent fresh-prefix marker distinguish those visited-range outages
+from an unsafe newest-only fragment.
 */
 #ifndef STONKY_MEXC_STAGING_H
 #define STONKY_MEXC_STAGING_H
+
+#include "stonky/advisory_file_lock.h"
 
 #include <algorithm>
 #include <array>
 #include <charconv>
 #include <chrono>
+#include <cmath>
 #include <cstdint>
 #include <filesystem>
 #include <fstream>
@@ -44,6 +49,17 @@ enum class Alignment : std::int32_t {
     CalendarMonth = 2,
 };
 
+enum class DelistedProbeAction {
+    Download,
+    NoOpExisting,
+    RefuseFresh
+};
+
+struct DelistedProbeDecision {
+    DelistedProbeAction action{DelistedProbeAction::RefuseFresh};
+    std::int64_t authoritativeLastOpen{};
+};
+
 struct Manifest {
     std::int32_t version{1};
     std::int32_t batchCount{};
@@ -58,24 +74,33 @@ struct Manifest {
 };
 
 /**
- * A deliberately fail-closed inter-process lock. Directory creation is atomic
- * on the supported filesystems. A crashed process leaves a stale lock behind;
- * the next run reports its exact path instead of guessing that it is safe to
- * break the lock and risking concurrent writes.
+ * Persistent proof that a freshly published CSV still has an unresolved older
+ * prefix.  The marker deliberately survives successful appends and negative
+ * API probes.  It is removed only after a later rebuild positively reaches
+ * requestedStart.
+ */
+struct PrefixMarker {
+    std::int32_t version{1};
+    std::int64_t requestedStart{};
+    std::int64_t intervalMs{};
+    Alignment alignment{Alignment::Fixed};
+
+    friend bool operator==(const PrefixMarker &, const PrefixMarker &) = default;
+};
+
+/**
+ * A fail-closed inter-process lock whose ownership is released by the kernel
+ * when a process exits, including SIGKILL.  The regular lock file intentionally
+ * persists and must not be deleted: only its OS advisory lock denotes an
+ * active owner.  A directory left by the pre-advisory implementation is
+ * intentionally rejected rather than guessed stale; it requires one-time
+ * manual removal after verifying that no old downloader process is running.
  */
 class DirectoryLock {
 public:
-    explicit DirectoryLock(std::filesystem::path path) : path_(std::move(path)) {
-        std::error_code ec;
-        const bool created = std::filesystem::create_directory(path_, ec);
-        if (!created) {
-            if (ec) {
-                throw std::runtime_error(fmt::format("cannot acquire lock {}: {}", path_.string(),
-                                                     ec.message()));
-            }
-            throw std::runtime_error(fmt::format(
-                "lock {} already exists (another process is active, or remove this stale lock after verification)",
-                path_.string()));
+    explicit DirectoryLock(std::filesystem::path path) : lock_(std::move(path)) {
+        if (!lock_.ownsLock()) {
+            throw std::runtime_error(lock_.error());
         }
     }
 
@@ -84,13 +109,10 @@ public:
     DirectoryLock(DirectoryLock &&) = delete;
     DirectoryLock &operator=(DirectoryLock &&) = delete;
 
-    ~DirectoryLock() {
-        std::error_code ec;
-        std::filesystem::remove(path_, ec);
-    }
+    ~DirectoryLock() = default;
 
 private:
-    std::filesystem::path path_;
+    AdvisoryFileLock lock_;
 };
 
 class RemoveUnlessReleased {
@@ -119,6 +141,12 @@ inline std::filesystem::path manifestPath(const std::filesystem::path &dir) {
     return dir / "complete.manifest";
 }
 
+inline std::filesystem::path prefixMarkerPath(const std::filesystem::path &csvPath) {
+    auto path = csvPath;
+    path += ".prefix.pending";
+    return path;
+}
+
 inline bool replaceAtomically(const std::filesystem::path &source,
                               const std::filesystem::path &destination, std::string &error) {
 #ifdef _WIN32
@@ -139,6 +167,128 @@ inline bool replaceAtomically(const std::filesystem::path &source,
     }
     return true;
 #endif
+}
+
+inline bool validPrefixMarker(const PrefixMarker &marker) {
+    const auto alignment = static_cast<std::int32_t>(marker.alignment);
+    return marker.version == 1 && marker.requestedStart >= 0 && marker.intervalMs > 0 &&
+           alignment >= static_cast<std::int32_t>(Alignment::Fixed) &&
+           alignment <= static_cast<std::int32_t>(Alignment::CalendarMonth);
+}
+
+inline bool writePrefixMarker(const std::filesystem::path &csvPath,
+                              const PrefixMarker &marker, std::string &error) {
+    error.clear();
+    if (!validPrefixMarker(marker)) {
+        error = "invalid MEXC unresolved-prefix marker";
+        return false;
+    }
+
+    const auto destination = prefixMarkerPath(csvPath);
+    auto partial = destination;
+    partial += ".writing";
+    RemoveUnlessReleased partialGuard(partial);
+    std::ofstream output(partial, std::ios::trunc | std::ios::binary);
+    if (!output.is_open()) {
+        error = fmt::format("cannot create unresolved-prefix marker {}", partial.string());
+        return false;
+    }
+    output << marker.version << ' ' << marker.requestedStart << ' ' << marker.intervalMs << ' '
+           << static_cast<std::int32_t>(marker.alignment) << '\n';
+    output.flush();
+    if (!output.good()) {
+        error = fmt::format("failed to flush unresolved-prefix marker {}", partial.string());
+        return false;
+    }
+    output.close();
+    if (!output.good()) {
+        error = fmt::format("failed to close unresolved-prefix marker {}", partial.string());
+        return false;
+    }
+    if (!replaceAtomically(partial, destination, error)) {
+        error = "failed to publish unresolved-prefix marker: " + error;
+        return false;
+    }
+    partialGuard.release();
+    return true;
+}
+
+inline bool readPrefixMarker(const std::filesystem::path &csvPath,
+                             std::optional<PrefixMarker> &marker, std::string &error) {
+    marker.reset();
+    error.clear();
+    const auto path = prefixMarkerPath(csvPath);
+    std::error_code ec;
+    const auto status = std::filesystem::symlink_status(path, ec);
+    if (ec) {
+        if (ec == std::errc::no_such_file_or_directory) {
+            return true;
+        }
+        error = fmt::format("cannot stat unresolved-prefix marker {}: {}", path.string(),
+                            ec.message());
+        return false;
+    }
+    if (!std::filesystem::exists(status)) {
+        return true;
+    }
+    if (!std::filesystem::is_regular_file(status)) {
+        error = fmt::format("unresolved-prefix marker is not a regular file: {}", path.string());
+        return false;
+    }
+
+    std::ifstream input(path, std::ios::binary);
+    PrefixMarker parsed;
+    std::int32_t alignment{};
+    if (!(input >> parsed.version >> parsed.requestedStart >> parsed.intervalMs >> alignment)) {
+        error = fmt::format("cannot parse unresolved-prefix marker {}", path.string());
+        return false;
+    }
+    input >> std::ws;
+    if (!input.eof() || alignment < static_cast<std::int32_t>(Alignment::Fixed) ||
+        alignment > static_cast<std::int32_t>(Alignment::CalendarMonth)) {
+        error = fmt::format("invalid unresolved-prefix marker {}", path.string());
+        return false;
+    }
+    parsed.alignment = static_cast<Alignment>(alignment);
+    if (!validPrefixMarker(parsed)) {
+        error = fmt::format("invalid unresolved-prefix marker values in {}", path.string());
+        return false;
+    }
+    marker = parsed;
+    return true;
+}
+
+inline bool removePrefixMarker(const std::filesystem::path &csvPath, std::string &error) {
+    error.clear();
+    std::error_code ec;
+    std::filesystem::remove(prefixMarkerPath(csvPath), ec);
+    if (ec) {
+        error = fmt::format("cannot remove resolved-prefix marker {}: {}",
+                            prefixMarkerPath(csvPath).string(), ec.message());
+        return false;
+    }
+    return true;
+}
+
+inline bool requirePrefixMarkerForPublication(const std::filesystem::path &csvPath,
+                                              const Manifest &manifest,
+                                              std::string &error) {
+    // An existing base makes an outage at the append boundary local and
+    // recoverable by downstream gap-aware aggregation.  Only a fresh/full
+    // replacement can permanently lose an unknown older prefix.
+    if (manifest.baseHasData || manifest.firstTimestamp <= manifest.requestedStart) {
+        return true;
+    }
+    std::optional<PrefixMarker> marker;
+    if (!readPrefixMarker(csvPath, marker, error)) {
+        return false;
+    }
+    if (!marker || marker->requestedStart != manifest.requestedStart ||
+        marker->intervalMs != manifest.intervalMs || marker->alignment != manifest.alignment) {
+        error = "refusing to publish an unresolved MEXC prefix without its matching persistent marker";
+        return false;
+    }
+    return true;
 }
 
 inline std::int64_t nextTimestamp(const std::int64_t timestampMs, const std::int64_t intervalMs,
@@ -197,6 +347,67 @@ inline bool isNextTimestamp(const std::int64_t previous, const std::int64_t time
     }
 }
 
+/**
+ * Convert a bounded delisted-symbol availability probe into a download
+ * decision.  A negative probe never advances persistent state: an existing
+ * CSV is a safe no-op and is retried on the next run, while a fresh symbol
+ * produces no output.  A prefix rebuild already has a positively known CSV
+ * suffix, so its existing tail is the authoritative end and avoids traversing
+ * an arbitrarily long post-delisting empty range.
+ */
+inline DelistedProbeDecision decideDelistedProbe(
+        const bool rebuildPrefix, const std::optional<std::int64_t> existingTail,
+        const std::optional<std::int64_t> newestProbeTimestamp) {
+    if (rebuildPrefix) {
+        if (!existingTail) {
+            throw std::invalid_argument("MEXC prefix rebuild requires an existing CSV tail");
+        }
+        return {DelistedProbeAction::Download, *existingTail};
+    }
+    if (newestProbeTimestamp) {
+        if (existingTail && *newestProbeTimestamp <= *existingTail) {
+            throw std::invalid_argument("MEXC delisted probe did not advance the existing tail");
+        }
+        return {DelistedProbeAction::Download, *newestProbeTimestamp};
+    }
+    if (existingTail) {
+        return {DelistedProbeAction::NoOpExisting, *existingTail};
+    }
+    return {DelistedProbeAction::RefuseFresh, 0};
+}
+
+/** Number of aligned candle slots after lastPresent through expectedLast. */
+inline std::uint64_t missingCandleSlotsAfter(const std::int64_t lastPresent,
+                                             const std::int64_t expectedLast,
+                                             const std::int64_t intervalMs,
+                                             const Alignment alignment) {
+    if (expectedLast <= lastPresent) {
+        return 0;
+    }
+    if (!isAlignedTimestamp(lastPresent, intervalMs, alignment) ||
+        !isAlignedTimestamp(expectedLast, intervalMs, alignment)) {
+        throw std::invalid_argument("cannot count misaligned MEXC candle slots");
+    }
+    if (alignment != Alignment::CalendarMonth) {
+        const auto difference = expectedLast - lastPresent;
+        if (difference % intervalMs != 0) {
+            throw std::invalid_argument("MEXC candle bounds are on different interval grids");
+        }
+        return static_cast<std::uint64_t>(difference / intervalMs);
+    }
+
+    std::uint64_t missing = 0;
+    auto cursor = lastPresent;
+    while (cursor < expectedLast) {
+        cursor = nextTimestamp(cursor, intervalMs, alignment);
+        ++missing;
+    }
+    if (cursor != expectedLast) {
+        throw std::invalid_argument("MEXC calendar-month bounds are not contiguous period opens");
+    }
+    return missing;
+}
+
 inline std::int64_t previousPeriodOpen(const std::int64_t periodOpenMs, const std::int64_t intervalMs,
                                        const Alignment alignment) {
     if (alignment != Alignment::CalendarMonth) {
@@ -210,7 +421,7 @@ inline std::int64_t previousPeriodOpen(const std::int64_t periodOpenMs, const st
     return duration_cast<milliseconds>(sys_days{previous}.time_since_epoch()).count();
 }
 
-inline bool isDecimalNumber(const std::string_view value) {
+inline bool hasDecimalSyntax(const std::string_view value) {
     if (value.empty()) {
         return false;
     }
@@ -252,14 +463,42 @@ inline bool isDecimalNumber(const std::string_view value) {
     return offset == value.size();
 }
 
-inline bool parseTimestamp(const std::string &line, std::int64_t &timestamp) {
+inline bool parseFiniteBinary64(std::string_view value, double &parsed) {
+    if (!hasDecimalSyntax(value)) {
+        return false;
+    }
+    if (value.front() == '+') {
+        value.remove_prefix(1); // floating from_chars rejects a leading plus
+    }
+    const auto *begin = value.data();
+    const auto *end = begin + value.size();
+    const auto [ptr, ec] = std::from_chars(begin, end, parsed, std::chars_format::general);
+    // result_out_of_range covers both overflow and non-representable
+    // underflow.  Market-data CSV is explicitly a finite binary64 contract;
+    // silently turning a non-zero decimal into Inf/0 would violate it.
+    return ec == std::errc{} && ptr == end && std::isfinite(parsed);
+}
+
+inline bool isDecimalNumber(const std::string_view value) {
+    double parsed{};
+    return parseFiniteBinary64(value, parsed);
+}
+
+struct CandleCsvRow {
+    std::int64_t timestamp{};
+    std::array<double, 6> values{};
+    std::string text;
+};
+
+inline bool parseCandleCsvFields(const std::string_view line, std::int64_t &timestamp,
+                                 std::array<double, 6> *values = nullptr) {
     // MEXC candle files have exactly seven fields.  Requiring the exact schema
     // prevents a glued/torn line with a valid timestamp prefix being accepted.
     if (std::count(line.begin(), line.end(), ',') != 6) {
         return false;
     }
     const auto comma = line.find(',');
-    if (comma == 0 || comma == std::string::npos) {
+    if (comma == 0 || comma == std::string_view::npos) {
         return false;
     }
     const char *begin = line.data();
@@ -270,21 +509,32 @@ inline bool parseTimestamp(const std::string &line, std::int64_t &timestamp) {
     }
 
     std::size_t fieldStart = comma + 1;
-    for (std::int32_t field = 1; field < 7; ++field) {
-        const auto fieldEnd = field == 6 ? line.size() : line.find(',', fieldStart);
-        if (fieldEnd == std::string::npos ||
-            !isDecimalNumber(std::string_view{line}.substr(fieldStart, fieldEnd - fieldStart))) {
+    for (std::size_t field = 0; field < 6; ++field) {
+        const auto fieldEnd = field == 5 ? line.size() : line.find(',', fieldStart);
+        double parsed{};
+        if (fieldEnd == std::string_view::npos ||
+            !parseFiniteBinary64(line.substr(fieldStart, fieldEnd - fieldStart), parsed)) {
             return false;
+        }
+        if (values) {
+            (*values)[field] = parsed;
         }
         fieldStart = fieldEnd + 1;
     }
     return true;
 }
 
+inline bool parseTimestamp(const std::string &line, std::int64_t &timestamp) {
+    return parseCandleCsvFields(line, timestamp);
+}
+
 struct CsvTail {
     bool hasData{};
+    std::int64_t firstTimestamp{};
     std::int64_t timestamp{};
     std::uintmax_t size{};
+
+    friend bool operator==(const CsvTail &, const CsvTail &) = default;
 };
 
 inline bool inspectCsvTail(const std::filesystem::path &path, const std::string &expectedHeader,
@@ -348,11 +598,12 @@ inline bool inspectCsvTail(const std::filesystem::path &path, const std::string 
             error = fmt::format("misaligned existing CSV timestamp in {}", path.string());
             return false;
         }
-        if (previous && ((intervalMs > 0 && !isNextTimestamp(*previous, timestamp, intervalMs,
-                                                              alignment)) ||
-                         (intervalMs <= 0 && timestamp <= *previous))) {
-            error = fmt::format("non-contiguous existing CSV timestamps in {}", path.string());
+        if (previous && timestamp <= *previous) {
+            error = fmt::format("non-increasing existing CSV timestamps in {}", path.string());
             return false;
+        }
+        if (!previous) {
+            tail.firstTimestamp = timestamp;
         }
         previous = timestamp;
     }
@@ -403,12 +654,14 @@ inline bool validate(const std::filesystem::path &dir, const Manifest &manifest,
         return false;
     }
     try {
-        if (manifest.baseHasData &&
-            (manifest.requestedStart != manifest.firstTimestamp ||
-             manifest.firstTimestamp != nextTimestamp(manifest.baseTimestamp, manifest.intervalMs,
-                                                       manifest.alignment))) {
-            error = "staging does not begin immediately after the existing CSV tail";
-            return false;
+        if (manifest.baseHasData) {
+            const auto expectedStart = nextTimestamp(manifest.baseTimestamp, manifest.intervalMs,
+                                                     manifest.alignment);
+            if (manifest.requestedStart != expectedStart ||
+                manifest.firstTimestamp < manifest.requestedStart) {
+                error = "staging begins before, or was requested away from, the existing CSV tail";
+                return false;
+            }
         }
     } catch (const std::exception &e) {
         error = fmt::format("invalid staging timestamp arithmetic: {}", e.what());
@@ -464,18 +717,10 @@ inline bool validate(const std::filesystem::path &dir, const Manifest &manifest,
                                     path.string());
                 return false;
             }
-            if (previous) {
-                try {
-                    if (!isNextTimestamp(*previous, timestamp, manifest.intervalMs,
-                                         manifest.alignment)) {
-                        error = fmt::format("non-contiguous staged candles: {} followed by {}",
-                                            *previous, timestamp);
-                        return false;
-                    }
-                } catch (const std::exception &e) {
-                    error = fmt::format("invalid staged timestamp arithmetic: {}", e.what());
-                    return false;
-                }
+            if (previous && timestamp <= *previous) {
+                error = fmt::format("non-increasing staged candles: {} followed by {}",
+                                    *previous, timestamp);
+                return false;
             }
             if (!first) {
                 first = timestamp;
@@ -563,6 +808,9 @@ inline bool commit(const std::filesystem::path &dir, const Manifest &manifest,
                    const std::filesystem::path &csvPath, const std::string &header,
                    std::string &error) {
     if (!validate(dir, manifest, error)) {
+        return false;
+    }
+    if (!requirePrefixMarkerForPublication(csvPath, manifest, error)) {
         return false;
     }
 
@@ -656,6 +904,230 @@ inline bool commit(const std::filesystem::path &dir, const Manifest &manifest,
     return true;
 }
 
+/**
+ * Atomically replace an existing CSV with the timestamp union of a fully
+ * validated fresh staging transaction and every previously stored row.  This
+ * is used only when a persistent prefix marker discovers older history.  A
+ * temporary venue outage during the rebuild must never erase a row already on
+ * disk.  Equal timestamps must carry binary64-equivalent OHLCV values or the
+ * replacement fails without touching the old CSV.  expectedCurrent closes the
+ * read/probe/rebuild TOCTOU window; callers additionally hold the per-symbol
+ * process lock.
+ */
+inline bool replaceCsv(const std::filesystem::path &dir, const Manifest &manifest,
+                       const std::filesystem::path &csvPath, const std::string &header,
+                       const CsvTail &expectedCurrent, std::string &error) {
+    if (!validate(dir, manifest, error)) {
+        return false;
+    }
+    // Unlike a fresh definitive commit, this operation is specifically a
+    // rebuild of an already published provisional suffix.  The marker must
+    // therefore still exist until after the union replacement succeeds.
+    std::optional<PrefixMarker> replacementMarker;
+    if (!readPrefixMarker(csvPath, replacementMarker, error)) {
+        return false;
+    }
+    if (!replacementMarker || replacementMarker->requestedStart != manifest.requestedStart ||
+        replacementMarker->intervalMs != manifest.intervalMs ||
+        replacementMarker->alignment != manifest.alignment) {
+        error = "refusing MEXC prefix replacement without its matching persistent marker";
+        return false;
+    }
+    if (manifest.baseHasData) {
+        error = "prefix rebuild staging must not append to an existing base";
+        return false;
+    }
+
+    CsvTail current;
+    if (!inspectCsvTail(csvPath, header, current, error, manifest.intervalMs,
+                        manifest.alignment)) {
+        return false;
+    }
+    if (current != expectedCurrent) {
+        error = "existing CSV changed while its historical prefix was rebuilt";
+        return false;
+    }
+
+    std::ifstream existing;
+    std::optional<CandleCsvRow> existingRow;
+    if (current.size > 0) {
+        existing.open(csvPath, std::ios::binary);
+        if (!existing.is_open()) {
+            error = fmt::format("cannot reopen existing CSV {} for prefix union",
+                                csvPath.string());
+            return false;
+        }
+        std::string existingHeader;
+        if (!std::getline(existing, existingHeader)) {
+            error = fmt::format("cannot read existing CSV header {} for prefix union",
+                                csvPath.string());
+            return false;
+        }
+        if (!existingHeader.empty() && existingHeader.back() == '\r') {
+            existingHeader.pop_back();
+        }
+        if (existingHeader != header) {
+            error = fmt::format("unexpected existing CSV header in prefix union {}",
+                                csvPath.string());
+            return false;
+        }
+    }
+
+    const auto readRow = [&error](std::istream &input, const std::filesystem::path &source,
+                                  std::optional<CandleCsvRow> &row) {
+        std::string line;
+        if (!std::getline(input, line)) {
+            if (input.bad()) {
+                error = fmt::format("failed while reading candle rows from {}", source.string());
+                return false;
+            }
+            row.reset();
+            return true;
+        }
+        if (!line.empty() && line.back() == '\r') {
+            line.pop_back();
+        }
+        CandleCsvRow parsed;
+        if (!parseCandleCsvFields(line, parsed.timestamp, &parsed.values)) {
+            error = fmt::format("invalid candle row while merging prefix from {}", source.string());
+            return false;
+        }
+        parsed.text = std::move(line);
+        row = std::move(parsed);
+        return true;
+    };
+
+    if (existing.is_open() && !readRow(existing, csvPath, existingRow)) {
+        return false;
+    }
+
+    std::int32_t stagedBatchIndex = 0;
+    std::ifstream stagedBatch;
+    std::filesystem::path stagedBatchSource;
+    const auto readNextStagedRow = [&](std::optional<CandleCsvRow> &row) {
+        while (true) {
+            if (!stagedBatch.is_open()) {
+                ++stagedBatchIndex;
+                if (stagedBatchIndex > manifest.batchCount) {
+                    row.reset();
+                    return true;
+                }
+                stagedBatchSource = batchPath(dir, stagedBatchIndex);
+                stagedBatch.clear();
+                stagedBatch.open(stagedBatchSource, std::ios::binary);
+                if (!stagedBatch.is_open()) {
+                    error = fmt::format("cannot reopen prefix-rebuild batch {}",
+                                        stagedBatchSource.string());
+                    return false;
+                }
+            }
+
+            if (!readRow(stagedBatch, stagedBatchSource, row)) {
+                return false;
+            }
+            if (row) {
+                return true;
+            }
+            stagedBatch.close();
+        }
+    };
+
+    std::optional<CandleCsvRow> stagedRow;
+    if (!readNextStagedRow(stagedRow)) {
+        return false;
+    }
+
+    const auto replacement = dir / "committed.csv";
+    RemoveUnlessReleased replacementGuard(replacement);
+    std::ofstream output(replacement, std::ios::trunc | std::ios::binary);
+    if (!output.is_open()) {
+        error = fmt::format("cannot create prefix-rebuild output {}", replacement.string());
+        return false;
+    }
+    output << header << '\n';
+    if (!output.good()) {
+        error = fmt::format("failed to write prefix-rebuild header {}", replacement.string());
+        return false;
+    }
+
+    std::optional<std::int64_t> unionFirst;
+    std::optional<std::int64_t> unionPrevious;
+    const auto emit = [&](const CandleCsvRow &row) {
+        if (unionPrevious && row.timestamp <= *unionPrevious) {
+            error = fmt::format("non-increasing timestamp {} in MEXC prefix union",
+                                row.timestamp);
+            return false;
+        }
+        output << row.text << '\n';
+        if (!output.good()) {
+            error = fmt::format("failed to write prefix-rebuild union {}",
+                                replacement.string());
+            return false;
+        }
+        if (!unionFirst) {
+            unionFirst = row.timestamp;
+        }
+        unionPrevious = row.timestamp;
+        return true;
+    };
+
+    while (existingRow || stagedRow) {
+        if (!stagedRow || (existingRow && existingRow->timestamp < stagedRow->timestamp)) {
+            if (!emit(*existingRow) || !readRow(existing, csvPath, existingRow)) {
+                return false;
+            }
+            continue;
+        }
+        if (!existingRow || stagedRow->timestamp < existingRow->timestamp) {
+            if (!emit(*stagedRow) || !readNextStagedRow(stagedRow)) {
+                return false;
+            }
+            continue;
+        }
+
+        // Equal timestamp: a different decimal spelling is harmless only when
+        // all six stored market values map to the same finite double.
+        if (existingRow->values != stagedRow->values) {
+            error = fmt::format(
+                "conflicting MEXC candle values at timestamp {}; refusing prefix replacement",
+                existingRow->timestamp);
+            return false;
+        }
+        if (!emit(*stagedRow) || !readRow(existing, csvPath, existingRow) ||
+            !readNextStagedRow(stagedRow)) {
+            return false;
+        }
+    }
+
+    const auto expectedFirst = current.hasData
+        ? std::min(current.firstTimestamp, manifest.firstTimestamp)
+        : manifest.firstTimestamp;
+    const auto expectedLast = current.hasData
+        ? std::max(current.timestamp, manifest.lastTimestamp)
+        : manifest.lastTimestamp;
+    if (!unionFirst || !unionPrevious || *unionFirst != expectedFirst ||
+        *unionPrevious != expectedLast) {
+        error = "prefix-rebuild union does not cover both staged and existing CSV bounds";
+        return false;
+    }
+
+    output.flush();
+    if (!output.good()) {
+        error = fmt::format("failed to flush prefix-rebuild output {}", replacement.string());
+        return false;
+    }
+    output.close();
+    if (!output.good()) {
+        error = fmt::format("failed to close prefix-rebuild output {}", replacement.string());
+        return false;
+    }
+    if (!replaceAtomically(replacement, csvPath, error)) {
+        return false;
+    }
+    replacementGuard.release();
+    return true;
+}
+
 inline bool truncateAfter(const std::filesystem::path &csvPath, const std::int64_t maxTimestamp,
                           std::string &error, const std::string &expectedHeader = {},
                           const std::int64_t intervalMs = 0,
@@ -703,10 +1175,8 @@ inline bool truncateAfter(const std::filesystem::path &csvPath, const std::int64
             error = fmt::format("misaligned timestamp while repairing CSV {}", csvPath.string());
             return false;
         }
-        if (previous && ((intervalMs > 0 && !isNextTimestamp(*previous, timestamp, intervalMs,
-                                                              alignment)) ||
-                         (intervalMs <= 0 && timestamp <= *previous))) {
-            error = fmt::format("non-contiguous timestamps while repairing CSV {}", csvPath.string());
+        if (previous && timestamp <= *previous) {
+            error = fmt::format("non-increasing timestamps while repairing CSV {}", csvPath.string());
             return false;
         }
         previous = timestamp;

@@ -74,6 +74,7 @@ include_directories(
 
 set(HEADERS
         include/stonky/downloader.h
+        include/stonky/advisory_file_lock.h
         include/stonky/atomic_file.h
         include/stonky/candle_aggregator.h
         include/stonky/csv_data.h
@@ -89,6 +90,8 @@ set(HEADERS
         include/stonky/mexc/mexc_spot_downloader.h
         include/stonky/hyperliquid/hyperliquid_downloader.h
         include/stonky/lighter/lighter_downloader.h
+        src/mexc_funding_csv.h
+        src/mexc_funding_pagination.h
 )
 
 set(SOURCES
@@ -181,5 +184,5 @@ if (BUILD_TESTING AND BUILD_DOWNLOADER)
             nlohmann_json::nlohmann_json
             stonky_common
             mexc_api)
-    add_test(NAME mexc_models_preserve_decimal_text COMMAND mexc_models_precision_test)
+    add_test(NAME mexc_models_preserve_binary64_value COMMAND mexc_models_precision_test)
 endif ()
