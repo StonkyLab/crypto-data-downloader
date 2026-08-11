@@ -564,6 +564,19 @@ void MEXCFuturesDownloader::updateMarketData(const std::string &dirPath, const s
                             throw std::runtime_error(fmt::format(
                                 "Cannot read MEXC Futures unresolved-prefix marker: {}", prefixError));
                         }
+                        const auto effectiveFreshFloor =
+                            mexc_staging::firstPeriodOpenAtOrAfter(
+                                historyFloor(1577836800000LL), intervalMs, alignment);
+                        if (!mexc_staging::reconcilePrefixForExplicitFloor(
+                                symbolFilePathCsv,
+                                currentCsv.hasData
+                                    ? std::optional<std::int64_t>{currentCsv.firstTimestamp}
+                                    : std::nullopt,
+                                historyFloorMs() > 0, effectiveFreshFloor,
+                                intervalMs, alignment, prefixMarker, prefixError)) {
+                            throw std::runtime_error(fmt::format(
+                                "Cannot reconcile archived MEXC Futures prefix state: {}", prefixError));
+                        }
                         if (prefixMarker &&
                             (prefixMarker->intervalMs != intervalMs ||
                              prefixMarker->alignment != alignment ||
@@ -600,14 +613,27 @@ void MEXCFuturesDownloader::updateMarketData(const std::string &dirPath, const s
                             return symbolFilePathCsv;
                         }
 
+                        const auto freshFromMs = tail.foundValid
+                            ? tail.timestamp
+                            : mexc_staging::firstPeriodOpenAtOrAfter(
+                                tail.timestamp, intervalMs, alignment);
                         const auto actualFromMs = rebuildPrefix
                             ? prefixMarker->requestedStart
                             : (!currentCsv.hasData && prefixMarker
                                 ? prefixMarker->requestedStart
                                 : (tail.foundValid
                                     ? mexc_staging::nextTimestamp(tail.timestamp, intervalMs, alignment)
-                                    : tail.timestamp));
-                        if (actualFromMs > lastCompletedOpen || actualFromMs % 1000 != 0) {
+                                    : freshFromMs));
+                        if (actualFromMs > lastCompletedOpen) {
+                            if (!currentCsv.hasData && historyFloorMs() > 0) {
+                                spdlog::info(fmt::format(
+                                    "Symbol {}: --since is newer than the last completed MEXC Futures candle; nothing to download yet",
+                                    symbol));
+                                return {};
+                            }
+                            throw std::runtime_error("Invalid MEXC Futures download range");
+                        }
+                        if (actualFromMs % 1000 != 0) {
                             throw std::runtime_error("Invalid MEXC Futures download range");
                         }
 
@@ -1015,8 +1041,10 @@ void MEXCFuturesDownloader::updateFundingRateData(const std::string &dirPath, co
                         }
                     }
 
-                    const std::int64_t oldestDate = historyFloor(1577836800000LL); // 2020-01-01 UTC
-                    const std::int64_t cutoffTimestamp = oldestDate;
+                    constexpr std::int64_t oldestDate = 1577836800000LL; // 2020-01-01 UTC
+                    const std::int64_t cutoffTimestamp =
+                        mexc_funding_csv::downloadCutoff(
+                            base.hasData, base.timestamp, oldestDate, historyFloorMs());
 
                     std::vector<HistoricalFundingRate> newRates;
                     int32_t currentPage = 1;
@@ -1061,6 +1089,7 @@ void MEXCFuturesDownloader::updateFundingRateData(const std::string &dirPath, co
                                 paginationError));
                         }
 
+                        bool pageCrossedCutoff = false;
                         for (const auto &rate: response.resultList) {
                             if (rate.settleTime < 0 ||
                                 (previousRemoteTimestamp &&
@@ -1071,25 +1100,34 @@ void MEXCFuturesDownloader::updateFundingRateData(const std::string &dirPath, co
                             }
                             previousRemoteTimestamp = rate.settleTime;
 
-                            if (rate.settleTime > cutoffTimestamp) {
+                            if (mexc_funding_csv::atOrAfterDownloadCutoff(
+                                    rate.settleTime, cutoffTimestamp)) {
                                 newRates.push_back(rate);
+                            } else {
+                                pageCrossedCutoff = true;
                             }
                         }
 
                         const auto downloadedPage = currentPage;
-                        switch (mexc_funding_pagination::decideScanProgress(
-                            false, false, currentPage, response.totalPage)) {
-                            case mexc_funding_pagination::ScanDecision::Continue:
-                                ++currentPage;
-                                break;
-                            case mexc_funding_pagination::ScanDecision::Complete:
-                                hasMoreData = false;
-                                break;
-                            case mexc_funding_pagination::ScanDecision::RejectMissingBaseOverlap:
-                                throw std::runtime_error(fmt::format(
-                                    "MEXC funding scan reached page {} of {} without finding "
-                                    "the existing CSV tail {}",
-                                    currentPage, response.totalPage, base.timestamp));
+                        if (pageCrossedCutoff &&
+                            mexc_funding_pagination::validatedPageCrossesCutoff(
+                                response.resultList.back().settleTime, cutoffTimestamp)) {
+                            hasMoreData = false;
+                        } else {
+                            switch (mexc_funding_pagination::decideScanProgress(
+                                false, false, currentPage, response.totalPage)) {
+                                case mexc_funding_pagination::ScanDecision::Continue:
+                                    ++currentPage;
+                                    break;
+                                case mexc_funding_pagination::ScanDecision::Complete:
+                                    hasMoreData = false;
+                                    break;
+                                case mexc_funding_pagination::ScanDecision::RejectMissingBaseOverlap:
+                                    throw std::runtime_error(fmt::format(
+                                        "MEXC funding scan reached page {} of {} without finding "
+                                        "the existing CSV tail {}",
+                                        currentPage, response.totalPage, base.timestamp));
+                            }
                         }
                         spdlog::info(fmt::format(
                             "Symbol {}: downloaded page {}/{}, {} new rates so far", symbol,
@@ -1104,8 +1142,15 @@ void MEXCFuturesDownloader::updateFundingRateData(const std::string &dirPath, co
                     }
 
                     if (records.empty()) {
-                        throw std::runtime_error(
-                            "MEXC returned no funding records newer than the supported history floor");
+                        if (mexc_funding_csv::emptyDownloadIsNoOp(base.hasData)) {
+                            spdlog::info(fmt::format(
+                                "Symbol {}: no MEXC funding rates at or after {}; preserving existing data",
+                                symbol, cutoffTimestamp));
+                            return symbol;
+                        }
+                        throw std::runtime_error(fmt::format(
+                            "MEXC returned no funding records at or after the fresh history floor {}",
+                            cutoffTimestamp));
                     }
                     std::vector<mexc_funding_csv::Record> mergedRecords;
                     if (!mexc_funding_csv::mergeRecords(

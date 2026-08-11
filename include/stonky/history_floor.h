@@ -10,39 +10,40 @@ Copyright (c) 2026 Vitezslav Kot <vitezslav.kot@stonky.cz>, Stonky s.r.o.
 #define INCLUDE_STONKY_HISTORY_FLOOR_H
 
 #include <algorithm>
+#include <atomic>
 #include <cstdint>
 
 namespace stonky {
 
 namespace detail {
-inline std::int64_t &historyFloorStorage() {
-    static std::int64_t floorMs = 0; // 0 = no override
+inline std::atomic<std::int64_t> &historyFloorStorage() {
+    static std::atomic<std::int64_t> floorMs{0}; // 0 = no override
     return floorMs;
 }
 } // namespace detail
 
 /**
  * Set the oldest timestamp any downloader may reach for, in ms since epoch.
- * Zero clears the override. Must be called from main() before any worker
- * starts; it is read-only afterwards, so no synchronisation is needed.
+ * Zero clears the override. Production code sets it once in main() before any
+ * worker starts; atomic storage also keeps the public helper race-free if it is
+ * inspected concurrently. Changing the policy during an active run is not a
+ * supported workflow because different requests could observe different floors.
  */
 inline void setHistoryFloorMs(const std::int64_t floorMs) {
-    detail::historyFloorStorage() = floorMs;
+    detail::historyFloorStorage().store(floorMs, std::memory_order_relaxed);
 }
 
 inline std::int64_t historyFloorMs() {
-    return detail::historyFloorStorage();
+    return detail::historyFloorStorage().load(std::memory_order_relaxed);
 }
 
 /**
  * Raise an exchange's own oldest-history constant to the configured floor.
  *
- * This value is only ever used where there is NO usable local data: it is the
- * fallback CsvData::lastValidRecord() returns for a missing, empty or
- * header-only file, the lower bound of a listing-date probe, and the cutoff of
- * a first funding scan. A file that already holds records always resumes from
- * its own tail, so raising the floor can never skip forward over stored data
- * and open a gap — the invariant the whole append-only design rests on.
+ * This is the inclusive lower bound for a missing, empty or header-only CSV,
+ * listing-date probes and fresh funding scans. Callers keep the accompanying
+ * `foundValid` state so a real persisted tail remains an exclusive resume
+ * cursor and always wins over a later configured floor.
  *
  * Intended use: once old years are archived away and deleted from the live
  * CSVs, `--since` stops every fresh symbol from pulling the full history back

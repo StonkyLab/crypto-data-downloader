@@ -89,6 +89,16 @@ enum class ScanDecision {
 };
 
 /**
+ * A fully validated newest-first page proves that every later page is older
+ * once its oldest row is below the inclusive download cutoff.  Equality must
+ * remain part of the retained history, so it does not stop the scan by itself.
+ */
+inline bool validatedPageCrossesCutoff(const std::int64_t oldestPageTimestamp,
+                                       const std::int64_t inclusiveCutoff) {
+    return oldestPageTimestamp < inclusiveCutoff;
+}
+
+/**
  * An established append transaction is complete only after seeing its exact
  * local tail in the remote history.  Reaching the advertised final page is not
  * proof: totalPage may itself be transiently truncated.

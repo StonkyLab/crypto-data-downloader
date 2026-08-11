@@ -12,6 +12,7 @@ Copyright (c) 2025 Vitezslav Kot <vitezslav.kot@stonky.cz>, Stonky s.r.o.
 #include "stonky/binance/binance_common.h"
 #include "stonky/csv_data.h"
 #include "stonky/csv_format.h"
+#include "stonky/download_resume.h"
 #include "stonky/downloader.h"
 #include "stonky/future_utils.h"
 #include "stonky/utils/semaphore.h"
@@ -49,10 +50,10 @@ struct BinanceFuturesDownloader::P {
                                                                              deleteDelistedData(deleteDelistedData) {
     }
 
-    static int64_t checkFundingRatesCSVFile(const std::string &path);
+    static DownloadResume checkFundingRatesCSVFile(const std::string &path);
 
     static bool writeFundingRatesToCSVFile(const std::vector<futures::FundingRate> &fr, const std::string &path,
-                                           std::int64_t lastTs);
+                                           DownloadResume resume);
 };
 
 BinanceFuturesDownloader::BinanceFuturesDownloader(std::uint32_t maxJobs, bool deleteDelistedData) : m_p(
@@ -61,15 +62,15 @@ BinanceFuturesDownloader::BinanceFuturesDownloader(std::uint32_t maxJobs, bool d
 
 BinanceFuturesDownloader::~BinanceFuturesDownloader() = default;
 
-int64_t BinanceFuturesDownloader::P::checkFundingRatesCSVFile(const std::string &path) {
+DownloadResume BinanceFuturesDownloader::P::checkFundingRatesCSVFile(const std::string &path) {
     const std::int64_t oldestBNBDate = historyFloor(1420070400000LL); /// Thursday 1. January 2015 0:00:00
     // Self-healing read: a torn tail (interrupted write) is truncated instead of
     // resetting the resume point to oldestBNBDate.
-    return CsvData::lastValidRecord(path, 2, oldestBNBDate).timestamp;
+    return downloadResume(CsvData::lastValidRecord(path, 2, oldestBNBDate));
 }
 
 bool BinanceFuturesDownloader::P::writeFundingRatesToCSVFile(const std::vector<futures::FundingRate> &fr,
-                                                             const std::string &path, const std::int64_t lastTs) {
+                                                             const std::string &path, DownloadResume resume) {
     const std::filesystem::path pathToCSVFile{path};
 
     std::ofstream ofs;
@@ -93,17 +94,15 @@ bool BinanceFuturesDownloader::P::writeFundingRatesToCSVFile(const std::vector<f
                 << std::endl;
     }
 
-    // Monotonic filter: skips both the inclusive resume-boundary record and
-    // page-boundary duplicates the client merges into one vector (records
-    // repeated at 1000-row fetch boundaries).
-    std::int64_t prevTs = lastTs;
+    // A persisted tail is exclusive, but a fresh --since floor is inclusive.
+    // Advancing the local resume point also removes page-boundary duplicates.
     for (const auto &record: fr) {
-        if (record.fundingTime <= prevTs) {
+        if (!shouldPersistTimestamp(record.fundingTime, resume)) {
             continue;
         }
         ofs << record.fundingTime << ",";
         ofs << csvNumber(record.fundingRate) << std::endl;
-        prevTs = record.fundingTime;
+        resume = {record.fundingTime, true};
     }
 
     ofs.flush();
@@ -522,21 +521,14 @@ void BinanceFuturesDownloader::updateFundingRateData(const std::string &dirPath,
 
                            spdlog::info(fmt::format("Updating FR for symbol: {}...", symbol));
 
-                           const int64_t fromTimeStamp = P::checkFundingRatesCSVFile(symbolFilePathCsv.string());
+                           const auto resume = P::checkFundingRatesCSVFile(symbolFilePathCsv.string());
 
                            try {
                                const auto fr = m_p->bnbFuturesClient->getFundingRates(
-                                   symbol, fromTimeStamp, endTimestamp,
+                                   symbol, resume.timestamp, endTimestamp,
                                    1000);
                                if (!fr.empty()) {
-                                   if (fr.size() == 1) {
-                                       if (fromTimeStamp == fr.front().fundingTime) {
-                                           spdlog::info(fmt::format("CSV file for symbol: {} updated", symbol));
-                                           return symbolFilePathCsv;
-                                       }
-                                   }
-
-                                   if (!P::writeFundingRatesToCSVFile(fr, symbolFilePathCsv.string(), fromTimeStamp)) {
+                                   if (!P::writeFundingRatesToCSVFile(fr, symbolFilePathCsv.string(), resume)) {
                                        throw std::runtime_error("failed to write funding-rate CSV");
                                    }
                                    spdlog::info(fmt::format("CSV file for symbol: {} updated", symbol));

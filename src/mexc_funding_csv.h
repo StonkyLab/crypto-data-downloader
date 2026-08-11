@@ -10,6 +10,7 @@ Copyright (c) 2026 Vitezslav Kot <vitezslav.kot@stonky.cz>, Stonky s.r.o.
 
 #include "stonky/atomic_file.h"
 
+#include <algorithm>
 #include <array>
 #include <charconv>
 #include <cmath>
@@ -47,6 +48,31 @@ struct Record {
 
     friend bool operator==(const Record &, const Record &) = default;
 };
+
+/**
+ * --since is a fresh-file floor, never a way to jump over an existing tail.
+ * MEXC funding is deliberately full-scanned and unioned on every run, so an
+ * established CSV uses a boundary no later than either the venue default or
+ * its actual tail.  A fresh file raises the venue boundary to the configured
+ * inclusive floor.
+ */
+inline std::int64_t downloadCutoff(const bool existingData,
+                                   const std::int64_t existingTail,
+                                   const std::int64_t exchangeDefault,
+                                   const std::int64_t configuredFloor) {
+    return existingData ? std::min(exchangeDefault, existingTail)
+                        : std::max(exchangeDefault, configuredFloor);
+}
+
+inline bool atOrAfterDownloadCutoff(const std::int64_t timestamp,
+                                    const std::int64_t cutoff) {
+    return timestamp >= cutoff;
+}
+
+/** Empty filtered history is a safe success only when a CSV already exists. */
+inline bool emptyDownloadIsNoOp(const bool existingData) {
+    return existingData;
+}
 
 inline std::filesystem::path updateLockPath(const std::filesystem::path &csvPath) {
     auto path = csvPath;

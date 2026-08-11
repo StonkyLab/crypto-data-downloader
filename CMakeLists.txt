@@ -77,10 +77,14 @@ set(HEADERS
         include/stonky/advisory_file_lock.h
         include/stonky/atomic_file.h
         include/stonky/candle_aggregator.h
+        include/stonky/csv_archive.h
         include/stonky/csv_data.h
         include/stonky/csv_format.h
         include/stonky/csv_verifier.h
+        include/stonky/download_resume.h
         include/stonky/future_utils.h
+        include/stonky/history_floor.h
+        include/stonky/since_parser.h
         include/stonky/binance/binance_futures_downloader.h
         include/stonky/binance/binance_spot_downloader.h
         include/stonky/binance/binance_common.h
@@ -156,6 +160,14 @@ if (BUILD_TESTING)
     add_executable(atomic_file_test test/atomic_file_test.cpp)
     target_include_directories(atomic_file_test PRIVATE include)
     add_test(NAME atomic_file_preserves_previous_output COMMAND atomic_file_test)
+
+    add_executable(since_parser_test test/since_parser_test.cpp)
+    target_include_directories(since_parser_test PRIVATE include)
+    add_test(NAME since_parser_rejects_ambiguous_input COMMAND since_parser_test)
+
+    add_executable(download_resume_test test/download_resume_test.cpp)
+    target_include_directories(download_resume_test PRIVATE include)
+    add_test(NAME since_resume_boundary_policy COMMAND download_resume_test)
 endif ()
 
 if (BUILD_TESTING AND BUILD_DOWNLOADER)

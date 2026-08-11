@@ -11,6 +11,7 @@ Copyright (c) 2025 Vitezslav Kot <vitezslav.kot@stonky.cz>, Stonky s.r.o.
 #include "stonky/atomic_file.h"
 #include "stonky/csv_data.h"
 #include "stonky/csv_format.h"
+#include "stonky/download_resume.h"
 #include "stonky/downloader.h"
 #include "stonky/future_utils.h"
 #include "stonky/hyperliquid/hyperliquid_rest_client.h"
@@ -39,18 +40,20 @@ struct HyperliquidDownloader::P {
     static bool writeCSVCandlesToZorroT6File(const std::string &csvPath, const std::string &t6Path,
                                              stonky::CandleInterval interval);
 
-    static int64_t checkSymbolCSVFile(const std::string &path);
+    static DownloadResume checkSymbolCSVFile(const std::string &path);
 
-    static bool writeCandlesToCSVFile(const std::vector<Candle> &candles, const std::string &path, std::int64_t lastTs);
+    static bool writeCandlesToCSVFile(const std::vector<Candle> &candles, const std::string &path,
+                                      DownloadResume resume);
 
     static bool readCandlesFromCSVFile(const std::string &path, std::vector<Candle> &candles);
 
     void convertFromCSVToT6(const std::vector<std::filesystem::path> &filePaths, const std::string &outDirPath,
                             stonky::CandleInterval interval) const;
 
-    static int64_t checkFundingRatesCSVFile(const std::string &path);
+    static DownloadResume checkFundingRatesCSVFile(const std::string &path);
 
-    static bool writeFundingRatesToCSVFile(const std::vector<FundingRate> &fr, const std::string &path);
+    static bool writeFundingRatesToCSVFile(const std::vector<FundingRate> &fr, const std::string &path,
+                                           DownloadResume resume);
 
     explicit P(const std::uint32_t maxJobs, const bool deleteDelistedData)
         : hlClient(std::make_unique<RESTClient>()),
@@ -156,7 +159,7 @@ void HyperliquidDownloader::P::convertFromCSVToT6(const std::vector<std::filesys
 }
 
 bool HyperliquidDownloader::P::writeCandlesToCSVFile(const std::vector<Candle> &candles, const std::string &path,
-                                                     std::int64_t lastTs) {
+                                                     DownloadResume resume) {
     const std::filesystem::path pathToCSVFile{path};
 
     std::ofstream ofs;
@@ -179,8 +182,7 @@ bool HyperliquidDownloader::P::writeCandlesToCSVFile(const std::vector<Candle> &
     }
 
     for (const auto &candle: candles) {
-        // <= guards against any overlap with already-persisted data
-        if (candle.startTime <= lastTs) {
+        if (!shouldPersistTimestamp(candle.startTime, resume)) {
             continue;
         }
         ofs << candle.startTime << ",";
@@ -189,6 +191,7 @@ bool HyperliquidDownloader::P::writeCandlesToCSVFile(const std::vector<Candle> &
         ofs << csvNumber(candle.low) << ",";
         ofs << csvNumber(candle.close) << ",";
         ofs << csvNumber(candle.volume) << std::endl;
+        resume = {candle.startTime, true};
     }
 
     ofs.flush();
@@ -201,20 +204,21 @@ bool HyperliquidDownloader::P::writeCandlesToCSVFile(const std::vector<Candle> &
     return ofs.good();
 }
 
-int64_t HyperliquidDownloader::P::checkSymbolCSVFile(const std::string &path) {
+DownloadResume HyperliquidDownloader::P::checkSymbolCSVFile(const std::string &path) {
     const std::int64_t oldestHyperliquidDate = historyFloor(1672531200000LL); /// Sunday 1. January 2023 0:00:00
     // Self-healing read: a torn tail (interrupted write) is truncated instead of
     // resetting the resume point to the oldest-date sentinel.
-    return CsvData::lastValidRecord(path, 6, oldestHyperliquidDate).timestamp;
+    return downloadResume(CsvData::lastValidRecord(path, 6, oldestHyperliquidDate));
 }
 
-int64_t HyperliquidDownloader::P::checkFundingRatesCSVFile(const std::string &path) {
+DownloadResume HyperliquidDownloader::P::checkFundingRatesCSVFile(const std::string &path) {
     const std::int64_t oldestHyperliquidDate = historyFloor(1672531200000LL); /// Sunday 1. January 2023 0:00:00
-    return CsvData::lastValidRecord(path, 2, oldestHyperliquidDate).timestamp;
+    return downloadResume(CsvData::lastValidRecord(path, 2, oldestHyperliquidDate));
 }
 
 bool HyperliquidDownloader::P::writeFundingRatesToCSVFile(const std::vector<FundingRate> &fr,
-                                                          const std::string &path) {
+                                                          const std::string &path,
+                                                          DownloadResume resume) {
     const std::filesystem::path pathToCSVFile{path};
 
     std::ofstream ofs;
@@ -237,8 +241,12 @@ bool HyperliquidDownloader::P::writeFundingRatesToCSVFile(const std::vector<Fund
     }
 
     for (const auto &record: fr) {
+        if (!shouldPersistTimestamp(record.time, resume)) {
+            continue;
+        }
         ofs << record.time << ",";
         ofs << csvNumber(record.fundingRate) << std::endl;
+        resume = {record.time, true};
     }
 
     ofs.flush();
@@ -380,19 +388,18 @@ void HyperliquidDownloader::updateMarketData(const std::string &dirPath,
                                       msg.find("429") != std::string::npos ||
                                       msg.find("rate limit") != std::string::npos;
                            };
-                           const std::int64_t oldestHyperliquidDate = historyFloor(1672531200000LL);
                            constexpr int maxRetries = 5;
                            for (int attempt = 0; attempt < maxRetries; ++attempt) {
                                // Re-read CSV state at start of each attempt — a previous attempt
                                // may have written batches to disk before hitting a 429.
-                               const int64_t fromTimeStamp = P::checkSymbolCSVFile(symbolFilePathCsv.string());
-                               const int64_t effectiveFrom = (fromTimeStamp == oldestHyperliquidDate)
-                                   ? nowTimestamp - static_cast<int64_t>(barSizeInMinutes) * 5000LL * 60000
-                                   : fromTimeStamp;
+                               const auto resume = P::checkSymbolCSVFile(symbolFilePathCsv.string());
+                               const int64_t retentionStart =
+                                   nowTimestamp - static_cast<int64_t>(barSizeInMinutes) * 5000LL * 60000;
+                               const int64_t effectiveFrom = freshDownloadStart(resume, retentionStart);
                                try {
                                    std::ignore = m_p->hlClient->getHistoricalPrices(
                                        symbol, hlInterval, effectiveFrom, nowTimestamp,
-                                       [symbolFilePathCsv, symbol, fromTimeStamp](
+                                       [symbolFilePathCsv, symbol](
                                        const std::vector<hyperliquid::Candle> &cnd) {
                                            // Zero-volume bars are stored as-is: the exchange serves a
                                            // continuous series and no-trade bars are needed downstream
@@ -400,8 +407,9 @@ void HyperliquidDownloader::updateMarketData(const std::string &dirPath,
                                            // began (pre-March-2023 era) also carry v=0 oracle prices —
                                            // excluding those is an upstream universe-selection concern.
                                            if (!cnd.empty()) {
+                                               const auto persisted = P::checkSymbolCSVFile(symbolFilePathCsv.string());
                                                if (!P::writeCandlesToCSVFile(cnd, symbolFilePathCsv.string(),
-                                                                             fromTimeStamp)) {
+                                                                             persisted)) {
                                                    // Abort pagination — continuing after a failed batch write
                                                    // would leave a permanent gap inside the CSV.
                                                    throw std::runtime_error(
@@ -613,16 +621,12 @@ void HyperliquidDownloader::updateFundingRateData(const std::string &dirPath,
                            for (int attempt = 0; attempt < maxRetries; ++attempt) {
                                // Re-read CSV state at start of each attempt — a previous attempt
                                // may have written rows to disk before hitting a 429.
-                               const int64_t fromTimeStamp = P::checkFundingRatesCSVFile(symbolFilePathCsv.string());
+                               const auto resume = P::checkFundingRatesCSVFile(symbolFilePathCsv.string());
                                try {
-                                   const auto fr = m_p->hlClient->getFundingRates(symbol, fromTimeStamp + 1,
+                                   const auto fr = m_p->hlClient->getFundingRates(symbol, requestStartTimestamp(resume),
                                                                                    nowTimestamp);
                                    if (!fr.empty()) {
-                                       if (fr.size() == 1 && fromTimeStamp == fr.front().time) {
-                                           spdlog::info(fmt::format("CSV file for symbol: {} updated", symbol));
-                                           return symbolFilePathCsv;
-                                       }
-                                       if (P::writeFundingRatesToCSVFile(fr, symbolFilePathCsv.string())) {
+                                       if (P::writeFundingRatesToCSVFile(fr, symbolFilePathCsv.string(), resume)) {
                                            spdlog::info(fmt::format("CSV file for symbol: {} updated", symbol));
                                            return symbolFilePathCsv;
                                        }

@@ -15,6 +15,7 @@ Copyright (c) 2025 Vitezslav Kot <vitezslav.kot@stonky.cz>, Stonky s.r.o.
 #include "stonky/lighter/lighter_downloader.h"
 #include "stonky/candle_aggregator.h"
 #include "stonky/history_floor.h"
+#include "stonky/since_parser.h"
 #include "stonky/utils/utils.h"
 #include "stonky/csv_verifier.h"
 #include "stonky/downloader.h"
@@ -26,8 +27,6 @@ Copyright (c) 2025 Vitezslav Kot <vitezslav.kot@stonky.cz>, Stonky s.r.o.
 #include <spdlog/sinks/rotating_file_sink.h>
 #include <algorithm>
 #include "csv.h"
-#include <iomanip>
-#include <sstream>
 #include <iostream>
 #include <memory>
 
@@ -331,25 +330,10 @@ int main(int argc, char **argv) {
         repairData = parseResult["repair"].as<bool>();
         if (const auto since = parseResult["since"].as<std::string>(); !since.empty()) {
             std::int64_t sinceMs = 0;
-            if (since.find('-') != std::string::npos) {
-                std::tm tm{};
-                std::istringstream in(since);
-                in >> std::get_time(&tm, "%Y-%m-%d");
-                if (in.fail()) {
-                    spdlog::error(fmt::format("Invalid --since '{}': expected YYYY-MM-DD or milliseconds", since));
-                    return -1;
-                }
-                sinceMs = static_cast<std::int64_t>(mkgmtime(&tm)) * 1000;
-            } else {
-                try {
-                    sinceMs = std::stoll(since);
-                } catch (const std::exception &) {
-                    spdlog::error(fmt::format("Invalid --since '{}': expected YYYY-MM-DD or milliseconds", since));
-                    return -1;
-                }
-            }
-            if (sinceMs <= 0 || sinceMs > getMsTimestamp(currentTime()).count()) {
-                spdlog::error(fmt::format("--since '{}' is not a past date", since));
+            try {
+                sinceMs = parseSinceMs(since, getMsTimestamp(currentTime()).count());
+            } catch (const SinceParseError &error) {
+                spdlog::error(fmt::format("Invalid --since '{}': {}", since, error.what()));
                 return -1;
             }
             setHistoryFloorMs(sinceMs);

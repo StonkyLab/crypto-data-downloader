@@ -11,6 +11,7 @@ Copyright (c) 2025 Vitezslav Kot <vitezslav.kot@stonky.cz>, Stonky s.r.o.
 #include "stonky/atomic_file.h"
 #include "stonky/csv_data.h"
 #include "stonky/csv_format.h"
+#include "stonky/download_resume.h"
 #include "stonky/downloader.h"
 #include "stonky/future_utils.h"
 #include "stonky/bybit/bybit_rest_client.h"
@@ -42,18 +43,20 @@ struct BybitDownloader::P {
     static bool writeCSVCandlesToZorroT6File(const std::string &csvPath, const std::string &t6Path,
                                               stonky::CandleInterval interval);
 
-    static int64_t checkSymbolCSVFile(const std::string &path);
+    static DownloadResume checkSymbolCSVFile(const std::string &path);
 
-    static bool writeCandlesToCSVFile(const std::vector<Candle> &candles, const std::string &path, std::int64_t lastTs);
+    static bool writeCandlesToCSVFile(const std::vector<Candle> &candles, const std::string &path,
+                                      DownloadResume resume);
 
     static bool readCandlesFromCSVFile(const std::string &path, std::vector<Candle> &candles);
 
     void convertFromCSVToT6(const std::vector<std::filesystem::path> &filePaths, const std::string &outDirPath,
                             stonky::CandleInterval interval) const;
 
-    static int64_t checkFundingRatesCSVFile(const std::string &path);
+    static DownloadResume checkFundingRatesCSVFile(const std::string &path);
 
-    static bool writeFundingRatesToCSVFile(const std::vector<FundingRate> &fr, const std::string &path);
+    static bool writeFundingRatesToCSVFile(const std::vector<FundingRate> &fr, const std::string &path,
+                                           DownloadResume resume);
 
     explicit P(const std::uint32_t maxJobs, const bool deleteDelistedData) : bybitClient(std::make_unique<RESTClient>("", "")),
                                               maxConcurrentConvertJobs(normalizedJobCount(maxJobs)),
@@ -160,7 +163,8 @@ void BybitDownloader::P::convertFromCSVToT6(const std::vector<std::filesystem::p
     }
 }
 
-bool BybitDownloader::P::writeCandlesToCSVFile(const std::vector<Candle> &candles, const std::string &path, std::int64_t lastTs) {
+bool BybitDownloader::P::writeCandlesToCSVFile(const std::vector<Candle> &candles, const std::string &path,
+                                                DownloadResume resume) {
     const std::filesystem::path pathToCSVFile{path};
 
     std::ofstream ofs;
@@ -185,9 +189,7 @@ bool BybitDownloader::P::writeCandlesToCSVFile(const std::vector<Candle> &candle
     }
 
     for (const auto &candle: candles) {
-        // <= guards against any overlap with already-persisted data, not just
-        // the single boundary candle (re-downloads, retry overlaps)
-        if (candle.startTime <= lastTs) {
+        if (!shouldPersistTimestamp(candle.startTime, resume)) {
             continue;
         }
         ofs << candle.startTime << ",";
@@ -196,6 +198,7 @@ bool BybitDownloader::P::writeCandlesToCSVFile(const std::vector<Candle> &candle
         ofs << csvNumber(candle.low) << ",";
         ofs << csvNumber(candle.close) << ",";
         ofs << csvNumber(candle.volume) << std::endl;
+        resume = {candle.startTime, true};
     }
 
     ofs.flush();
@@ -208,20 +211,21 @@ bool BybitDownloader::P::writeCandlesToCSVFile(const std::vector<Candle> &candle
     return ofs.good();
 }
 
-int64_t BybitDownloader::P::checkSymbolCSVFile(const std::string &path) {
+DownloadResume BybitDownloader::P::checkSymbolCSVFile(const std::string &path) {
     const std::int64_t oldestBybitDate = historyFloor(1420070400000LL); /// Thursday 1. January 2015 0:00:00
     // Self-healing read: a torn tail (interrupted write) is truncated instead of
     // resetting the resume point to oldestBybitDate, which used to silently
     // re-download and append the entire history.
-    return CsvData::lastValidRecord(path, 6, oldestBybitDate).timestamp;
+    return downloadResume(CsvData::lastValidRecord(path, 6, oldestBybitDate));
 }
 
-int64_t BybitDownloader::P::checkFundingRatesCSVFile(const std::string &path) {
+DownloadResume BybitDownloader::P::checkFundingRatesCSVFile(const std::string &path) {
     const std::int64_t oldestBybitDate = historyFloor(1420070400000LL); /// Thursday 1. January 2015 0:00:00
-    return CsvData::lastValidRecord(path, 2, oldestBybitDate).timestamp;
+    return downloadResume(CsvData::lastValidRecord(path, 2, oldestBybitDate));
 }
 
-bool BybitDownloader::P::writeFundingRatesToCSVFile(const std::vector<FundingRate> &fr, const std::string &path) {
+bool BybitDownloader::P::writeFundingRatesToCSVFile(const std::vector<FundingRate> &fr, const std::string &path,
+                                                     DownloadResume resume) {
     const std::filesystem::path pathToCSVFile{path};
 
     std::ofstream ofs;
@@ -247,8 +251,12 @@ bool BybitDownloader::P::writeFundingRatesToCSVFile(const std::vector<FundingRat
     }
 
     for (const auto &record: fr) {
+        if (!shouldPersistTimestamp(record.fundingRateTimestamp, resume)) {
+            continue;
+        }
         ofs << record.fundingRateTimestamp << ",";
         ofs << csvNumber(record.fundingRate) << std::endl;
+        resume = {record.fundingRateTimestamp, true};
     }
 
     ofs.flush();
@@ -449,8 +457,8 @@ void BybitDownloader::updateMarketData(const std::string &dirPath,
                            spdlog::info(fmt::format("Updating candles for symbol: {}...", symbol));
 
                            {
-                               const int64_t initialFromTs = P::checkSymbolCSVFile(symbolFilePathCsv.string());
-                               if (std::to_string(initialFromTs).length() < 13) {
+                               const auto initialResume = P::checkSymbolCSVFile(symbolFilePathCsv.string());
+                               if (std::to_string(initialResume.timestamp).length() < 13) {
                                    throw std::runtime_error(fmt::format(
                                        "Old data format for symbol {}, delete file {} before retrying",
                                        symbol, symbolFilePathCsv.string()));
@@ -466,15 +474,16 @@ void BybitDownloader::updateMarketData(const std::string &dirPath,
                            for (int attempt = 0; attempt < maxRetries; ++attempt) {
                                // Re-read CSV state at start of each attempt — a previous attempt
                                // may have written batches to disk before hitting a 429.
-                               const int64_t fromTimeStamp = P::checkSymbolCSVFile(symbolFilePathCsv.string());
+                               const auto resume = P::checkSymbolCSVFile(symbolFilePathCsv.string());
                                try {
-                                   const auto candles = m_p->bybitClient->getHistoricalPrices(category,
+                                   std::ignore = m_p->bybitClient->getHistoricalPrices(category,
                                        symbol,
                                        bybitCandleInterval,
-                                       fromTimeStamp,
-                                       endTimestamp, 200, [symbolFilePathCsv, symbol, fromTimeStamp](const std::vector<Candle> &cnd) {
+                                       resume.timestamp,
+                                       endTimestamp, 200, [symbolFilePathCsv, symbol](const std::vector<Candle> &cnd) {
                                            if (!cnd.empty()) {
-                                               if (!P::writeCandlesToCSVFile(cnd, symbolFilePathCsv.string(),fromTimeStamp)) {
+                                               const auto persisted = P::checkSymbolCSVFile(symbolFilePathCsv.string());
+                                               if (!P::writeCandlesToCSVFile(cnd, symbolFilePathCsv.string(), persisted)) {
                                                    // Abort pagination — continuing after a failed batch write
                                                    // would leave a permanent gap inside the CSV.
                                                    throw std::runtime_error(fmt::format("CSV write failed for symbol: {}", symbol));
@@ -715,18 +724,11 @@ void BybitDownloader::updateFundingRateData(const std::string &dirPath,
                            for (int attempt = 0; attempt < maxRetries; ++attempt) {
                                // Re-read CSV state at start of each attempt — a previous attempt
                                // may have written rows to disk before hitting a 429.
-                               const int64_t fromTimeStamp = P::checkFundingRatesCSVFile(symbolFilePathCsv.string());
+                               const auto resume = P::checkFundingRatesCSVFile(symbolFilePathCsv.string());
                                try {
                                    if (const auto fr = m_p->bybitClient->getFundingRates(
-                                       Category::linear, symbol, fromTimeStamp + 1000, endTimestamp); !fr.empty()) {
-                                       if (fr.size() == 1) {
-                                           if (fromTimeStamp == fr.front().fundingRateTimestamp) {
-                                               spdlog::info(fmt::format("CSV file for symbol: {} updated", symbol));
-                                               return symbolFilePathCsv;
-                                           }
-                                       }
-
-                                       if (P::writeFundingRatesToCSVFile(fr, symbolFilePathCsv.string())) {
+                                       Category::linear, symbol, requestStartTimestamp(resume), endTimestamp); !fr.empty()) {
+                                       if (P::writeFundingRatesToCSVFile(fr, symbolFilePathCsv.string(), resume)) {
                                            spdlog::info(fmt::format("CSV file for symbol: {} updated", symbol));
                                            return symbolFilePathCsv;
                                        }

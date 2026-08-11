@@ -9,6 +9,7 @@ Copyright (c) 2025 Vitezslav Kot <vitezslav.kot@stonky.cz>, Stonky s.r.o.
 #include "stonky/okx/okx_downloader.h"
 #include "stonky/history_floor.h"
 #include "stonky/atomic_file.h"
+#include "stonky/csv_archive.h"
 #include "stonky/csv_data.h"
 #include "stonky/csv_format.h"
 #include "stonky/future_utils.h"
@@ -544,8 +545,9 @@ void OKXDownloader::updateMarketData(const std::string &dirPath,
             }
         }
 
-        // Scan existing CSV files for symbols no longer on the exchange. Unless
-        // they are being deleted they stay in the update set: `/public/instruments`
+        // Scan existing live or individually compressed CSV files for symbols
+        // no longer on the exchange. Unless they are being deleted they stay in
+        // the update set: `/public/instruments`
         // only ever lists live contracts, so a delisted symbol dropped here would
         // stop being maintained and would vanish from a rebuilt dataset, silently
         // introducing survivorship bias. The bulk archive still serves them.
@@ -557,12 +559,19 @@ void OKXDownloader::updateMarketData(const std::string &dirPath,
 
         if (std::filesystem::exists(csvDir)) {
             for (const auto &entry: std::filesystem::directory_iterator(csvDir)) {
-                if (entry.is_regular_file() && entry.path().extension() == ".csv") {
-                    const auto stem = entry.path().stem().string();
+                if (entry.is_regular_file()) {
+                    const auto archivedStem = csvStemFromArchivePath(entry.path());
+                    if (!archivedStem) {
+                        continue;
+                    }
+                    const auto &stem = *archivedStem;
                     if (!exchangeSymbolSet.contains(stem)) {
-                        if (m_p->deleteDelistedData) {
+                        // Never delete a user's compressed archive implicitly. Plain
+                        // live CSVs keep the existing --delete-delisted behaviour.
+                        if (m_p->deleteDelistedData && entry.path().extension() == ".csv") {
                             symbolsToDelete.push_back(stem);
-                        } else {
+                        } else if (!m_p->deleteDelistedData &&
+                                   std::ranges::find(symbolsToUpdate, stem) == symbolsToUpdate.end()) {
                             symbolsToUpdate.push_back(stem);
                             delistedKept++;
                         }
@@ -958,8 +967,9 @@ void OKXDownloader::updateFundingRateData(const std::string &dirPath,
             }
         }
 
-        // Scan existing CSV files for symbols no longer on the exchange. Unless
-        // they are being deleted they stay in the update set — see the same
+        // Scan existing live or individually compressed CSV files for symbols
+        // no longer on the exchange. Unless they are being deleted they stay in
+        // the update set — see the same
         // reasoning in updateMarketData(): dropping them would introduce
         // survivorship bias into a rebuilt dataset.
         std::filesystem::path frDir = finalPath;
@@ -969,15 +979,20 @@ void OKXDownloader::updateFundingRateData(const std::string &dirPath,
 
         if (std::filesystem::exists(frDir)) {
             for (const auto &entry: std::filesystem::directory_iterator(frDir)) {
-                if (entry.is_regular_file() && entry.path().extension() == ".csv") {
-                    auto stem = entry.path().stem().string();
+                if (entry.is_regular_file()) {
+                    const auto archivedStem = csvStemFromArchivePath(entry.path());
+                    if (!archivedStem) {
+                        continue;
+                    }
+                    auto stem = *archivedStem;
                     if (stem.ends_with("_fr")) {
                         stem = stem.substr(0, stem.size() - 3);
                     }
                     if (!exchangeSymbolSet.contains(stem)) {
-                        if (m_p->deleteDelistedData) {
+                        if (m_p->deleteDelistedData && entry.path().extension() == ".csv") {
                             symbolsToDelete.push_back(stem);
-                        } else {
+                        } else if (!m_p->deleteDelistedData &&
+                                   std::ranges::find(symbolsToUpdate, stem) == symbolsToUpdate.end()) {
                             symbolsToUpdate.push_back(stem);
                             delistedKept++;
                         }

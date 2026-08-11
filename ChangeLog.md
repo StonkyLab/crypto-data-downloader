@@ -95,4 +95,9 @@ All notable changes to this project will be documented in this file. This projec
 - Add `--since YYYY-MM-DD` (or milliseconds): the oldest date a symbol without local data may reach for. Intended for the point where old years are archived off the server — without it every fresh symbol pulls the full history back in
 - The floor applies only where there is no usable local data: the fallback for a missing/empty/header-only CSV, the lower bound of Lighter's listing-date probe and the cutoff of a first MEXC funding scan. A file that already holds records always resumes from its own tail, so `--since` cannot skip forward over stored data and open a gap
 - Route all eight downloaders' hardcoded oldest-history constants through one shared `historyFloor()` policy instead of fifteen separate copies
-
+- Parse `--since` strictly and timezone-independently: reject normalized invalid dates, trailing characters, whitespace, signed/overflowing millisecond values and future timestamps instead of silently accepting a different floor
+- Keep the fresh floor inclusive while treating a real CSV tail as exclusive, including candle and funding boundaries; an existing tail always wins over a later `--since`
+- Reconcile MEXC prefix markers after archiving, align raw millisecond floors to the first eligible candle, and keep MEXC funding scans from jumping over an existing tail
+- Discover OKX delisted symbols from individually compressed `.csv.gz`, `.csv.xz`, `.csv.bz2` and `.csv.zst` files when the live CSV has been archived
+- Make the process-wide floor storage race-free while retaining the set-before-workers contract
+- Add deterministic parser, fresh/resume boundary, archive-name, MEXC marker/alignment and funding-cutoff regression coverage

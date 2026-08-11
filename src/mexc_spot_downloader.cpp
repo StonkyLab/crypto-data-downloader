@@ -542,6 +542,19 @@ void MEXCSpotDownloader::updateMarketData(const std::string &dirPath, const std:
                             throw std::runtime_error(fmt::format(
                                 "Cannot read MEXC Spot unresolved-prefix marker: {}", prefixError));
                         }
+                        const auto effectiveFreshFloor =
+                            mexc_staging::firstPeriodOpenAtOrAfter(
+                                historyFloor(1577836800000LL), intervalMs, alignment);
+                        if (!mexc_staging::reconcilePrefixForExplicitFloor(
+                                symbolFilePathCsv,
+                                currentCsv.hasData
+                                    ? std::optional<std::int64_t>{currentCsv.firstTimestamp}
+                                    : std::nullopt,
+                                historyFloorMs() > 0, effectiveFreshFloor,
+                                intervalMs, alignment, prefixMarker, prefixError)) {
+                            throw std::runtime_error(fmt::format(
+                                "Cannot reconcile archived MEXC Spot prefix state: {}", prefixError));
+                        }
                         if (prefixMarker &&
                             (prefixMarker->intervalMs != intervalMs ||
                              prefixMarker->alignment != alignment)) {
@@ -576,14 +589,24 @@ void MEXCSpotDownloader::updateMarketData(const std::string &dirPath, const std:
                             return symbolFilePathCsv;
                         }
 
+                        const auto freshFromTimeStamp = tail.foundValid
+                            ? tail.timestamp
+                            : mexc_staging::firstPeriodOpenAtOrAfter(
+                                tail.timestamp, intervalMs, alignment);
                         const auto actualFromTimeStamp = rebuildPrefix
                             ? prefixMarker->requestedStart
                             : (!currentCsv.hasData && prefixMarker
                                 ? prefixMarker->requestedStart
                                 : (tail.foundValid
                                     ? mexc_staging::nextTimestamp(tail.timestamp, intervalMs, alignment)
-                                    : tail.timestamp));
+                                    : freshFromTimeStamp));
                         if (actualFromTimeStamp > lastCompletedOpen) {
+                            if (!currentCsv.hasData && historyFloorMs() > 0) {
+                                spdlog::info(fmt::format(
+                                    "Symbol {}: --since is newer than the last completed MEXC Spot candle; nothing to download yet",
+                                    symbol));
+                                return {};
+                            }
                             throw std::runtime_error("Invalid MEXC Spot download range");
                         }
 

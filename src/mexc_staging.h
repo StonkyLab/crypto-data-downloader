@@ -270,6 +270,41 @@ inline bool removePrefixMarker(const std::filesystem::path &csvPath, std::string
     return true;
 }
 
+/**
+ * An unresolved-prefix marker describes the CSV that was published beside it.
+ * An explicit --since becomes the authoritative prefix boundary after an
+ * archive operation: an orphaned marker is removed, a retained suffix already
+ * reaching the floor needs no marker, and a suffix beginning after the floor
+ * gets an atomically rebased marker.  Existing rows are never removed.
+ */
+inline bool reconcilePrefixForExplicitFloor(
+        const std::filesystem::path &csvPath,
+        const std::optional<std::int64_t> csvFirstTimestamp,
+        const bool explicitFloorConfigured, const std::int64_t effectiveFloor,
+        const std::int64_t intervalMs, const Alignment alignment,
+        std::optional<PrefixMarker> &marker, std::string &error) {
+    if (!explicitFloorConfigured || !marker) {
+        return true;
+    }
+
+    if (!csvFirstTimestamp || *csvFirstTimestamp <= effectiveFloor) {
+        if (!removePrefixMarker(csvPath, error)) {
+            return false;
+        }
+        marker.reset();
+        return true;
+    }
+
+    const PrefixMarker rebased{1, effectiveFloor, intervalMs, alignment};
+    if (*marker != rebased) {
+        if (!writePrefixMarker(csvPath, rebased, error)) {
+            return false;
+        }
+        marker = rebased;
+    }
+    return true;
+}
+
 inline bool requirePrefixMarkerForPublication(const std::filesystem::path &csvPath,
                                               const Manifest &manifest,
                                               std::string &error) {
@@ -324,6 +359,17 @@ inline std::int64_t currentPeriodOpen(const std::int64_t timestampMs, const std:
     }
 
     return (timestampMs / intervalMs) * intervalMs;
+}
+
+/** First aligned candle open that is not older than an inclusive raw floor. */
+inline std::int64_t firstPeriodOpenAtOrAfter(const std::int64_t timestampMs,
+                                             const std::int64_t intervalMs,
+                                             const Alignment alignment) {
+    if (timestampMs < 0 || intervalMs <= 0) {
+        throw std::invalid_argument("invalid MEXC candle floor");
+    }
+    const auto current = currentPeriodOpen(timestampMs, intervalMs, alignment);
+    return current == timestampMs ? current : nextTimestamp(current, intervalMs, alignment);
 }
 
 inline bool isAlignedTimestamp(const std::int64_t timestampMs, const std::int64_t intervalMs,

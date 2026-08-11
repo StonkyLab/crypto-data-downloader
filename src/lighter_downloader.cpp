@@ -11,6 +11,7 @@ Copyright (c) 2026 Vitezslav Kot <vitezslav.kot@stonky.cz>, Stonky s.r.o.
 #include "stonky/atomic_file.h"
 #include "stonky/csv_data.h"
 #include "stonky/csv_format.h"
+#include "stonky/download_resume.h"
 #include "stonky/downloader.h"
 #include "stonky/future_utils.h"
 #include "stonky/lighter/lighter_rest_client.h"
@@ -41,18 +42,20 @@ struct LighterDownloader::P {
     static bool writeCSVCandlesToZorroT6File(const std::string &csvPath, const std::string &t6Path,
                                              lighter::CandleInterval interval);
 
-    static int64_t checkSymbolCSVFile(const std::string &path);
+    static DownloadResume checkSymbolCSVFile(const std::string &path);
 
-    static bool writeCandlesToCSVFile(const std::vector<Candle> &candles, const std::string &path, std::int64_t lastTs);
+    static bool writeCandlesToCSVFile(const std::vector<Candle> &candles, const std::string &path,
+                                      DownloadResume resume);
 
     static bool readCandlesFromCSVFile(const std::string &path, std::vector<Candle> &candles);
 
     void convertFromCSVToT6(const std::vector<std::filesystem::path> &filePaths, const std::string &outDirPath,
                             lighter::CandleInterval interval) const;
 
-    static int64_t checkFundingRatesCSVFile(const std::string &path);
+    static DownloadResume checkFundingRatesCSVFile(const std::string &path);
 
-    static bool writeFundingRatesToCSVFile(const std::vector<FundingRate> &fr, const std::string &path);
+    static bool writeFundingRatesToCSVFile(const std::vector<FundingRate> &fr, const std::string &path,
+                                           DownloadResume resume);
 
     static std::unique_ptr<RESTClient> makeClient() {
         // Read optional Lighter authentication from environment.
@@ -209,7 +212,7 @@ void LighterDownloader::P::convertFromCSVToT6(const std::vector<std::filesystem:
 }
 
 bool LighterDownloader::P::writeCandlesToCSVFile(const std::vector<Candle> &candles, const std::string &path,
-                                                  std::int64_t lastTs) {
+                                                  DownloadResume resume) {
     const std::filesystem::path pathToCSVFile{path};
 
     std::ofstream ofs;
@@ -232,8 +235,7 @@ bool LighterDownloader::P::writeCandlesToCSVFile(const std::vector<Candle> &cand
     }
 
     for (const auto &candle: candles) {
-        // <= guards against any overlap with already-persisted data
-        if (candle.openTime <= lastTs) {
+        if (!shouldPersistTimestamp(candle.openTime, resume)) {
             continue;
         }
         ofs << candle.openTime << ",";
@@ -242,6 +244,7 @@ bool LighterDownloader::P::writeCandlesToCSVFile(const std::vector<Candle> &cand
         ofs << csvNumber(candle.low) << ",";
         ofs << csvNumber(candle.close) << ",";
         ofs << csvNumber(candle.baseVolume) << std::endl;
+        resume = {candle.openTime, true};
     }
 
     ofs.flush();
@@ -254,20 +257,21 @@ bool LighterDownloader::P::writeCandlesToCSVFile(const std::vector<Candle> &cand
     return ofs.good();
 }
 
-int64_t LighterDownloader::P::checkSymbolCSVFile(const std::string &path) {
+DownloadResume LighterDownloader::P::checkSymbolCSVFile(const std::string &path) {
     const std::int64_t oldestLighterDate = historyFloor(1704067200000LL); /// Monday 1. January 2024 0:00:00
     // Self-healing read: a torn tail (interrupted write) is truncated instead of
     // resetting the resume point to the oldest-date sentinel.
-    return CsvData::lastValidRecord(path, 6, oldestLighterDate).timestamp;
+    return downloadResume(CsvData::lastValidRecord(path, 6, oldestLighterDate));
 }
 
-int64_t LighterDownloader::P::checkFundingRatesCSVFile(const std::string &path) {
+DownloadResume LighterDownloader::P::checkFundingRatesCSVFile(const std::string &path) {
     const std::int64_t oldestLighterDate = historyFloor(1704067200000LL); /// Monday 1. January 2024 0:00:00
-    return CsvData::lastValidRecord(path, 2, oldestLighterDate).timestamp;
+    return downloadResume(CsvData::lastValidRecord(path, 2, oldestLighterDate));
 }
 
 bool LighterDownloader::P::writeFundingRatesToCSVFile(const std::vector<FundingRate> &fr,
-                                                       const std::string &path) {
+                                                       const std::string &path,
+                                                       DownloadResume resume) {
     const std::filesystem::path pathToCSVFile{path};
 
     std::ofstream ofs;
@@ -290,8 +294,12 @@ bool LighterDownloader::P::writeFundingRatesToCSVFile(const std::vector<FundingR
     }
 
     for (const auto &record: fr) {
+        if (!shouldPersistTimestamp(record.fundingTime, resume)) {
+            continue;
+        }
         ofs << record.fundingTime << ",";
         ofs << csvNumber(record.fundingRate) << std::endl;
+        resume = {record.fundingTime, true};
     }
 
     ofs.flush();
@@ -436,6 +444,7 @@ void LighterDownloader::updateMarketData(const std::string &dirPath,
                                       msg.find("rate limit") != std::string::npos;
                            };
                            const std::int64_t oldestLighterDate = historyFloor(1704067200000LL);
+                           const auto initialResume = P::checkSymbolCSVFile(symbolFilePathCsv.string());
 
                            // Discover the market's listing date with a single cheap 1d probe.
                            // Lighter retains full per-market history at all resolutions, so the
@@ -447,13 +456,18 @@ void LighterDownloader::updateMarketData(const std::string &dirPath,
                            // (one batch step is 500 days for 1d, so from=0 would mean ~41 wasted
                            // requests scanning 1970→2024 before the first real candle).
                            // Probe is skipped when the CSV already has data (we resume from CSV).
-                           int64_t listingDate = nowTimestamp;
-                           if (P::checkSymbolCSVFile(symbolFilePathCsv.string()) == oldestLighterDate) {
+                           int64_t listingDate = initialResume.timestamp;
+                           if (!initialResume.hasSavedRecord) {
                                constexpr int probeRetries = 5;
+                               constexpr int64_t dayMs = 24LL * 60 * 60 * 1000;
+                               // A raw millisecond --since may be midday. The daily probe must
+                               // include that day's candle; the real-resolution download below
+                               // is still bounded by the exact (unrounded) --since value.
+                               const int64_t probeFrom = floorTimestamp(oldestLighterDate, dayMs);
                                for (int attempt = 0; attempt < probeRetries; ++attempt) {
                                    try {
                                        const auto probe = m_p->ltClient->getHistoricalPrices(
-                                           symbol, lighter::CandleInterval::_1d, oldestLighterDate, nowTimestamp);
+                                           symbol, lighter::CandleInterval::_1d, probeFrom, nowTimestamp);
                                        // An empty but valid response is not an authoritative listing
                                        // date. Starting at the venue floor is slower, but cannot
                                        // permanently truncate a newly-created CSV.
@@ -478,21 +492,20 @@ void LighterDownloader::updateMarketData(const std::string &dirPath,
                            for (int attempt = 0; attempt < maxRetries; ++attempt) {
                                // Re-read CSV state at start of each attempt — a previous attempt
                                // may have written batches to disk before hitting a 429.
-                               const int64_t fromTimeStamp = P::checkSymbolCSVFile(symbolFilePathCsv.string());
-                               const int64_t effectiveFrom = (fromTimeStamp == oldestLighterDate)
-                                   ? listingDate
-                                   : fromTimeStamp;
+                               const auto resume = P::checkSymbolCSVFile(symbolFilePathCsv.string());
+                               const int64_t effectiveFrom = freshDownloadStart(resume, listingDate);
                                try {
                                    std::ignore = m_p->ltClient->getHistoricalPrices(
                                        symbol, ltInterval, effectiveFrom, nowTimestamp,
-                                       [symbolFilePathCsv, symbol, fromTimeStamp](
+                                       [symbolFilePathCsv, symbol](
                                        const std::vector<lighter::Candle> &cnd) {
                                            // Zero-volume bars are stored as-is: Lighter serves a continuous
                                            // series (~44% of bars on quieter markets carry v=0) and no-trade
                                            // bars are needed downstream (MTM, funding, SL triggers).
                                            if (!cnd.empty()) {
+                                               const auto persisted = P::checkSymbolCSVFile(symbolFilePathCsv.string());
                                                if (!P::writeCandlesToCSVFile(cnd, symbolFilePathCsv.string(),
-                                                                             fromTimeStamp)) {
+                                                                             persisted)) {
                                                    // Abort pagination — continuing after a failed batch write
                                                    // would leave a permanent gap inside the CSV.
                                                    throw std::runtime_error(
@@ -708,16 +721,12 @@ void LighterDownloader::updateFundingRateData(const std::string &dirPath,
                            for (int attempt = 0; attempt < maxRetries; ++attempt) {
                                // Re-read CSV state at start of each attempt — a previous attempt
                                // may have written rows to disk before hitting a 429.
-                               const int64_t fromTimeStamp = P::checkFundingRatesCSVFile(symbolFilePathCsv.string());
+                               const auto resume = P::checkFundingRatesCSVFile(symbolFilePathCsv.string());
                                try {
-                                   const auto fr = m_p->ltClient->getFundingRates(symbol, fromTimeStamp + 1,
+                                   const auto fr = m_p->ltClient->getFundingRates(symbol, requestStartTimestamp(resume),
                                                                                    nowTimestamp);
                                    if (!fr.empty()) {
-                                       if (fr.size() == 1 && fromTimeStamp == fr.front().fundingTime) {
-                                           spdlog::info(fmt::format("CSV file for symbol: {} updated", symbol));
-                                           return symbolFilePathCsv;
-                                       }
-                                       if (P::writeFundingRatesToCSVFile(fr, symbolFilePathCsv.string())) {
+                                       if (P::writeFundingRatesToCSVFile(fr, symbolFilePathCsv.string(), resume)) {
                                            spdlog::info(fmt::format("CSV file for symbol: {} updated", symbol));
                                            return symbolFilePathCsv;
                                        }

@@ -90,6 +90,16 @@ int main() {
         std::cerr << "Calendar-month MEXC boundary is incorrect\n";
         ok = false;
     }
+    if (firstPeriodOpenAtOrAfter(2 * minute, minute, Alignment::Fixed) != 2 * minute ||
+        firstPeriodOpenAtOrAfter(2 * minute + 1, minute, Alignment::Fixed) != 3 * minute ||
+        firstPeriodOpenAtOrAfter(utcMs(2026, 8, 9), week, Alignment::WeekMonday) !=
+            utcMs(2026, 8, 10) ||
+        firstPeriodOpenAtOrAfter(
+            utcMs(2026, 8, 29), 30LL * 24 * 60 * 60 * 1000,
+            Alignment::CalendarMonth) != utcMs(2026, 9, 1)) {
+        std::cerr << "Raw MEXC --since floor was not rounded to a safe inclusive candle open\n";
+        ok = false;
+    }
     if (missingCandleSlotsAfter(2 * minute, 5 * minute, minute, Alignment::Fixed) != 3 ||
         missingCandleSlotsAfter(utcMs(2024, 1, 1), utcMs(2024, 4, 1),
                                 30LL * 24 * 60 * 60 * 1000,
@@ -125,6 +135,73 @@ int main() {
     if (!inspectCsvTail(tmp.path() / "missing.csv", header, absentTail, error, minute,
                         Alignment::Fixed) || absentTail.hasData || absentTail.size != 0) {
         std::cerr << "Missing CSV was not treated as an empty base: " << error << '\n';
+        ok = false;
+    }
+
+    // A candle prefix marker belongs to the live CSV beside it.  An explicit
+    // archival floor removes an orphan/covered marker and rebases a retained
+    // suffix marker so it can never resurrect history older than --since.
+    const auto archivedCsv = tmp.path() / "ARCHIVED.csv";
+    std::optional<PrefixMarker> archivedMarker{
+        PrefixMarker{1, minute, minute, Alignment::Fixed}};
+    if (!writePrefixMarker(archivedCsv, *archivedMarker, error) ||
+        !reconcilePrefixForExplicitFloor(
+            archivedCsv, std::nullopt, true, 10 * minute, minute,
+            Alignment::Fixed, archivedMarker, error) || archivedMarker ||
+        std::filesystem::exists(prefixMarkerPath(archivedCsv))) {
+        std::cerr << "Orphaned MEXC prefix marker survived an explicit fresh floor: "
+                  << error << '\n';
+        ok = false;
+    }
+
+    const auto coveredCsv = tmp.path() / "COVERED.csv";
+    std::optional<PrefixMarker> coveredMarker{
+        PrefixMarker{1, minute, minute, Alignment::Fixed}};
+    if (!writePrefixMarker(coveredCsv, *coveredMarker, error) ||
+        !reconcilePrefixForExplicitFloor(
+            coveredCsv, 9 * minute, true, 10 * minute, minute,
+            Alignment::Fixed, coveredMarker, error) || coveredMarker ||
+        std::filesystem::exists(prefixMarkerPath(coveredCsv))) {
+        std::cerr << "Covered MEXC prefix marker was not retired at --since: "
+                  << error << '\n';
+        ok = false;
+    }
+
+    const auto suffixCsv = tmp.path() / "SUFFIX.csv";
+    std::optional<PrefixMarker> suffixMarker{
+        PrefixMarker{1, minute, 5 * minute, Alignment::CalendarMonth}};
+    if (!writePrefixMarker(suffixCsv, *suffixMarker, error) ||
+        !reconcilePrefixForExplicitFloor(
+            suffixCsv, 20 * minute, true, 10 * minute, minute,
+            Alignment::Fixed, suffixMarker, error) ||
+        !suffixMarker ||
+        *suffixMarker != PrefixMarker{1, 10 * minute, minute, Alignment::Fixed}) {
+        std::cerr << "Retained MEXC suffix marker was not rebased to --since: "
+                  << error << '\n';
+        ok = false;
+    } else {
+        std::optional<PrefixMarker> storedRebasedMarker;
+        if (!readPrefixMarker(suffixCsv, storedRebasedMarker, error) ||
+            storedRebasedMarker != suffixMarker) {
+            std::cerr << "Rebased MEXC suffix marker was not persisted atomically: "
+                      << error << '\n';
+            ok = false;
+        }
+    }
+
+    constexpr std::int64_t fundingDefault = 100;
+    constexpr std::int64_t fundingSince = 250;
+    if (stonky::mexc_funding_csv::downloadCutoff(
+            false, 0, fundingDefault, fundingSince) != fundingSince ||
+        stonky::mexc_funding_csv::downloadCutoff(
+            true, 50, fundingDefault, fundingSince) != 50 ||
+        stonky::mexc_funding_csv::downloadCutoff(
+            true, 200, fundingDefault, fundingSince) != fundingDefault ||
+        !stonky::mexc_funding_csv::atOrAfterDownloadCutoff(fundingSince, fundingSince) ||
+        stonky::mexc_funding_csv::atOrAfterDownloadCutoff(fundingSince - 1, fundingSince) ||
+        !stonky::mexc_funding_csv::emptyDownloadIsNoOp(true) ||
+        stonky::mexc_funding_csv::emptyDownloadIsNoOp(false)) {
+        std::cerr << "MEXC funding --since skipped an existing tail or its inclusive boundary\n";
         ok = false;
     }
 
@@ -828,6 +905,12 @@ int main() {
     }
 
     using stonky::mexc_funding_pagination::ScanDecision;
+    if (!stonky::mexc_funding_pagination::validatedPageCrossesCutoff(249, 250) ||
+        stonky::mexc_funding_pagination::validatedPageCrossesCutoff(250, 250) ||
+        stonky::mexc_funding_pagination::validatedPageCrossesCutoff(251, 250)) {
+        std::cerr << "MEXC funding cutoff pagination stopped before retaining equality\n";
+        ok = false;
+    }
     if (stonky::mexc_funding_pagination::decideScanProgress(true, false, 1, 1) !=
             ScanDecision::RejectMissingBaseOverlap ||
         stonky::mexc_funding_pagination::decideScanProgress(true, true, 1, 3) !=

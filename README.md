@@ -124,6 +124,11 @@ timestamp fail closed. The marker is removed only after a positive scan reaches
 the originally requested start. Negative probes never silently declare a
 shortened history complete.
 
+When an explicit `--since` is supplied after archiving, an orphan marker whose
+CSV was removed is retired. If a live suffix and marker remain, the marker is
+rebased to the first candle boundary at or after the new floor, so recovery can
+fill a wanted gap but cannot restore intentionally archived rows before it.
+
 The regular `*.lock` files are persistent lock identities and are not stale just
 because they remain on disk; ownership is held and released by the operating
 system, including after a killed process. A directory at one of these lock paths
@@ -276,6 +281,7 @@ crypto_data_downloader [OPTIONS]
 | `-z` | `--t6_conversion` | Convert existing CSV data to T6 format (Zorro Trader) without downloading | - |
 | `-g` | `--aggregate` | Aggregate the `-b` bar size into coarser timeframes (comma-separated minutes) without downloading | - |
 | - | `--allow_partial_aggregation` | Emit a partial coarse candle from the available valid source bars; by default an incomplete bucket alone is skipped | - |
+| - | `--since` | Earliest UTC date (`YYYY-MM-DD`) or epoch-millisecond timestamp for a symbol with no usable local CSV | - |
 | `-x` | `--xperp` | OKX only: download X-Perps instead of USDT swaps, into `<output>/xperp/` | - |
 | `-y` | `--verify` | Verify CSV data integrity (torn lines, duplicates, ordering, gaps) without downloading | - |
 | `-r` | `--repair` | Verify and repair CSV data files in place | - |
@@ -303,6 +309,24 @@ crypto_data_downloader [OPTIONS]
 ```bash
 ./crypto_data_downloader -e okx -t fr -o /data/okx
 ```
+
+**Continue with a bounded live history after archiving old CSV files:**
+```bash
+./crypto_data_downloader -e okx -o /data/okx --since 2024-01-01
+```
+
+`--since` is used only when a symbol's active CSV is missing, empty or contains
+only its header. A CSV that still contains records always resumes after its own
+tail, even when that tail is older than `--since`, so the option cannot create a
+gap in existing live data. The first available record whose timestamp is equal
+to the fresh floor is included. Dates are interpreted as midnight UTC and must
+be an exact, valid `YYYY-MM-DD`; epoch milliseconds must contain decimal digits
+only. Future timestamps and the Unix epoch itself are rejected.
+
+For OKX `all` mode, individually compressed files named
+`<symbol>.csv.gz`, `.csv.xz`, `.csv.bz2` or `.csv.zst` still identify delisted
+symbols after the live CSV is removed. Container archives such as `tar.gz` or
+ZIP files are not inspected; pass those symbols explicitly with `-s` or `-a`.
 
 **Download OKX perpetual candles and build 5m/1h from them:**
 ```bash
