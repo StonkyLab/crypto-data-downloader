@@ -91,3 +91,8 @@ All notable changes to this project will be documented in this file. This projec
 - Accept non-ASCII exchange symbols again. The 2.6.1 symbol validation allowed only ASCII letters, digits, `_` and `-`, so Binance perpetuals with CJK names (币安人生USDT, 龙虾USDT — on disk in this dataset for years) were rejected as "unsafe", and because validation threw over the whole list, one such symbol aborted the entire exchange run. The check now rejects only what genuinely cannot be a file name: empty, `.`/`..`, path separators, control bytes, Windows-reserved punctuation and names over 240 bytes
 - A rejected symbol is skipped with an error instead of aborting the run; filtering a non-empty list down to nothing still fails, because an empty list means "the whole exchange" downstream and that silent flip would be worse than stopping
 
+## [2.7.0](https://github.com/vitakot/crypto_data_downloader/releases/tag/v2.7.0) (2026-08-11)
+- Add `--since YYYY-MM-DD` (or milliseconds): the oldest date a symbol without local data may reach for. Intended for the point where old years are archived off the server — without it every fresh symbol pulls the full history back in
+- The floor applies only where there is no usable local data: the fallback for a missing/empty/header-only CSV, the lower bound of Lighter's listing-date probe and the cutoff of a first MEXC funding scan. A file that already holds records always resumes from its own tail, so `--since` cannot skip forward over stored data and open a gap
+- Route all eight downloaders' hardcoded oldest-history constants through one shared `historyFloor()` policy instead of fifteen separate copies
+

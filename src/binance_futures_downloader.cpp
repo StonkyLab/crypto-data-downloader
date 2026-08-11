@@ -7,6 +7,7 @@ Copyright (c) 2025 Vitezslav Kot <vitezslav.kot@stonky.cz>, Stonky s.r.o.
 */
 
 #include "stonky/binance/binance_futures_downloader.h"
+#include "stonky/history_floor.h"
 #include "stonky/binance/binance_futures_rest_client.h"
 #include "stonky/binance/binance_common.h"
 #include "stonky/csv_data.h"
@@ -61,7 +62,7 @@ BinanceFuturesDownloader::BinanceFuturesDownloader(std::uint32_t maxJobs, bool d
 BinanceFuturesDownloader::~BinanceFuturesDownloader() = default;
 
 int64_t BinanceFuturesDownloader::P::checkFundingRatesCSVFile(const std::string &path) {
-    constexpr int64_t oldestBNBDate = 1420070400000; /// Thursday 1. January 2015 0:00:00
+    const std::int64_t oldestBNBDate = historyFloor(1420070400000LL); /// Thursday 1. January 2015 0:00:00
     // Self-healing read: a torn tail (interrupted write) is truncated instead of
     // resetting the resume point to oldestBNBDate.
     return CsvData::lastValidRecord(path, 2, oldestBNBDate).timestamp;

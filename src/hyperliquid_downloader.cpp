@@ -7,6 +7,7 @@ Copyright (c) 2025 Vitezslav Kot <vitezslav.kot@stonky.cz>, Stonky s.r.o.
 */
 
 #include "stonky/hyperliquid/hyperliquid_downloader.h"
+#include "stonky/history_floor.h"
 #include "stonky/atomic_file.h"
 #include "stonky/csv_data.h"
 #include "stonky/csv_format.h"
@@ -201,14 +202,14 @@ bool HyperliquidDownloader::P::writeCandlesToCSVFile(const std::vector<Candle> &
 }
 
 int64_t HyperliquidDownloader::P::checkSymbolCSVFile(const std::string &path) {
-    constexpr int64_t oldestHyperliquidDate = 1672531200000; /// Sunday 1. January 2023 0:00:00
+    const std::int64_t oldestHyperliquidDate = historyFloor(1672531200000LL); /// Sunday 1. January 2023 0:00:00
     // Self-healing read: a torn tail (interrupted write) is truncated instead of
     // resetting the resume point to the oldest-date sentinel.
     return CsvData::lastValidRecord(path, 6, oldestHyperliquidDate).timestamp;
 }
 
 int64_t HyperliquidDownloader::P::checkFundingRatesCSVFile(const std::string &path) {
-    constexpr int64_t oldestHyperliquidDate = 1672531200000; /// Sunday 1. January 2023 0:00:00
+    const std::int64_t oldestHyperliquidDate = historyFloor(1672531200000LL); /// Sunday 1. January 2023 0:00:00
     return CsvData::lastValidRecord(path, 2, oldestHyperliquidDate).timestamp;
 }
 
@@ -379,7 +380,7 @@ void HyperliquidDownloader::updateMarketData(const std::string &dirPath,
                                       msg.find("429") != std::string::npos ||
                                       msg.find("rate limit") != std::string::npos;
                            };
-                           constexpr int64_t oldestHyperliquidDate = 1672531200000LL;
+                           const std::int64_t oldestHyperliquidDate = historyFloor(1672531200000LL);
                            constexpr int maxRetries = 5;
                            for (int attempt = 0; attempt < maxRetries; ++attempt) {
                                // Re-read CSV state at start of each attempt — a previous attempt

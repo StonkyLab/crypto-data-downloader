@@ -7,6 +7,7 @@ Copyright (c) 2025 Vitezslav Kot <vitezslav.kot@stonky.cz>, Stonky s.r.o.
 */
 
 #include "stonky/okx/okx_downloader.h"
+#include "stonky/history_floor.h"
 #include "stonky/atomic_file.h"
 #include "stonky/csv_data.h"
 #include "stonky/csv_format.h"
@@ -409,7 +410,7 @@ bool OKXDownloader::P::writeCandlesToCSVFile(const std::vector<Candle> &candles,
 }
 
 CsvData::TailCheck OKXDownloader::P::checkSymbolCSVFile(const std::string &path) {
-    constexpr int64_t oldestBybitDate = 1420070400000; /// Thursday 1. January 2015 0:00:00
+    const std::int64_t oldestBybitDate = historyFloor(1420070400000LL); /// Thursday 1. January 2015 0:00:00
     // Self-healing read: a torn tail (interrupted write) is truncated instead of
     // resetting the resume point to the oldest-date sentinel, which used to
     // silently re-download and append the entire history.
@@ -417,7 +418,7 @@ CsvData::TailCheck OKXDownloader::P::checkSymbolCSVFile(const std::string &path)
 }
 
 CsvData::TailCheck OKXDownloader::P::checkFundingRatesCSVFile(const std::string &path) {
-    constexpr int64_t oldestDate = 1420070400000; /// Thursday 1. January 2015 0:00:00
+    const std::int64_t oldestDate = historyFloor(1420070400000LL); /// Thursday 1. January 2015 0:00:00
     return CsvData::lastValidRecord(path, 2, oldestDate);
 }
 

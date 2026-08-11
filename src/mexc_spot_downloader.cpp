@@ -7,6 +7,7 @@ Copyright (c) 2026 Vitezslav Kot <vitezslav.kot@stonky.cz>, Stonky s.r.o.
 */
 
 #include "stonky/mexc/mexc_spot_downloader.h"
+#include "stonky/history_floor.h"
 #include "stonky/atomic_file.h"
 #include "stonky/csv_format.h"
 #include "stonky/csv_data.h"
@@ -224,7 +225,7 @@ CsvData::TailCheck MEXCSpotDownloader::P::checkSymbolCSVFile(const std::string &
     // Default to January 1, 2020 (same as Futures)
     // For newly listed tokens or intervals with limited history, backward pagination
     // will stop when API returns empty results
-    constexpr int64_t defaultStartDate = 1577836800000; // Wednesday 1. January 2020 0:00:00
+    const std::int64_t defaultStartDate = historyFloor(1577836800000LL); // Wednesday 1. January 2020 0:00:00
     // Self-healing read: a torn tail (interrupted write) is truncated instead of
     // resetting the resume point to the default start date.
     return CsvData::lastValidRecord(path, 7, defaultStartDate);

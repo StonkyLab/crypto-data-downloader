@@ -7,6 +7,7 @@ Copyright (c) 2026 Vitezslav Kot <vitezslav.kot@stonky.cz>, Stonky s.r.o.
 */
 
 #include "stonky/lighter/lighter_downloader.h"
+#include "stonky/history_floor.h"
 #include "stonky/atomic_file.h"
 #include "stonky/csv_data.h"
 #include "stonky/csv_format.h"
@@ -254,14 +255,14 @@ bool LighterDownloader::P::writeCandlesToCSVFile(const std::vector<Candle> &cand
 }
 
 int64_t LighterDownloader::P::checkSymbolCSVFile(const std::string &path) {
-    constexpr int64_t oldestLighterDate = 1704067200000; /// Monday 1. January 2024 0:00:00
+    const std::int64_t oldestLighterDate = historyFloor(1704067200000LL); /// Monday 1. January 2024 0:00:00
     // Self-healing read: a torn tail (interrupted write) is truncated instead of
     // resetting the resume point to the oldest-date sentinel.
     return CsvData::lastValidRecord(path, 6, oldestLighterDate).timestamp;
 }
 
 int64_t LighterDownloader::P::checkFundingRatesCSVFile(const std::string &path) {
-    constexpr int64_t oldestLighterDate = 1704067200000; /// Monday 1. January 2024 0:00:00
+    const std::int64_t oldestLighterDate = historyFloor(1704067200000LL); /// Monday 1. January 2024 0:00:00
     return CsvData::lastValidRecord(path, 2, oldestLighterDate).timestamp;
 }
 
@@ -434,7 +435,7 @@ void LighterDownloader::updateMarketData(const std::string &dirPath,
                                       msg.find("captcha") != std::string::npos ||
                                       msg.find("rate limit") != std::string::npos;
                            };
-                           constexpr int64_t oldestLighterDate = 1704067200000LL;
+                           const std::int64_t oldestLighterDate = historyFloor(1704067200000LL);
 
                            // Discover the market's listing date with a single cheap 1d probe.
                            // Lighter retains full per-market history at all resolutions, so the

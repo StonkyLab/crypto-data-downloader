@@ -7,6 +7,7 @@ Copyright (c) 2025 Vitezslav Kot <vitezslav.kot@stonky.cz>, Stonky s.r.o.
 */
 
 #include "stonky/binance/binance_common.h"
+#include "stonky/history_floor.h"
 #include "stonky/binance/binance_models.h"
 #include "stonky/atomic_file.h"
 #include "stonky/csv_data.h"
@@ -198,7 +199,7 @@ std::size_t BinanceCommon::downloadCandlesToCSVFile(const CandlePageFetcher &fet
 }
 
 int64_t BinanceCommon::checkSymbolCSVFile(const std::string &path) {
-    constexpr int64_t oldestBNBDate = 1420070400000; /// Thursday 1. January 2015 0:00:00
+    const std::int64_t oldestBNBDate = historyFloor(1420070400000LL); /// Thursday 1. January 2015 0:00:00
     // Self-healing read: a torn tail (interrupted write) is truncated instead of
     // resetting the resume point to oldestBNBDate, which used to silently
     // re-download and append the entire history.

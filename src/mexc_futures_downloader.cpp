@@ -7,6 +7,7 @@ Copyright (c) 2026 Vitezslav Kot <vitezslav.kot@stonky.cz>, Stonky s.r.o.
 */
 
 #include "stonky/mexc/mexc_futures_downloader.h"
+#include "stonky/history_floor.h"
 #include "stonky/atomic_file.h"
 #include "stonky/csv_format.h"
 #include "stonky/csv_data.h"
@@ -225,7 +226,7 @@ void MEXCFuturesDownloader::P::convertFromCSVToT6(const std::vector<std::filesys
 }
 
 CsvData::TailCheck MEXCFuturesDownloader::P::checkSymbolCSVFile(const std::string &path) {
-    constexpr int64_t oldestDate = 1577836800000; // Wednesday 1. January 2020 0:00:00
+    const std::int64_t oldestDate = historyFloor(1577836800000LL); // Wednesday 1. January 2020 0:00:00
     // Self-healing read: a torn tail (interrupted write) is truncated instead of
     // resetting the resume point to the oldest-date sentinel.
     return CsvData::lastValidRecord(path, 7, oldestDate);
@@ -1014,7 +1015,7 @@ void MEXCFuturesDownloader::updateFundingRateData(const std::string &dirPath, co
                         }
                     }
 
-                    constexpr std::int64_t oldestDate = 1577836800000; // 2020-01-01 UTC
+                    const std::int64_t oldestDate = historyFloor(1577836800000LL); // 2020-01-01 UTC
                     const std::int64_t cutoffTimestamp = oldestDate;
 
                     std::vector<HistoricalFundingRate> newRates;

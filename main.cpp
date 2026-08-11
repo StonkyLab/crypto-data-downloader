@@ -14,6 +14,8 @@ Copyright (c) 2025 Vitezslav Kot <vitezslav.kot@stonky.cz>, Stonky s.r.o.
 #include "stonky/hyperliquid/hyperliquid_downloader.h"
 #include "stonky/lighter/lighter_downloader.h"
 #include "stonky/candle_aggregator.h"
+#include "stonky/history_floor.h"
+#include "stonky/utils/utils.h"
 #include "stonky/csv_verifier.h"
 #include "stonky/downloader.h"
 #include "stonky/binance/binance_spot_downloader.h"
@@ -24,12 +26,14 @@ Copyright (c) 2025 Vitezslav Kot <vitezslav.kot@stonky.cz>, Stonky s.r.o.
 #include <spdlog/sinks/rotating_file_sink.h>
 #include <algorithm>
 #include "csv.h"
+#include <iomanip>
+#include <sstream>
 #include <iostream>
 #include <memory>
 
 #undef max
 
-#define VERSION "2.6.2"
+#define VERSION "2.7.0"
 
 using namespace stonky;
 
@@ -117,6 +121,8 @@ int main(int argc, char **argv) {
             ("g,aggregate", R"(Aggregate the existing -b bar size into coarser timeframes (minutes, comma separated) without downloading, example: -o /data/okx -b 1 -g 5,60. OKX only publishes 1m bars in its bulk archive, so higher timeframes are built locally)",
              cxxopts::value<std::vector<std::string> >()->default_value(""))
             ("allow_partial_aggregation", R"(Emit a partial coarse candle from available valid source bars; by default only the affected incomplete bucket is skipped)")
+            ("since", R"(Oldest date to fetch for symbols that have no local data yet, as YYYY-MM-DD (UTC) or milliseconds since epoch, example: --since 2026-01-01. A file that already holds records always resumes from its own tail, so this can never skip over stored data and open a gap. Use after archiving old years away to stop fresh symbols pulling the full history back in)",
+             cxxopts::value<std::string>()->default_value(""))
             ("x,xperp", R"(OKX only: download X-Perps (USD-settled perpetual-style futures, instType FUTURES / ruleType xperp) instead of USDT swaps. Data land in <output>/xperp/. Their funding rates come from the REST endpoint only, which serves ~3 months)")
             ("y,verify", R"(Verify CSV data integrity (torn lines, duplicates, ordering, gaps) without downloading, example: -e bybit -o /data/bybit -b 1 -y)")
             ("r,repair", R"(Verify and repair CSV data files in place (removes torn lines and duplicates, restores ordering), example: -e bybit -o /data/bybit -b 1 -r)")
@@ -323,6 +329,35 @@ int main(int argc, char **argv) {
         keepDelistedData = !parseResult["delete_delisted"].as<bool>();
         verifyData = parseResult["verify"].as<bool>();
         repairData = parseResult["repair"].as<bool>();
+        if (const auto since = parseResult["since"].as<std::string>(); !since.empty()) {
+            std::int64_t sinceMs = 0;
+            if (since.find('-') != std::string::npos) {
+                std::tm tm{};
+                std::istringstream in(since);
+                in >> std::get_time(&tm, "%Y-%m-%d");
+                if (in.fail()) {
+                    spdlog::error(fmt::format("Invalid --since '{}': expected YYYY-MM-DD or milliseconds", since));
+                    return -1;
+                }
+                sinceMs = static_cast<std::int64_t>(mkgmtime(&tm)) * 1000;
+            } else {
+                try {
+                    sinceMs = std::stoll(since);
+                } catch (const std::exception &) {
+                    spdlog::error(fmt::format("Invalid --since '{}': expected YYYY-MM-DD or milliseconds", since));
+                    return -1;
+                }
+            }
+            if (sinceMs <= 0 || sinceMs > getMsTimestamp(currentTime()).count()) {
+                spdlog::error(fmt::format("--since '{}' is not a past date", since));
+                return -1;
+            }
+            setHistoryFloorMs(sinceMs);
+            spdlog::info(fmt::format("History floor set to {} UTC — symbols without local data start there; "
+                                     "existing files still resume from their own tail",
+                                     getDateTimeStringFromTimeStamp(sinceMs, "%Y-%m-%d %H:%M", true)));
+        }
+
         aggregateTargets = parseResult["aggregate"].as<std::vector<std::string> >();
         std::erase_if(aggregateTargets, [](const std::string &s) { return s.empty(); });
         allowPartialAggregation = parseResult["allow_partial_aggregation"].as<bool>();
