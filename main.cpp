@@ -29,7 +29,7 @@ Copyright (c) 2025 Vitezslav Kot <vitezslav.kot@stonky.cz>, Stonky s.r.o.
 
 #undef max
 
-#define VERSION "2.6.1"
+#define VERSION "2.6.2"
 
 using namespace stonky;
 

@@ -485,7 +485,6 @@ void OKXDownloader::updateMarketData(const std::string &dirPath,
 
     std::vector<std::future<std::filesystem::path> > futures;
     const std::filesystem::path finalPath(dirPath);
-    validateSymbolFileComponents(symbols);
     std::vector<std::string> symbolsToUpdate = symbols;
     std::vector<std::filesystem::path> csvFilePaths;
     std::vector<std::string> symbolsToDelete;
@@ -604,7 +603,7 @@ void OKXDownloader::updateMarketData(const std::string &dirPath,
     }
 
     deduplicatePreserveOrder(symbolsToUpdate);
-    validateSymbolFileComponents(symbolsToUpdate);
+    removeUnsafeSymbolFileComponents(symbolsToUpdate);
     if (onSymbolsToUpdateCB) {
         onSymbolsToUpdateCB(symbolsToUpdate);
     }
@@ -913,7 +912,6 @@ void OKXDownloader::updateFundingRateData(const std::string &dirPath,
                                           const onSymbolCompleted &onSymbolCompletedCB) const {
     std::vector<std::future<std::filesystem::path> > futures;
     const std::filesystem::path finalPath(dirPath);
-    validateSymbolFileComponents(symbols);
     std::vector<std::string> symbolsToUpdate = symbols;
     std::vector<std::filesystem::path> csvFilePaths;
     std::vector<std::string> symbolsToDelete;
@@ -1021,7 +1019,7 @@ void OKXDownloader::updateFundingRateData(const std::string &dirPath,
     }
 
     deduplicatePreserveOrder(symbolsToUpdate);
-    validateSymbolFileComponents(symbolsToUpdate);
+    removeUnsafeSymbolFileComponents(symbolsToUpdate);
     if (onSymbolsToUpdateCB) {
         onSymbolsToUpdateCB(symbolsToUpdate);
     }

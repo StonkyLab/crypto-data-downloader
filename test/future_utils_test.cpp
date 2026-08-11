@@ -19,20 +19,30 @@ int main() {
         return 1;
     }
 
-    try {
-        stonky::validateSymbolFileComponents({"BTCUSDT", "BTC-USD-SWAP", "ETH_USDT"});
-    } catch (const std::exception &error) {
-        std::cerr << "Safe exchange symbol was rejected: " << error.what() << '\n';
+    // Non-ASCII symbols are real: Binance lists perpetuals such as 币安人生USDT.
+    std::vector<std::string> safe{"BTCUSDT", "BTC-USD-SWAP", "ETH_USDT", "币安人生USDT", "10000SATSUSDT"};
+    if (stonky::removeUnsafeSymbolFileComponents(safe) != 0 || safe.size() != 5) {
+        std::cerr << "A safe exchange symbol was rejected\n";
         return 1;
     }
-    for (const std::string invalid: {"../BTC", "BTC/USDT", "/tmp/owned", ".", ""}) {
+    // A list reduced to nothing must throw: an empty list means "the whole
+    // exchange" downstream, and that silent flip would be worse than stopping.
+    for (const std::string invalid: {"../BTC", "BTC/USDT", "/tmp/owned", ".", "..", ""}) {
+        std::vector<std::string> lone{invalid};
         try {
-            stonky::validateSymbolFileComponents({invalid});
+            stonky::removeUnsafeSymbolFileComponents(lone);
             std::cerr << "Unsafe symbol was accepted: " << invalid << '\n';
             return 1;
         } catch (const std::invalid_argument &) {
             // Expected.
         }
+    }
+    // One bad entry must drop only itself, never abort the surrounding run.
+    std::vector<std::string> mixed{"BTCUSDT", "../evil", "龙虾USDT"};
+    if (stonky::removeUnsafeSymbolFileComponents(mixed) != 1 ||
+        mixed != std::vector<std::string>{"BTCUSDT", "龙虾USDT"}) {
+        std::cerr << "Filtering a mixed list did not keep exactly the safe symbols\n";
+        return 1;
     }
 
     Semaphore slots{2};

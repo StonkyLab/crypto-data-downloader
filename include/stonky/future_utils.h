@@ -10,6 +10,7 @@ Copyright (c) 2026 Vitezslav Kot <vitezslav.kot@stonky.cz>, Stonky s.r.o.
 #define INCLUDE_STONKY_FUTURE_UTILS_H
 
 #include "stonky/utils/semaphore.h"
+#include <spdlog/spdlog.h>
 #include <cstdint>
 #include <exception>
 #include <future>
@@ -123,28 +124,64 @@ void deduplicatePreserveOrder(std::vector<T> &values) {
     values.erase(out, values.end());
 }
 
+/**
+ * A symbol is unusable as a file-name component only when it could escape the
+ * data directory or break the filesystem: empty, "." / "..", path separators,
+ * ASCII control bytes, Windows-reserved punctuation, or an absurd length.
+ * Anything else — including non-ASCII UTF-8 — is legitimate. An ASCII-only
+ * whitelist here once aborted a whole Binance run over the perpetual
+ * 币安人生USDT, whose files had been part of the dataset for years.
+ */
 inline bool isSafeSymbolFileComponent(const std::string_view symbol) {
-    if (symbol.empty()) {
+    if (symbol.empty() || symbol == "." || symbol == "..") {
         return false;
     }
+    if (symbol.size() > 240) {
+        return false; // leaves room for suffixes within the usual 255-byte file name limit
+    }
     for (const unsigned char c: symbol) {
-        const bool asciiAlphaNumeric = (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
-                                       (c >= '0' && c <= '9');
-        if (!asciiAlphaNumeric && c != '_' && c != '-') {
-            return false;
+        if (c < 0x20 || c == 0x7f) {
+            return false; // control bytes
+        }
+        switch (c) {
+            case '/':
+            case '\\':
+            case '<':
+            case '>':
+            case ':':
+            case '"':
+            case '|':
+            case '?':
+            case '*':
+                return false; // path separators and Windows-reserved punctuation
+            default:
+                break;
         }
     }
     return true;
 }
 
-inline void validateSymbolFileComponents(const std::vector<std::string> &symbols) {
-    for (const auto &symbol: symbols) {
-        if (!isSafeSymbolFileComponent(symbol)) {
-            throw std::invalid_argument(
-                "unsafe exchange symbol '" + symbol +
-                "': symbols used as file names may contain only ASCII letters, digits, '_' and '-'");
+/**
+ * Drop symbols unusable as file names, logging each. One hostile or broken
+ * entry must not abort the run for the hundreds of valid symbols around it —
+ * a skipped symbol is never used to build a path, which is all the protection
+ * the caller needs. The one exception: filtering a non-empty list down to
+ * nothing throws, because an empty symbol list means "the whole exchange"
+ * further down, and that silent flip would be worse than stopping.
+ */
+inline std::size_t removeUnsafeSymbolFileComponents(std::vector<std::string> &symbols) {
+    const bool hadSymbols = !symbols.empty();
+    const auto removed = std::erase_if(symbols, [](const std::string &symbol) {
+        if (isSafeSymbolFileComponent(symbol)) {
+            return false;
         }
+        spdlog::error("Skipping exchange symbol '{}': not usable as a file name component", symbol);
+        return true;
+    });
+    if (hadSymbols && symbols.empty()) {
+        throw std::invalid_argument("every requested symbol was rejected as unsafe for file names");
     }
+    return removed;
 }
 
 } // namespace stonky

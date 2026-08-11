@@ -87,3 +87,7 @@ All notable changes to this project will be documented in this file. This projec
 - Add deterministic regression tests (11 CTest targets) covering number round-trips, tail recovery, pagination, staging, atomic writes, intervals, aggregation policy and the verifier
 - Remove the GitHub Actions workflow; sanitizer and coverage remain as local, opt-in CMake configurations
 
+## [2.6.2](https://github.com/vitakot/crypto_data_downloader/releases/tag/v2.6.2) (2026-08-11)
+- Accept non-ASCII exchange symbols again. The 2.6.1 symbol validation allowed only ASCII letters, digits, `_` and `-`, so Binance perpetuals with CJK names (币安人生USDT, 龙虾USDT — on disk in this dataset for years) were rejected as "unsafe", and because validation threw over the whole list, one such symbol aborted the entire exchange run. The check now rejects only what genuinely cannot be a file name: empty, `.`/`..`, path separators, control bytes, Windows-reserved punctuation and names over 240 bytes
+- A rejected symbol is skipped with an error instead of aborting the run; filtering a non-empty list down to nothing still fails, because an empty list means "the whole exchange" downstream and that silent flip would be worse than stopping
+

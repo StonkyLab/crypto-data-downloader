@@ -64,7 +64,6 @@ void BinanceSpotDownloader::updateMarketData(const std::string &dirPath, const s
 
     std::vector<std::future<std::filesystem::path> > futures;
     const std::filesystem::path finalPath(dirPath);
-    validateSymbolFileComponents(symbols);
     std::vector<std::string> symbolsToUpdate = symbols;
     std::vector<std::filesystem::path> csvFilePaths;
     std::vector<std::string> symbolsToDelete;
@@ -151,7 +150,7 @@ void BinanceSpotDownloader::updateMarketData(const std::string &dirPath, const s
     }
 
     deduplicatePreserveOrder(symbolsToUpdate);
-    validateSymbolFileComponents(symbolsToUpdate);
+    removeUnsafeSymbolFileComponents(symbolsToUpdate);
     if (onSymbolsToUpdateCB) {
         onSymbolsToUpdateCB(symbolsToUpdate);
     }
