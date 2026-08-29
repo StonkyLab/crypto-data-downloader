@@ -103,3 +103,7 @@ All notable changes to this project will be documented in this file. This projec
 - Add deterministic parser, fresh/resume boundary, archive-name, MEXC marker/alignment and funding-cutoff regression coverage
 - Drop the per-target `.csv.lock` files the aggregator left next to 5m/1h data. Concurrent runs are serialized per exchange by a flock in the update scripts instead — one mechanism for every venue and phase, invisible in the data directories. `AtomicFileWriter` keeps sibling locking for the MEXC staging and repair paths
 
+
+## [2.7.1](https://github.com/vitakot/crypto_data_downloader/releases/tag/v2.7.1) (2026-08-29)
+- Fix MEXC spot 1h/1m/5m history arriving with half of every file missing. `/api/v3/klines` truncates every response at 500 rows whatever `limit` requests (1000 and 721 both come back as 500) and fills a window from its `startTime`, but the backward paginator strode 1000 intervals per window and then moved the cursor to the oldest returned row. Each window therefore served only its older half and the cursor stepped over the newer half unfetched, leaving alternating 500-bar blocks and 500-bar holes at 50.7 % coverage — and, because the very first window is the newest, no data at all for the last ~500 hours. Stride now equals the venue's row cap
+- Fail closed if MEXC ever truncates a window again: a cap-sized page whose newest row stops short of the window top now raises `IncompletePaginationError` for that symbol instead of silently skipping the unfetched remainder
