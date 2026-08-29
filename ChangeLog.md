@@ -101,3 +101,5 @@ All notable changes to this project will be documented in this file. This projec
 - Discover OKX delisted symbols from individually compressed `.csv.gz`, `.csv.xz`, `.csv.bz2` and `.csv.zst` files when the live CSV has been archived
 - Make the process-wide floor storage race-free while retaining the set-before-workers contract
 - Add deterministic parser, fresh/resume boundary, archive-name, MEXC marker/alignment and funding-cutoff regression coverage
+- Drop the per-target `.csv.lock` files the aggregator left next to 5m/1h data. Concurrent runs are serialized per exchange by a flock in the update scripts instead — one mechanism for every venue and phase, invisible in the data directories. `AtomicFileWriter` keeps sibling locking for the MEXC staging and repair paths
+

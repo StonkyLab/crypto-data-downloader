@@ -1,5 +1,4 @@
 #include "stonky/candle_aggregator.h"
-#include "stonky/advisory_file_lock.h"
 
 #include <chrono>
 #include <filesystem>
@@ -528,21 +527,6 @@ bool checkAppendIsAtomicAndRepairsTornTail(const std::filesystem::path &pricesDi
     target.close();
     const auto tornBytes = readBytes(targetPath);
 
-    auto lockPath = targetPath;
-    lockPath += ".lock";
-    {
-        stonky::AdvisoryFileLock heldLock(lockPath);
-        if (!heldLock.ownsLock()) {
-            std::cerr << "Could not acquire append atomicity test lock\n";
-            return false;
-        }
-        const auto blocked = aggregate(pricesDir, false, false);
-        if (!blocked.failed || blocked.barsWritten != 0 || readBytes(targetPath) != tornBytes) {
-            std::cerr << "A failed append modified its previous target\n";
-            return false;
-        }
-    }
-
     {
         std::ofstream malformed(sourceDir / "TEST.csv", std::ios::trunc);
         malformed << "open_time,open,high,low,close,volume\n"
@@ -807,34 +791,6 @@ bool checkExistingKnownGapDoesNotBlockNewSuffix(const std::filesystem::path &pri
     return true;
 }
 
-bool checkConcurrentRewriteIsRejected(const std::filesystem::path &pricesDir) {
-    if (!writeSource(pricesDir)) {
-        return false;
-    }
-    const auto targetDir = pricesDir / "5m";
-    std::filesystem::create_directories(targetDir);
-    const auto targetPath = targetDir / "TEST.csv";
-    std::ofstream(targetPath, std::ios::trunc)
-        << "open_time,open,high,low,close,volume\n"
-        << "0,10,11,9,10.5,5\n";
-    const auto before = readLines(targetPath);
-
-    auto lockPath = targetPath;
-    lockPath += ".lock";
-    stonky::AdvisoryFileLock heldLock(lockPath);
-    if (!heldLock.ownsLock()) {
-        std::cerr << "Could not acquire aggregate test lock\n";
-        return false;
-    }
-
-    const auto report = aggregate(pricesDir, false, true);
-    if (!report.failed || report.barsWritten != 0 || readLines(targetPath) != before) {
-        std::cerr << "Concurrent rewrite was not rejected without touching the target\n";
-        return false;
-    }
-    return true;
-}
-
 bool checkInvalidTargetProducesFailureReport(const std::filesystem::path &pricesDir) {
     const auto sourceDir = pricesDir / "1m";
     std::filesystem::create_directories(sourceDir);
@@ -926,7 +882,6 @@ int main() {
     const auto rogueTailGuardDir = temporaryDirectory.path() / "rogue-tail-guard";
     const auto isolatedHeadGuardDir = temporaryDirectory.path() / "isolated-head-guard";
     const auto knownGapRewriteDir = temporaryDirectory.path() / "known-gap-rewrite";
-    const auto concurrentRewriteDir = temporaryDirectory.path() / "concurrent-rewrite";
     const auto invalidTargetDir = temporaryDirectory.path() / "invalid-target";
     const auto binanceDir = temporaryDirectory.path() / "binance";
     const auto mexcDir = temporaryDirectory.path() / "mexc";
@@ -956,7 +911,6 @@ int main() {
            checkRejectedRogueCannotAuthorizeTailTruncation(rogueTailGuardDir) &&
            checkIsolatedDamagedHeadCannotAuthorizePrefixTruncation(isolatedHeadGuardDir) &&
            checkExistingKnownGapDoesNotBlockNewSuffix(knownGapRewriteDir) &&
-           checkConcurrentRewriteIsRejected(concurrentRewriteDir) &&
            checkInvalidTargetProducesFailureReport(invalidTargetDir) &&
            checkVenueSchemas(binanceDir, mexcDir) ? 0 : 1;
 }

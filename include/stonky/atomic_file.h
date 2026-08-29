@@ -28,13 +28,22 @@ namespace stonky {
 
 class AtomicFileWriter {
 public:
+    /**
+     * Sibling: serialize writers through a persistent `<target>.lock` file.
+     * None: skip the lock entirely — for writers whose runs are already
+     * serialized at a higher level (the update scripts hold a per-exchange
+     * flock), so no lock files litter the data directories.
+     */
+    enum class Locking { Sibling, None };
+
     explicit AtomicFileWriter(std::filesystem::path target,
-                              const std::ios::openmode mode = std::ios::binary)
+                              const std::ios::openmode mode = std::ios::binary,
+                              const Locking locking = Locking::Sibling)
         : target_(std::move(target)), temporary_(target_), lockPath_(target_) {
         temporary_ += ".writing";
         lockPath_ += ".lock";
 
-        if (!lockHandle_.acquire(lockPath_)) {
+        if (locking == Locking::Sibling && !lockHandle_.acquire(lockPath_)) {
             error_ = lockHandle_.error();
             return;
         }

@@ -48,7 +48,7 @@ public:
         /// Maximum number of symbols aggregated in parallel
         std::uint32_t maxJobs{1};
         /// Atomically rebuild target files from scratch instead of appending after their tail.
-        /// Rewrites and appends are cross-process serialized per target file.
+        /// Concurrent runs are serialized at the update-script level (flock), not per file.
         bool rewrite{false};
         /// Emit buckets even when one or more source bars are missing. Disabled
         /// by default because a partial bucket is indistinguishable from a
