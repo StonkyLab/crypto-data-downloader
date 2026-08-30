@@ -88,33 +88,6 @@ struct PrefixMarker {
     friend bool operator==(const PrefixMarker &, const PrefixMarker &) = default;
 };
 
-/**
- * A fail-closed inter-process lock whose ownership is released by the kernel
- * when a process exits, including SIGKILL.  The regular lock file intentionally
- * persists and must not be deleted: only its OS advisory lock denotes an
- * active owner.  A directory left by the pre-advisory implementation is
- * intentionally rejected rather than guessed stale; it requires one-time
- * manual removal after verifying that no old downloader process is running.
- */
-class DirectoryLock {
-public:
-    explicit DirectoryLock(std::filesystem::path path) : lock_(std::move(path)) {
-        if (!lock_.ownsLock()) {
-            throw std::runtime_error(lock_.error());
-        }
-    }
-
-    DirectoryLock(const DirectoryLock &) = delete;
-    DirectoryLock &operator=(const DirectoryLock &) = delete;
-    DirectoryLock(DirectoryLock &&) = delete;
-    DirectoryLock &operator=(DirectoryLock &&) = delete;
-
-    ~DirectoryLock() = default;
-
-private:
-    AdvisoryFileLock lock_;
-};
-
 class RemoveUnlessReleased {
 public:
     explicit RemoveUnlessReleased(std::filesystem::path path) : path_(std::move(path)) {}

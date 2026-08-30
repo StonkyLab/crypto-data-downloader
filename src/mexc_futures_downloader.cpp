@@ -522,7 +522,6 @@ void MEXCFuturesDownloader::updateMarketData(const std::string &dirPath, const s
                         // Temp directory for this symbol's batches
                         std::filesystem::path tempDir = symbolFilePathCsv.parent_path();
                         tempDir.append("temp_" + symbol);
-                        mexc_staging::DirectoryLock symbolLock(tempDir.string() + ".lock");
 
                         // Recover only complete transactions; partial newest-
                         // first staging is unsafe and is re-downloaded.
@@ -826,7 +825,10 @@ void MEXCFuturesDownloader::updateMarketData(const std::string &dirPath, const s
                         }
                     } catch (const std::exception &e) {
                         spdlog::warn(fmt::format("Updating candles for symbol: {} failed, reason: {}", symbol, e.what()));
-                        throw;
+                        // waitAllOrThrow aggregates only what(), so name the symbol
+                        // there as well: a bare venue message is unattributable
+                        // among hundreds of concurrent workers.
+                        throw std::runtime_error(fmt::format("{}: {}", symbol, e.what()));
                     }
                     return "";
                 },
@@ -878,7 +880,6 @@ void MEXCFuturesDownloader::updateMarketData(const std::string &dirPath, const s
 
             std::filesystem::path tempDir = symbolFilePathCsv.parent_path();
             tempDir.append("temp_" + symbol);
-            mexc_staging::DirectoryLock symbolLock(tempDir.string() + ".lock");
             if (std::filesystem::exists(symbolFilePathCsv)) {
                 std::filesystem::remove(symbolFilePathCsv);
                 spdlog::info(fmt::format("Removing csv file for delisted symbol: {}, file: {}...", symbol, symbolFilePathCsv.string()));
@@ -1006,12 +1007,11 @@ void MEXCFuturesDownloader::updateFundingRateData(const std::string &dirPath, co
                     std::filesystem::path symbolFilePathCsv = frDir;
                     symbolFilePathCsv.append(symbol + "_fr.csv");
 
-                    // The lock covers the complete read-tail/fetch/commit transaction.  Without
-                    // it two cron processes can observe the same tail and both append the same
-                    // pages.  Publication below is also an atomic whole-file replacement, so a
-                    // failed flush, close or disk-full write cannot damage the old CSV.
-                    mexc_staging::DirectoryLock fundingLock(
-                        mexc_funding_csv::updateLockPath(symbolFilePathCsv));
+                    // Two runs observing the same tail would both append the same pages, so
+                    // the read-tail/fetch/commit transaction has to be serialized: the update
+                    // scripts hold a per-exchange flock for exactly that.  Publication below is
+                    // an atomic whole-file replacement on top, so a failed flush, close or
+                    // disk-full write cannot damage the old CSV either.
                     mexc_funding_csv::Tail base;
                     std::vector<mexc_funding_csv::Record> existingRecords;
                     std::string fundingCsvError;
@@ -1191,8 +1191,6 @@ void MEXCFuturesDownloader::updateFundingRateData(const std::string &dirPath, co
             symbolFilePathCsv = symbolFilePathCsv.lexically_normal();
             symbolFilePathCsv.append(symbol + "_fr.csv");
 
-            mexc_staging::DirectoryLock fundingLock(
-                mexc_funding_csv::updateLockPath(symbolFilePathCsv));
             std::error_code removeError;
             const bool removedCsv = std::filesystem::remove(symbolFilePathCsv, removeError);
             if (removeError) {

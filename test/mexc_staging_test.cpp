@@ -1,6 +1,7 @@
 #include "mexc_staging.h"
 #include "mexc_funding_csv.h"
 #include "mexc_funding_pagination.h"
+#include "stonky/advisory_file_lock.h"
 
 #include <algorithm>
 #include <chrono>
@@ -204,6 +205,21 @@ int main() {
         std::cerr << "MEXC funding --since skipped an existing tail or its inclusive boundary\n";
         ok = false;
     }
+
+    // The downloaders no longer take a per-symbol advisory lock — runs are
+    // serialized per exchange by the update scripts' flock, and the lock files
+    // were visible clutter in the data directories. AtomicFileWriter still
+    // publishes through sibling locks, so these semantics stay load-bearing
+    // and keep their coverage here.
+    struct DirectoryLock {
+        explicit DirectoryLock(std::filesystem::path path) : lock_(std::move(path)) {
+            if (!lock_.ownsLock()) {
+                throw std::runtime_error(lock_.error());
+            }
+        }
+
+        stonky::AdvisoryFileLock lock_;
+    };
 
     const auto lockPath = tmp.path() / "TEST.lock";
     try {

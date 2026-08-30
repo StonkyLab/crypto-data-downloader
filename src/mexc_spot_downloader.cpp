@@ -499,7 +499,6 @@ void MEXCSpotDownloader::updateMarketData(const std::string &dirPath, const std:
                         // Temp directory for this symbol's batches
                         std::filesystem::path tempDir = symbolFilePathCsv.parent_path();
                         tempDir.append("temp_" + symbol);
-                        mexc_staging::DirectoryLock symbolLock(tempDir.string() + ".lock");
 
                         // Only a fully validated transaction with a completion
                         // manifest may be recovered.  Partial older staging is
@@ -571,14 +570,36 @@ void MEXCSpotDownloader::updateMarketData(const std::string &dirPath, const std:
                                 }
                                 prefixMarker.reset();
                             } else {
+                                const auto requestedStart = prefixMarker->requestedStart;
                                 const auto probe = m_p->mexcSpotClient->probeHistoricalPrices(
-                                    symbol, mexcCandleInterval, prefixMarker->requestedStart,
+                                    symbol, mexcCandleInterval, requestedStart,
                                     currentCsv.firstTimestamp);
                                 rebuildPrefix = !probe.empty();
                                 if (rebuildPrefix) {
                                     spdlog::info(fmt::format(
                                         "Symbol {}: older MEXC Spot history became available; rebuilding prefix",
                                         symbol));
+                                } else {
+                                    // The marker records a boundary that one scan
+                                    // could not prove.  This probe is a second,
+                                    // independent look under different network and
+                                    // venue conditions, which is what rules out the
+                                    // transient outage the marker guards against.
+                                    // Nothing stronger is obtainable: the venue
+                                    // answers a fixed window from the requested
+                                    // start, so RequestedRangeScanned is
+                                    // unreachable for any symbol listed after it
+                                    // and the marker would never resolve — 1609 of
+                                    // 1662 spot files carried one indefinitely and
+                                    // re-probed the same empty window every run.
+                                    if (!mexc_staging::removePrefixMarker(symbolFilePathCsv,
+                                                                          prefixError)) {
+                                        throw std::runtime_error(prefixError);
+                                    }
+                                    prefixMarker.reset();
+                                    spdlog::info(fmt::format(
+                                        "Symbol {}: MEXC Spot still serves nothing before {}; prefix boundary confirmed",
+                                        symbol, requestedStart));
                                 }
                             }
                         }
@@ -803,9 +824,25 @@ void MEXCSpotDownloader::updateMarketData(const std::string &dirPath, const std:
                         if (std::filesystem::exists(symbolFilePathCsv)) {
                             return symbolFilePathCsv;
                         }
+                    } catch (const UnknownSymbolError &) {
+                        // Expected outcome, not a failure: the symbol universe is
+                        // survivorship-clean on purpose, so it carries symbols the
+                        // venue has since delisted — 368 of 2030 here — and every
+                        // one of them answers -1121. Counting those as worker
+                        // failures made the exit code permanently non-zero and
+                        // buried the real errors. Any CSV already on disk is left
+                        // untouched.
+                        spdlog::info(fmt::format("Symbol {} is not listed by MEXC Spot; skipping", symbol));
+                        if (std::filesystem::exists(symbolFilePathCsv)) {
+                            return symbolFilePathCsv;
+                        }
+                        return {};
                     } catch (const std::exception &e) {
                         spdlog::warn(fmt::format("Updating candles for symbol: {} failed, reason: {}", symbol, e.what()));
-                        throw;
+                        // waitAllOrThrow aggregates only what(), so name the symbol
+                        // there as well: a bare venue message is unattributable
+                        // among hundreds of concurrent workers.
+                        throw std::runtime_error(fmt::format("{}: {}", symbol, e.what()));
                     }
                     return "";
                 },
@@ -857,7 +894,6 @@ void MEXCSpotDownloader::updateMarketData(const std::string &dirPath, const std:
 
             std::filesystem::path tempDir = symbolFilePathCsv.parent_path();
             tempDir.append("temp_" + symbol);
-            mexc_staging::DirectoryLock symbolLock(tempDir.string() + ".lock");
             if (std::filesystem::exists(symbolFilePathCsv)) {
                 std::filesystem::remove(symbolFilePathCsv);
                 spdlog::info(fmt::format("Removing csv file for delisted symbol: {}, file: {}...", symbol, symbolFilePathCsv.string()));

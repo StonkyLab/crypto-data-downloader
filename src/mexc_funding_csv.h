@@ -74,12 +74,6 @@ inline bool emptyDownloadIsNoOp(const bool existingData) {
     return existingData;
 }
 
-inline std::filesystem::path updateLockPath(const std::filesystem::path &csvPath) {
-    auto path = csvPath;
-    path += ".update.lock";
-    return path;
-}
-
 inline bool parseFiniteBinary64(std::string_view value, double &parsed) {
     if (value.empty()) {
         return false;
@@ -492,9 +486,10 @@ inline bool copyExactly(std::ifstream &input, std::ofstream &output,
 /**
  * Atomically publish existing data plus a validated append transaction.
  *
- * The caller must hold updateLockPath(path) from before the initial inspect
- * through this call.  Re-inspecting and comparing the base closes accidental
- * TOCTOU use even if a future caller omits that contract.
+ * Runs are serialized per exchange by the update scripts' flock, so no per-file
+ * lock is taken around this.  Re-inspecting and comparing the base before
+ * publishing still closes the TOCTOU window, and that check is what actually
+ * protects the file.
  */
 inline bool appendAtomically(const std::filesystem::path &path, const Tail &expectedBase,
                              const std::span<const Record> records, std::string &error) {
