@@ -340,7 +340,9 @@ inline bool ensureProvisionalMarker(const std::filesystem::path &csvPath, std::s
     }
 
     const auto marker = provisionalMarkerPath(csvPath);
-    AtomicFileWriter output(marker, std::ios::binary);
+    // Runs are serialized per exchange by the update scripts' flock, so this
+    // publishes without a sibling lock file next to the data.
+    AtomicFileWriter output(marker, std::ios::binary, AtomicFileWriter::Locking::None);
     if (!output.isOpen()) {
         error = output.error();
         return false;
@@ -442,7 +444,9 @@ inline bool replaceAtomically(const std::filesystem::path &path, const Tail &exp
         return false;
     }
 
-    AtomicFileWriter replacement(path, std::ios::binary);
+    // Runs are serialized per exchange by the update scripts' flock, so this
+    // publishes without a sibling lock file next to the data.
+    AtomicFileWriter replacement(path, std::ios::binary, AtomicFileWriter::Locking::None);
     if (!replacement.isOpen()) {
         error = replacement.error();
         return false;
@@ -523,7 +527,9 @@ inline bool appendAtomically(const std::filesystem::path &path, const Tail &expe
         return false;
     }
 
-    AtomicFileWriter replacement(path, std::ios::binary);
+    // Runs are serialized per exchange by the update scripts' flock, so this
+    // publishes without a sibling lock file next to the data.
+    AtomicFileWriter replacement(path, std::ios::binary, AtomicFileWriter::Locking::None);
     if (!replacement.isOpen()) {
         error = replacement.error();
         return false;
