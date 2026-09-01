@@ -19,6 +19,7 @@ Copyright (c) 2025 Vitezslav Kot <vitezslav.kot@stonky.cz>, Stonky s.r.o.
 #include "stonky/utils/utils.h"
 #include "stonky/csv_verifier.h"
 #include "stonky/downloader.h"
+#include "stonky/advisory_file_lock.h"
 #include "stonky/binance/binance_spot_downloader.h"
 #include <spdlog/spdlog.h>
 #include <cxxopts.hpp>
@@ -26,13 +27,14 @@ Copyright (c) 2025 Vitezslav Kot <vitezslav.kot@stonky.cz>, Stonky s.r.o.
 #include <spdlog/sinks/stdout_sinks.h>
 #include <spdlog/sinks/rotating_file_sink.h>
 #include <algorithm>
+#include <cstdlib>
 #include "csv.h"
 #include <iostream>
 #include <memory>
 
 #undef max
 
-#define VERSION "2.7.0"
+#define VERSION "2.7.5"
 
 using namespace stonky;
 
@@ -74,6 +76,47 @@ std::vector<std::string> parseSymbolsFile(const std::string &path) {
         spdlog::warn(fmt::format("Could not parse symbols file: {}, reason: {}", path, e.what()));
     }
     return retVal;
+}
+
+/**
+ * One downloader per exchange and output tree.
+ *
+ * Two runs over the same data interleave their staging directories, their
+ * deterministic `<target>.writing` temporaries and their append-only CSV
+ * tails. Comparing the base and tail again just before publishing narrows
+ * that window but cannot close it, so the exclusion has to happen once, at
+ * the level of the whole run.
+ *
+ * The lock file lives outside the data tree, so the HTTP server publishing
+ * that tree never serves it, and ownership is a kernel file description:
+ * released on exit, on SIGKILL and on a crash alike. Nothing unlinks it —
+ * only the OS lock denotes an owner.
+ */
+std::unique_ptr<AdvisoryFileLock> acquireRunLock(const std::string &exchange,
+                                                 const std::string &outputDirectory) {
+    std::error_code ec;
+    const auto canonical = std::filesystem::weakly_canonical(outputDirectory, ec);
+    const auto identity = exchange + '\0' + (ec ? outputDirectory : canonical.string());
+
+    // FNV-1a rather than std::hash: the name has to be the same in every
+    // process that shares this data, which the standard does not promise.
+    std::uint64_t digest = 1469598103934665603ULL;
+    for (const unsigned char byte: identity) {
+        digest = (digest ^ byte) * 1099511628211ULL;
+    }
+
+    std::filesystem::path directory;
+    if (const auto *runtimeDir = std::getenv("XDG_RUNTIME_DIR"); runtimeDir && *runtimeDir) {
+        directory = runtimeDir;
+    } else {
+        directory = std::filesystem::temp_directory_path(ec);
+        if (ec) {
+            directory = ".";
+        }
+    }
+
+    return std::make_unique<AdvisoryFileLock>(
+        directory / fmt::format("crypto_data_downloader-{:016x}.lock", digest));
 }
 
 int main(int argc, char **argv) {
@@ -370,6 +413,16 @@ int main(int argc, char **argv) {
         register_logger(combinedLogger);
         set_default_logger(combinedLogger);
         spdlog::flush_on(spdlog::level::info);
+
+        // Held for the rest of the run, aggregation and verification included:
+        // those rewrite the same files the downloads append to.
+        const auto runLock = acquireRunLock(exchange, outputDirectory);
+        if (!runLock->ownsLock()) {
+            spdlog::critical(fmt::format(
+                "A {} downloader is already running for {} ({})",
+                exchange, outputDirectory, runLock->error()));
+            return -1;
+        }
 
         if (!aggregateTargets.empty()) {
             CandleAggregator::Options aggregatorOptions;

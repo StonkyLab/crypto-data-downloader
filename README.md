@@ -112,29 +112,33 @@ timestamps and strictly increasing rows, but missing aligned candle slots are
 preserved as gaps instead of invalidating the rest of the history. Duplicate,
 out-of-order, misaligned or malformed rows still fail the transaction.
 
-Each symbol update is serialized by an OS advisory lock and published through
-validated staging plus atomic replacement. If a first download reaches only a
-provisional MEXC availability boundary, the usable suffix may be published, but
-`<SYMBOL>.csv.prefix.pending` is written first. Every later run holding the same
-symbol lock probes the missing interval. If older candles become available, the
-downloaded range is merged by timestamp with every row already stored locally
-and the union atomically replaces the suffix. A transient API omission therefore
-cannot erase a candle that is already on disk; conflicting values at the same
-timestamp fail closed. The marker is removed only after a positive scan reaches
-the originally requested start. Negative probes never silently declare a
-shortened history complete.
+Concurrent runs are excluded once, for the whole process: at startup the
+downloader takes a non-blocking OS advisory lock keyed on the exchange and the
+canonical output directory, and holds it through downloading, aggregation and
+verification. A second run over the same data exits immediately with
+`A mexc downloader is already running for /data/crypto`. The lock file lives in
+`$XDG_RUNTIME_DIR` (or the system temp directory), deliberately outside the data
+tree so an HTTP server publishing that tree never serves it; its ownership is a
+kernel file description, released on exit, on SIGKILL and on a crash alike.
+There are no per-symbol or per-file lock files.
+
+Updates are published through validated staging plus atomic replacement. If a
+first download reaches only a provisional MEXC availability boundary, the usable
+suffix may be published, but `<SYMBOL>.csv.prefix.pending` is written first.
+Every later run probes the missing interval. If older candles become available,
+the downloaded range is merged by timestamp with every row already stored
+locally and the union atomically replaces the suffix. A transient API omission
+therefore cannot erase a candle that is already on disk; conflicting values at
+the same timestamp fail closed. The marker is removed only after a positive scan
+reaches the originally requested start. Negative probes never silently declare a
+shortened history complete — on MEXC Spot in particular a probe anchored at the
+requested start only ever inspects the oldest 500-interval window of the range,
+so its empty answer proves nothing about a gap further up.
 
 When an explicit `--since` is supplied after archiving, an orphan marker whose
 CSV was removed is retired. If a live suffix and marker remain, the marker is
 rebased to the first candle boundary at or after the new floor, so recovery can
 fill a wanted gap but cannot restore intentionally archived rows before it.
-
-The regular `*.lock` files are persistent lock identities and are not stale just
-because they remain on disk; ownership is held and released by the operating
-system, including after a killed process. A directory at one of these lock paths
-comes from the former directory-lock implementation and is rejected fail-closed.
-After confirming that no old downloader process is running, remove that legacy
-directory once so the new regular lock file can be created.
 
 #### MEXC Delisted Symbols
 
@@ -452,17 +456,15 @@ The data sources are asymmetric, and one of them decays:
 ./crypto_data_downloader -e mexc -t fr -o /data/mexc
 ```
 
-MEXC funding updates use a separate per-symbol lock and atomic whole-file
-replacement. Empty first pages are retried and ambiguous pagination fails
-closed. Before the first update with this version, every fresh or legacy CSV is
-preceded by `<SYMBOL>_fr.csv.prefix-provisional`; the marker is created before
-any data write. Every run then scans all declared pages, validates stable
-pagination metadata, merges the complete download with the complete local CSV
-by timestamp, and atomically publishes the union. Thus a temporarily shortened
-but internally consistent API snapshot can add records but cannot hide an older
-or middle gap forever; a later wider snapshot fills it. The marker is
-intentionally retained because MEXC exposes no independent authoritative
-start-of-history proof.
+MEXC funding updates publish through atomic whole-file replacement. Empty first
+pages are retried and ambiguous pagination fails closed. Every run scans all
+declared pages, validates stable pagination metadata, merges the complete
+download with the complete local CSV by timestamp, and atomically publishes the
+union — never an incremental append from the stored tail, because MEXC exposes
+no authoritative start-of-history and an exact tail overlap cannot prove a
+truncated snapshot did not omit a middle page. A temporarily shortened but
+internally consistent API snapshot can therefore add records but cannot hide an
+older or middle gap forever; a later wider snapshot fills it.
 
 **Download Hyperliquid perpetuals — 1h candles (all symbols):**
 ```bash

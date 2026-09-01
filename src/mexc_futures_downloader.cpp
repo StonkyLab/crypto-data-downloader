@@ -603,24 +603,12 @@ void MEXCFuturesDownloader::updateMarketData(const std::string &dirPath, const s
                                     spdlog::info(fmt::format(
                                         "Symbol {}: older MEXC Futures history became available; rebuilding prefix",
                                         symbol));
-                                } else {
-                                    // Same dead end the spot path had: the marker
-                                    // waits for RequestedRangeScanned, which no
-                                    // symbol listed after the requested start can
-                                    // ever reach, so 714 futures files carried one
-                                    // indefinitely.  This probe covers the whole
-                                    // older range rather than a fixed window, so an
-                                    // empty answer here is stronger evidence than
-                                    // spot's: nothing older exists to be found.
-                                    if (!mexc_staging::removePrefixMarker(symbolFilePathCsv,
-                                                                          prefixError)) {
-                                        throw std::runtime_error(prefixError);
-                                    }
-                                    prefixMarker.reset();
-                                    spdlog::info(fmt::format(
-                                        "Symbol {}: MEXC Futures serves nothing before {}; prefix boundary confirmed",
-                                        symbol, requestedStart));
                                 }
+                                // A repeated empty answer is not proof of a
+                                // listing boundary either — a venue outage looks
+                                // exactly the same — so the marker stays until
+                                // stored data actually reaches the requested
+                                // start.
                             }
                         }
 
