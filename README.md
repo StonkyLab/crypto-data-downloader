@@ -125,7 +125,9 @@ There are no per-symbol or per-file lock files.
 Updates are published through validated staging plus atomic replacement. If a
 first download reaches only a provisional MEXC availability boundary, the usable
 suffix may be published, but `<SYMBOL>.csv.prefix.pending` is written first.
-Every later run probes the missing interval. If older candles become available,
+Every later run probes the window immediately below the stored history — where
+an interrupted or provisionally bounded earlier download left off, and the only
+place a single MEXC Spot request can usefully inspect. If older candles become available,
 the downloaded range is merged by timestamp with every row already stored
 locally and the union atomically replaces the suffix. A transient API omission
 therefore cannot erase a candle that is already on disk; conflicting values at

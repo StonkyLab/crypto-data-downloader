@@ -63,6 +63,7 @@ public:
         }
         path_ = std::move(path);
         error_.clear();
+        contended_ = false;
 
 #ifdef _WIN32
         handle_ = ::CreateFileW(path_.c_str(), GENERIC_READ | GENERIC_WRITE,
@@ -77,9 +78,10 @@ public:
         if (!::LockFileEx(handle_, LOCKFILE_EXCLUSIVE_LOCK | LOCKFILE_FAIL_IMMEDIATELY,
                           0, 1, 0, &overlapped)) {
             const auto code = ::GetLastError();
+            contended_ = code == ERROR_LOCK_VIOLATION;
             error_ = windowsError(
-                code == ERROR_LOCK_VIOLATION ? "advisory lock is already held"
-                                             : "cannot acquire advisory lock",
+                contended_ ? "advisory lock is already held"
+                           : "cannot acquire advisory lock",
                 code);
             ::CloseHandle(handle_);
             handle_ = INVALID_HANDLE_VALUE;
@@ -116,9 +118,10 @@ public:
 
         if (::flock(descriptor_, LOCK_EX | LOCK_NB) != 0) {
             const auto code = errno;
+            contended_ = code == EWOULDBLOCK || code == EAGAIN;
             error_ = posixError(
-                code == EWOULDBLOCK || code == EAGAIN ? "advisory lock is already held"
-                                                       : "cannot acquire advisory lock",
+                contended_ ? "advisory lock is already held"
+                           : "cannot acquire advisory lock",
                 code);
             ::close(descriptor_);
             descriptor_ = -1;
@@ -131,6 +134,12 @@ public:
     }
 
     [[nodiscard]] bool ownsLock() const noexcept { return ownsLock_; }
+
+    /// True only when the lock failed because another owner holds it. Every
+    /// other failure — an unwritable directory, a path that is not a regular
+    /// file, any other errno — leaves this false, so a caller can tell "someone
+    /// else is running" from "this lock could not be established at all".
+    [[nodiscard]] bool contended() const noexcept { return contended_; }
     [[nodiscard]] const std::string &error() const noexcept { return error_; }
     [[nodiscard]] const std::filesystem::path &path() const noexcept { return path_; }
 
@@ -198,6 +207,7 @@ private:
     std::filesystem::path path_;
     std::string error_;
     bool ownsLock_{};
+    bool contended_{};
 };
 
 } // namespace stonky

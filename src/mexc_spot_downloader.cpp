@@ -570,9 +570,23 @@ void MEXCSpotDownloader::updateMarketData(const std::string &dirPath, const std:
                                 }
                                 prefixMarker.reset();
                             } else {
-                                const auto requestedStart = prefixMarker->requestedStart;
+                                // Look immediately below the stored history, not
+                                // at the requested start: the venue answers a
+                                // fixed window from the query's startTime, so a
+                                // probe anchored at requestedStart only ever
+                                // inspects the oldest window of the range and is
+                                // empty for every symbol listed after it, whatever
+                                // sits higher up. Directly below the CSV is where
+                                // an interrupted or provisionally bounded earlier
+                                // download left off, so that is where recovery has
+                                // a chance of finding something.
+                                const auto probeStart = std::max(
+                                    prefixMarker->requestedStart,
+                                    currentCsv.firstTimestamp -
+                                        static_cast<std::int64_t>(SpotHistoricalPageIntervals) *
+                                            intervalMs);
                                 const auto probe = m_p->mexcSpotClient->probeHistoricalPrices(
-                                    symbol, mexcCandleInterval, requestedStart,
+                                    symbol, mexcCandleInterval, probeStart,
                                     currentCsv.firstTimestamp);
                                 rebuildPrefix = !probe.empty();
                                 if (rebuildPrefix) {

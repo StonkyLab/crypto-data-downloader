@@ -20,6 +20,7 @@ Copyright (c) 2025 Vitezslav Kot <vitezslav.kot@stonky.cz>, Stonky s.r.o.
 #include "stonky/csv_verifier.h"
 #include "stonky/downloader.h"
 #include "stonky/advisory_file_lock.h"
+#include "stonky/run_lock.h"
 #include "stonky/binance/binance_spot_downloader.h"
 #include <spdlog/spdlog.h>
 #include <cxxopts.hpp>
@@ -27,14 +28,13 @@ Copyright (c) 2025 Vitezslav Kot <vitezslav.kot@stonky.cz>, Stonky s.r.o.
 #include <spdlog/sinks/stdout_sinks.h>
 #include <spdlog/sinks/rotating_file_sink.h>
 #include <algorithm>
-#include <cstdlib>
 #include "csv.h"
 #include <iostream>
 #include <memory>
 
 #undef max
 
-#define VERSION "2.7.5"
+#define VERSION "2.7.6"
 
 using namespace stonky;
 
@@ -94,29 +94,7 @@ std::vector<std::string> parseSymbolsFile(const std::string &path) {
  */
 std::unique_ptr<AdvisoryFileLock> acquireRunLock(const std::string &exchange,
                                                  const std::string &outputDirectory) {
-    std::error_code ec;
-    const auto canonical = std::filesystem::weakly_canonical(outputDirectory, ec);
-    const auto identity = exchange + '\0' + (ec ? outputDirectory : canonical.string());
-
-    // FNV-1a rather than std::hash: the name has to be the same in every
-    // process that shares this data, which the standard does not promise.
-    std::uint64_t digest = 1469598103934665603ULL;
-    for (const unsigned char byte: identity) {
-        digest = (digest ^ byte) * 1099511628211ULL;
-    }
-
-    std::filesystem::path directory;
-    if (const auto *runtimeDir = std::getenv("XDG_RUNTIME_DIR"); runtimeDir && *runtimeDir) {
-        directory = runtimeDir;
-    } else {
-        directory = std::filesystem::temp_directory_path(ec);
-        if (ec) {
-            directory = ".";
-        }
-    }
-
-    return std::make_unique<AdvisoryFileLock>(
-        directory / fmt::format("crypto_data_downloader-{:016x}.lock", digest));
+    return std::make_unique<AdvisoryFileLock>(runLockPath(exchange, outputDirectory));
 }
 
 int main(int argc, char **argv) {
@@ -418,9 +396,13 @@ int main(int argc, char **argv) {
         // those rewrite the same files the downloads append to.
         const auto runLock = acquireRunLock(exchange, outputDirectory);
         if (!runLock->ownsLock()) {
-            spdlog::critical(fmt::format(
-                "A {} downloader is already running for {} ({})",
-                exchange, outputDirectory, runLock->error()));
+            // Refusing to start because the lock could not be established at
+            // all is a different problem from refusing because someone else
+            // holds it, and it needs a different thing done about it.
+            spdlog::critical(runLock->contended()
+                ? fmt::format("A {} downloader is already running for {}", exchange, outputDirectory)
+                : fmt::format("Cannot establish the {} run lock for {}: {}",
+                              exchange, outputDirectory, runLock->error()));
             return -1;
         }
 

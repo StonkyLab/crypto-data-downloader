@@ -168,6 +168,11 @@ if (BUILD_TESTING)
     add_executable(download_resume_test test/download_resume_test.cpp)
     target_include_directories(download_resume_test PRIVATE include)
     add_test(NAME since_resume_boundary_policy COMMAND download_resume_test)
+
+    add_executable(run_lock_test test/run_lock_test.cpp)
+    target_include_directories(run_lock_test PRIVATE include)
+    target_link_libraries(run_lock_test PRIVATE spdlog::spdlog_header_only)
+    add_test(NAME run_lock_identity_is_environment_independent COMMAND run_lock_test)
 endif ()
 
 if (BUILD_TESTING AND BUILD_DOWNLOADER)
