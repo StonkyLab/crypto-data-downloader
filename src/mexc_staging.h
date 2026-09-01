@@ -76,14 +76,17 @@ struct Manifest {
 /**
  * Persistent proof that a freshly published CSV still has an unresolved older
  * prefix.  The marker deliberately survives successful appends and negative
- * API probes.  It is removed only after a later rebuild positively reaches
- * requestedStart.
+ * API probes. Version 2 also remembers progress through empty recovery pages.
  */
 struct PrefixMarker {
     std::int32_t version{1};
     std::int64_t requestedStart{};
     std::int64_t intervalMs{};
     Alignment alignment{Alignment::Fixed};
+    // Version 2 persists the exclusive end of the next backward probe. Empty
+    // venue windows therefore advance the search instead of making every run
+    // ask the same question forever. Zero means start at the CSV prefix.
+    std::int64_t nextProbeEnd{};
 
     friend bool operator==(const PrefixMarker &, const PrefixMarker &) = default;
 };
@@ -144,7 +147,11 @@ inline bool replaceAtomically(const std::filesystem::path &source,
 
 inline bool validPrefixMarker(const PrefixMarker &marker) {
     const auto alignment = static_cast<std::int32_t>(marker.alignment);
-    return marker.version == 1 && marker.requestedStart >= 0 && marker.intervalMs > 0 &&
+    return (marker.version == 1 || marker.version == 2) && marker.requestedStart >= 0 &&
+           marker.intervalMs > 0 &&
+           (marker.version == 1 ? marker.nextProbeEnd == 0
+                                : marker.nextProbeEnd == 0 ||
+                                      marker.nextProbeEnd >= marker.requestedStart) &&
            alignment >= static_cast<std::int32_t>(Alignment::Fixed) &&
            alignment <= static_cast<std::int32_t>(Alignment::CalendarMonth);
 }
@@ -167,7 +174,11 @@ inline bool writePrefixMarker(const std::filesystem::path &csvPath,
         return false;
     }
     output << marker.version << ' ' << marker.requestedStart << ' ' << marker.intervalMs << ' '
-           << static_cast<std::int32_t>(marker.alignment) << '\n';
+           << static_cast<std::int32_t>(marker.alignment);
+    if (marker.version == 2) {
+        output << ' ' << marker.nextProbeEnd;
+    }
+    output << '\n';
     output.flush();
     if (!output.good()) {
         error = fmt::format("failed to flush unresolved-prefix marker {}", partial.string());
@@ -214,6 +225,10 @@ inline bool readPrefixMarker(const std::filesystem::path &csvPath,
     std::int32_t alignment{};
     if (!(input >> parsed.version >> parsed.requestedStart >> parsed.intervalMs >> alignment)) {
         error = fmt::format("cannot parse unresolved-prefix marker {}", path.string());
+        return false;
+    }
+    if (parsed.version == 2 && !(input >> parsed.nextProbeEnd)) {
+        error = fmt::format("cannot parse unresolved-prefix marker cursor {}", path.string());
         return false;
     }
     input >> std::ws;
@@ -268,13 +283,16 @@ inline bool reconcilePrefixForExplicitFloor(
         return true;
     }
 
-    const PrefixMarker rebased{1, effectiveFloor, intervalMs, alignment};
-    if (*marker != rebased) {
-        if (!writePrefixMarker(csvPath, rebased, error)) {
-            return false;
-        }
-        marker = rebased;
+    if (marker->requestedStart == effectiveFloor && marker->intervalMs == intervalMs &&
+        marker->alignment == alignment) {
+        return true;
     }
+
+    const PrefixMarker rebased{2, effectiveFloor, intervalMs, alignment, 0};
+    if (!writePrefixMarker(csvPath, rebased, error)) {
+        return false;
+    }
+    marker = rebased;
     return true;
 }
 
@@ -438,6 +456,47 @@ inline std::int64_t previousPeriodOpen(const std::int64_t periodOpenMs, const st
     const year_month_day ymd{day};
     const year_month_day previous = ymd.year() / ymd.month() / std::chrono::day{1} - months{1};
     return duration_cast<milliseconds>(sys_days{previous}.time_since_epoch()).count();
+}
+
+struct PrefixProbeWindow {
+    std::int64_t start{};
+    std::int64_t end{};
+};
+
+/** Next fixed-size page in a persistent backward prefix scan. */
+inline PrefixProbeWindow prefixProbeWindow(const PrefixMarker &marker,
+                                           const std::int64_t csvFirstTimestamp,
+                                           const std::size_t pageIntervals) {
+    if (!validPrefixMarker(marker) || csvFirstTimestamp <= marker.requestedStart ||
+        pageIntervals == 0) {
+        throw std::invalid_argument("invalid MEXC prefix probe state");
+    }
+
+    auto end = marker.nextProbeEnd;
+    if (end <= marker.requestedStart || end > csvFirstTimestamp) {
+        end = csvFirstTimestamp;
+    }
+    if (!isAlignedTimestamp(end, marker.intervalMs, marker.alignment)) {
+        throw std::invalid_argument("misaligned MEXC prefix probe cursor");
+    }
+
+    auto start = end;
+    for (std::size_t i = 0; i < pageIntervals && start > marker.requestedStart; ++i) {
+        start = std::max(marker.requestedStart,
+                         previousPeriodOpen(start, marker.intervalMs, marker.alignment));
+    }
+    return {start, end};
+}
+
+inline PrefixMarker advancePrefixProbe(const PrefixMarker &marker,
+                                       const PrefixProbeWindow window) {
+    if (window.start < marker.requestedStart || window.start >= window.end) {
+        throw std::invalid_argument("invalid MEXC prefix probe window");
+    }
+    auto advanced = marker;
+    advanced.version = 2;
+    advanced.nextProbeEnd = window.start;
+    return advanced;
 }
 
 inline bool hasDecimalSyntax(const std::string_view value) {
@@ -929,9 +988,9 @@ inline bool commit(const std::filesystem::path &dir, const Manifest &manifest,
  * is used only when a persistent prefix marker discovers older history.  A
  * temporary venue outage during the rebuild must never erase a row already on
  * disk.  Equal timestamps must carry binary64-equivalent OHLCV values or the
- * replacement fails without touching the old CSV.  expectedCurrent closes the
- * read/probe/rebuild TOCTOU window; callers additionally hold the per-symbol
- * process lock.
+ * replacement fails without touching the old CSV. expectedCurrent closes the
+ * read/probe/rebuild TOCTOU window even though the run-level process guard
+ * already excludes another downloader over the same data.
  */
 inline bool replaceCsv(const std::filesystem::path &dir, const Manifest &manifest,
                        const std::filesystem::path &csvPath, const std::string &header,

@@ -146,7 +146,8 @@ bool MEXCFuturesDownloader::P::writeCSVCandlesToZorroT6File(
     const mexc_staging::Alignment alignment) {
     const std::filesystem::path pathToT6File{t6Path};
 
-    AtomicFileWriter output(pathToT6File);
+    AtomicFileWriter output(pathToT6File, std::ios::binary,
+                            AtomicFileWriter::Locking::None);
     if (!output.isOpen()) {
         spdlog::error(fmt::format("Couldn't prepare file {}: {}", t6Path, output.error()));
         return false;
@@ -1014,10 +1015,10 @@ void MEXCFuturesDownloader::updateFundingRateData(const std::string &dirPath, co
                     symbolFilePathCsv.append(symbol + "_fr.csv");
 
                     // Two runs observing the same tail would both append the same pages, so
-                    // the read-tail/fetch/commit transaction has to be serialized: the update
-                    // scripts hold a per-exchange flock for exactly that.  Publication below is
-                    // an atomic whole-file replacement on top, so a failed flush, close or
-                    // disk-full write cannot damage the old CSV either.
+                    // the process-wide exchange/output guard serializes the complete
+                    // read-tail/fetch/commit transaction. Publication below is an atomic
+                    // whole-file replacement on top, so a failed flush, close or disk-full
+                    // write cannot damage the old CSV either.
                     mexc_funding_csv::Tail base;
                     std::vector<mexc_funding_csv::Record> existingRecords;
                     std::string fundingCsvError;

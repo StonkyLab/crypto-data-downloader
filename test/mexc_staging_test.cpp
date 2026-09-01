@@ -176,7 +176,7 @@ int main() {
             suffixCsv, 20 * minute, true, 10 * minute, minute,
             Alignment::Fixed, suffixMarker, error) ||
         !suffixMarker ||
-        *suffixMarker != PrefixMarker{1, 10 * minute, minute, Alignment::Fixed}) {
+        *suffixMarker != PrefixMarker{2, 10 * minute, minute, Alignment::Fixed, 0}) {
         std::cerr << "Retained MEXC suffix marker was not rebased to --since: "
                   << error << '\n';
         ok = false;
@@ -188,6 +188,60 @@ int main() {
                       << error << '\n';
             ok = false;
         }
+    }
+
+    // Empty recovery probes must walk backward instead of repeating the page
+    // immediately below the CSV forever. Version 1 markers start at the CSV;
+    // version 2 round-trips the cursor for the following run.
+    const auto firstProbe = prefixProbeWindow(
+        PrefixMarker{1, 0, minute, Alignment::Fixed}, 20 * minute, 5);
+    const auto advancedProbe = advancePrefixProbe(
+        PrefixMarker{1, 0, minute, Alignment::Fixed}, firstProbe);
+    const auto secondProbe = prefixProbeWindow(advancedProbe, 20 * minute, 5);
+    const auto completedEmptyPass = advancePrefixProbe(
+        advancedProbe, PrefixProbeWindow{0, 15 * minute});
+    const auto repeatedPass = prefixProbeWindow(completedEmptyPass, 20 * minute, 5);
+    // If the process dies after publishing a positive page but before resetting
+    // the marker, the old cursor is now above the CSV prefix. Start at that new
+    // prefix; no repair page is skipped and no special crash record is needed.
+    const auto afterPublishedPage = prefixProbeWindow(
+        PrefixMarker{2, 0, minute, Alignment::Fixed, 15 * minute}, 12 * minute, 5);
+    const auto monthlyProbe = prefixProbeWindow(
+        PrefixMarker{2, utcMs(2020, 1, 1), 30LL * 24 * 60 * 60 * 1000,
+                     Alignment::CalendarMonth, 0},
+        utcMs(2026, 9, 1), 2);
+    if (firstProbe.start != 15 * minute || firstProbe.end != 20 * minute ||
+        advancedProbe != PrefixMarker{2, 0, minute, Alignment::Fixed, 15 * minute} ||
+        secondProbe.start != 10 * minute || secondProbe.end != 15 * minute ||
+        completedEmptyPass.nextProbeEnd != 0 ||
+        repeatedPass.start != 15 * minute || repeatedPass.end != 20 * minute ||
+        afterPublishedPage.start != 7 * minute || afterPublishedPage.end != 12 * minute ||
+        monthlyProbe.start != utcMs(2026, 7, 1) ||
+        monthlyProbe.end != utcMs(2026, 9, 1) ||
+        !writePrefixMarker(suffixCsv, advancedProbe, error)) {
+        std::cerr << "MEXC prefix recovery did not advance across an empty page: "
+                  << error << '\n';
+        ok = false;
+    } else {
+        std::optional<PrefixMarker> storedCursor;
+        if (!readPrefixMarker(suffixCsv, storedCursor, error) ||
+            storedCursor != advancedProbe) {
+            std::cerr << "MEXC prefix recovery cursor did not round-trip: "
+                      << error << '\n';
+            ok = false;
+        }
+    }
+
+    std::optional<PrefixMarker> flooredCursor{
+        PrefixMarker{2, 10 * minute, minute, Alignment::Fixed, 15 * minute}};
+    if (!writePrefixMarker(suffixCsv, *flooredCursor, error) ||
+        !reconcilePrefixForExplicitFloor(
+            suffixCsv, 20 * minute, true, 10 * minute, minute,
+            Alignment::Fixed, flooredCursor, error) ||
+        flooredCursor != PrefixMarker{2, 10 * minute, minute, Alignment::Fixed, 15 * minute}) {
+        std::cerr << "Unchanged --since floor reset MEXC prefix recovery progress: "
+                  << error << '\n';
+        ok = false;
     }
 
     constexpr std::int64_t fundingDefault = 100;
@@ -206,11 +260,10 @@ int main() {
         ok = false;
     }
 
-    // The downloaders no longer take a per-symbol advisory lock — runs are
-    // serialized per exchange by the update scripts' flock, and the lock files
-    // were visible clutter in the data directories. AtomicFileWriter still
-    // publishes through sibling locks, so these semantics stay load-bearing
-    // and keep their coverage here.
+    // The downloaders no longer take a per-symbol advisory lock — the binary's
+    // run-level guard serializes one exchange/output tree without putting lock
+    // files into the published data directories. AtomicFileWriter still uses
+    // advisory locks internally, so their semantics keep coverage here.
     struct DirectoryLock {
         explicit DirectoryLock(std::filesystem::path path) : lock_(std::move(path)) {
             if (!lock_.ownsLock()) {

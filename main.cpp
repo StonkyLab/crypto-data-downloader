@@ -19,7 +19,6 @@ Copyright (c) 2025 Vitezslav Kot <vitezslav.kot@stonky.cz>, Stonky s.r.o.
 #include "stonky/utils/utils.h"
 #include "stonky/csv_verifier.h"
 #include "stonky/downloader.h"
-#include "stonky/advisory_file_lock.h"
 #include "stonky/run_lock.h"
 #include "stonky/binance/binance_spot_downloader.h"
 #include <spdlog/spdlog.h>
@@ -76,25 +75,6 @@ std::vector<std::string> parseSymbolsFile(const std::string &path) {
         spdlog::warn(fmt::format("Could not parse symbols file: {}, reason: {}", path, e.what()));
     }
     return retVal;
-}
-
-/**
- * One downloader per exchange and output tree.
- *
- * Two runs over the same data interleave their staging directories, their
- * deterministic `<target>.writing` temporaries and their append-only CSV
- * tails. Comparing the base and tail again just before publishing narrows
- * that window but cannot close it, so the exclusion has to happen once, at
- * the level of the whole run.
- *
- * The lock file lives outside the data tree, so the HTTP server publishing
- * that tree never serves it, and ownership is a kernel file description:
- * released on exit, on SIGKILL and on a crash alike. Nothing unlinks it —
- * only the OS lock denotes an owner.
- */
-std::unique_ptr<AdvisoryFileLock> acquireRunLock(const std::string &exchange,
-                                                 const std::string &outputDirectory) {
-    return std::make_unique<AdvisoryFileLock>(runLockPath(exchange, outputDirectory));
 }
 
 int main(int argc, char **argv) {
@@ -392,17 +372,19 @@ int main(int argc, char **argv) {
         set_default_logger(combinedLogger);
         spdlog::flush_on(spdlog::level::info);
 
-        // Held for the rest of the run, aggregation and verification included:
-        // those rewrite the same files the downloads append to.
-        const auto runLock = acquireRunLock(exchange, outputDirectory);
-        if (!runLock->ownsLock()) {
+        // Two runs over the same data could interleave their deterministic
+        // sibling temporaries and CSV tails. Exclude that once for the whole
+        // process, including aggregation and verification. Lock state stays
+        // outside the data tree and kernel ownership dies with the process.
+        const RunLock runLock(exchange, outputDirectory);
+        if (!runLock.ownsLock()) {
             // Refusing to start because the lock could not be established at
             // all is a different problem from refusing because someone else
             // holds it, and it needs a different thing done about it.
-            spdlog::critical(runLock->contended()
+            spdlog::critical(runLock.contended()
                 ? fmt::format("A {} downloader is already running for {}", exchange, outputDirectory)
                 : fmt::format("Cannot establish the {} run lock for {}: {}",
-                              exchange, outputDirectory, runLock->error()));
+                              exchange, outputDirectory, runLock.error()));
             return -1;
         }
 

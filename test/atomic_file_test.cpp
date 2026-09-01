@@ -111,6 +111,31 @@ int main() {
         return 1;
     }
 
+    // Production writers are protected by the process-wide run guard and use
+    // this mode so their published directories never retain sibling lock files.
+    const auto noLockTarget = dir / "NO_LOCK.t6";
+    {
+        stonky::AtomicFileWriter noLock(
+            noLockTarget, std::ios::binary, stonky::AtomicFileWriter::Locking::None);
+        if (!noLock.isOpen()) {
+            std::cerr << noLock.error() << '\n';
+            return 1;
+        }
+        noLock.stream() << "without-lock-file";
+        std::string error;
+        if (!noLock.commit(error)) {
+            std::cerr << error << '\n';
+            return 1;
+        }
+    }
+    auto noLockSibling = noLockTarget;
+    noLockSibling += ".lock";
+    if (read(noLockTarget) != "without-lock-file" ||
+        std::filesystem::exists(noLockSibling)) {
+        std::cerr << "Lock-free atomic publication created persistent lock state\n";
+        return 1;
+    }
+
 #ifndef _WIN32
     // A hard process exit bypasses every C++ destructor.  The sibling output
     // stays partial, but the kernel releases the advisory lock.  A subsequent

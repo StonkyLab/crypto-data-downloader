@@ -89,7 +89,8 @@ bool HyperliquidDownloader::P::writeCSVCandlesToZorroT6File(const std::string &c
                                                             stonky::CandleInterval interval) {
     const std::filesystem::path pathToT6File{t6Path};
 
-    AtomicFileWriter output(pathToT6File);
+    AtomicFileWriter output(pathToT6File, std::ios::binary,
+                            AtomicFileWriter::Locking::None);
     if (!output.isOpen()) {
         spdlog::error(fmt::format("Couldn't prepare file {}: {}", t6Path, output.error()));
         return false;

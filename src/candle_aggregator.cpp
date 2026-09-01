@@ -722,10 +722,9 @@ CandleAggregator::Report aggregateFile(const std::filesystem::path &sourcePath,
         return report;
     }
 
-    // Hold the target's kernel lock for the complete operation. Both rewrite
-    // and append build a sibling file and commit by atomic replacement, so a
-    // failed scan/write never leaves a half-appended target.
-    // Runs are serialized per exchange by the update scripts' flock, so no
+    // Both rewrite and append build a sibling file and commit by atomic
+    // replacement, so a failed scan/write never leaves a half-appended target.
+    // The process-wide exchange/output guard excludes another run, so no
     // per-target lock file is created next to the data.
     AtomicFileWriter targetOutput(targetPath, std::ios::binary, AtomicFileWriter::Locking::None);
     if (!targetOutput.isOpen()) {

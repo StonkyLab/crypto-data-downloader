@@ -356,8 +356,8 @@ inline bool replaceAtomically(const std::filesystem::path &path, const Tail &exp
         return false;
     }
 
-    // Runs are serialized per exchange by the update scripts' flock, so this
-    // publishes without a sibling lock file next to the data.
+    // The process-wide exchange/output guard serializes runs, so this publishes
+    // without a sibling lock file next to the data.
     AtomicFileWriter replacement(path, std::ios::binary, AtomicFileWriter::Locking::None);
     if (!replacement.isOpen()) {
         error = replacement.error();
@@ -402,10 +402,9 @@ inline bool copyExactly(std::ifstream &input, std::ofstream &output,
 /**
  * Atomically publish existing data plus a validated append transaction.
  *
- * Runs are serialized per exchange by the update scripts' flock, so no per-file
- * lock is taken around this.  Re-inspecting and comparing the base before
- * publishing still closes the TOCTOU window, and that check is what actually
- * protects the file.
+ * The process-wide exchange/output guard serializes runs, so no per-file lock
+ * is taken around this. Re-inspecting and comparing the base before publishing
+ * still closes the TOCTOU window if this helper is ever called incorrectly.
  */
 inline bool appendAtomically(const std::filesystem::path &path, const Tail &expectedBase,
                              const std::span<const Record> records, std::string &error) {
@@ -439,8 +438,8 @@ inline bool appendAtomically(const std::filesystem::path &path, const Tail &expe
         return false;
     }
 
-    // Runs are serialized per exchange by the update scripts' flock, so this
-    // publishes without a sibling lock file next to the data.
+    // The process-wide exchange/output guard serializes runs, so this publishes
+    // without a sibling lock file next to the data.
     AtomicFileWriter replacement(path, std::ios::binary, AtomicFileWriter::Locking::None);
     if (!replacement.isOpen()) {
         error = replacement.error();

@@ -43,8 +43,8 @@ class AdvisoryFileLock {
 public:
     AdvisoryFileLock() = default;
 
-    explicit AdvisoryFileLock(std::filesystem::path path) {
-        acquire(std::move(path));
+    explicit AdvisoryFileLock(std::filesystem::path path, const bool sharedNamespace = false) {
+        acquire(std::move(path), sharedNamespace);
     }
 
     AdvisoryFileLock(const AdvisoryFileLock &) = delete;
@@ -56,7 +56,7 @@ public:
         release();
     }
 
-    bool acquire(std::filesystem::path path) {
+    bool acquire(std::filesystem::path path, const bool sharedNamespace = false) {
         if (ownsLock_) {
             error_ = "advisory lock is already held";
             return false;
@@ -66,6 +66,7 @@ public:
         contended_ = false;
 
 #ifdef _WIN32
+        (void) sharedNamespace;
         handle_ = ::CreateFileW(path_.c_str(), GENERIC_READ | GENERIC_WRITE,
                                 FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr,
                                 OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
@@ -95,7 +96,19 @@ public:
 #ifdef O_NOFOLLOW
         flags |= O_NOFOLLOW;
 #endif
+        if (sharedNamespace) {
+            flags |= O_NONBLOCK;
+        }
         descriptor_ = ::open(path_.c_str(), flags, 0666);
+        if (descriptor_ < 0 && sharedNamespace && errno == EACCES) {
+            // A run lock in /tmp may have been created by another account
+            // (most commonly root via sudo) with a restrictive umask. Try the
+            // existing regular file read-only; platforms that do not permit an
+            // exclusive flock on it fail closed below.
+            flags &= ~(O_RDWR | O_CREAT);
+            flags |= O_RDONLY;
+            descriptor_ = ::open(path_.c_str(), flags);
+        }
         if (descriptor_ < 0) {
             error_ = posixError("cannot open advisory lock file", errno);
             return false;
@@ -114,6 +127,14 @@ public:
             ::close(descriptor_);
             descriptor_ = -1;
             return false;
+        }
+
+        if (sharedNamespace) {
+            // Ignore EPERM for a file owned by somebody else: reaching this
+            // point already proves that its current permissions are usable.
+            // For a newly created file this defeats the creator's umask so the
+            // next run can use the same namespace under a different account.
+            (void) ::fchmod(descriptor_, 0666);
         }
 
         if (::flock(descriptor_, LOCK_EX | LOCK_NB) != 0) {

@@ -116,26 +116,25 @@ Concurrent runs are excluded once, for the whole process: at startup the
 downloader takes a non-blocking OS advisory lock keyed on the exchange and the
 canonical output directory, and holds it through downloading, aggregation and
 verification. A second run over the same data exits immediately with
-`A mexc downloader is already running for /data/crypto`. The lock file lives in
-`$XDG_RUNTIME_DIR` (or the system temp directory), deliberately outside the data
-tree so an HTTP server publishing that tree never serves it; its ownership is a
-kernel file description, released on exit, on SIGKILL and on a crash alike.
-There are no per-symbol or per-file lock files.
+`A mexc downloader is already running for /data/crypto`. Lock state lives in
+`/tmp` on POSIX; Windows uses a global named mutex instead of a file. Both are
+independent of the launching user's temporary-directory environment and outside
+the data tree, so an HTTP server publishing that tree never serves lock state.
+Ownership is released on exit, on SIGKILL and on a crash alike. There are no
+per-symbol or per-file lock files.
 
 Updates are published through validated staging plus atomic replacement. If a
 first download reaches only a provisional MEXC availability boundary, the usable
 suffix may be published, but `<SYMBOL>.csv.prefix.pending` is written first.
-Every later run probes the window immediately below the stored history — where
-an interrupted or provisionally bounded earlier download left off, and the only
-place a single MEXC Spot request can usefully inspect. If older candles become available,
-the downloaded range is merged by timestamp with every row already stored
-locally and the union atomically replaces the suffix. A transient API omission
-therefore cannot erase a candle that is already on disk; conflicting values at
-the same timestamp fail closed. The marker is removed only after a positive scan
-reaches the originally requested start. Negative probes never silently declare a
-shortened history complete — on MEXC Spot in particular a probe anchored at the
-requested start only ever inspects the oldest 500-interval window of the range,
-so its empty answer proves nothing about a gap further up.
+Every later run continues a persistent backward scan of the missing interval,
+one 500-interval MEXC Spot page at a time. An empty page advances the saved scan
+cursor instead of making every run repeat the same request. A page containing
+older candles is merged by timestamp with every row already stored locally and
+the union atomically replaces the suffix; scanning then continues below the new
+first row. A transient API omission therefore cannot erase a candle already on
+disk, and conflicting values at the same timestamp fail closed. A completely
+empty scan is never treated as proof that no older data exists; after reaching
+the floor it starts another pass on a later run.
 
 When an explicit `--since` is supplied after archiving, an orphan marker whose
 CSV was removed is retired. If a live suffix and marker remain, the marker is

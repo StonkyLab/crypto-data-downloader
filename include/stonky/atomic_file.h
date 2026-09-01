@@ -31,8 +31,8 @@ public:
     /**
      * Sibling: serialize writers through a persistent `<target>.lock` file.
      * None: skip the lock entirely — for writers whose runs are already
-     * serialized at a higher level (the update scripts hold a per-exchange
-     * flock), so no lock files litter the data directories.
+     * serialized by the downloader's exchange/output run guard, so no lock
+     * files litter the data directories.
      */
     enum class Locking { Sibling, None };
 
