@@ -593,15 +593,33 @@ void MEXCFuturesDownloader::updateMarketData(const std::string &dirPath, const s
                                 }
                                 prefixMarker.reset();
                             } else {
+                                const auto requestedStart = prefixMarker->requestedStart;
                                 const auto probeEndSeconds = currentCsv.firstTimestamp / 1000 - 1;
                                 const auto probe = m_p->mexcFuturesClient->probeHistoricalPrices(
                                     symbol, mexcCandleInterval,
-                                    prefixMarker->requestedStart / 1000, probeEndSeconds);
+                                    requestedStart / 1000, probeEndSeconds);
                                 rebuildPrefix = !probe.empty();
                                 if (rebuildPrefix) {
                                     spdlog::info(fmt::format(
                                         "Symbol {}: older MEXC Futures history became available; rebuilding prefix",
                                         symbol));
+                                } else {
+                                    // Same dead end the spot path had: the marker
+                                    // waits for RequestedRangeScanned, which no
+                                    // symbol listed after the requested start can
+                                    // ever reach, so 714 futures files carried one
+                                    // indefinitely.  This probe covers the whole
+                                    // older range rather than a fixed window, so an
+                                    // empty answer here is stronger evidence than
+                                    // spot's: nothing older exists to be found.
+                                    if (!mexc_staging::removePrefixMarker(symbolFilePathCsv,
+                                                                          prefixError)) {
+                                        throw std::runtime_error(prefixError);
+                                    }
+                                    prefixMarker.reset();
+                                    spdlog::info(fmt::format(
+                                        "Symbol {}: MEXC Futures serves nothing before {}; prefix boundary confirmed",
+                                        symbol, requestedStart));
                                 }
                             }
                         }
