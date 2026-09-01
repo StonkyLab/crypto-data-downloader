@@ -935,10 +935,9 @@ int main() {
         ok = false;
     }
 
-    // A fresh suffix is marked provisional before publication.  Every later
-    // scan can atomically union an older prefix with it, while the persistent
-    // marker prevents the suffix tail from becoming an incremental resume
-    // point that would permanently hide the missing history.
+    // A narrow first scan is published as-is, and every later scan atomically
+    // unions an older prefix into it.  The suffix tail is never an incremental
+    // resume point, which is what would permanently hide the missing history.
     const auto provisionalFundingCsv = tmp.path() / "PROVISIONAL_fr.csv";
     stonky::mexc_funding_csv::Tail missingFundingBase;
     std::vector<stonky::mexc_funding_csv::Record> noFundingRecords;
@@ -949,19 +948,6 @@ int main() {
     if (!stonky::mexc_funding_csv::readRecords(
             provisionalFundingCsv, missingFundingBase, noFundingRecords, error)) {
         std::cerr << "Could not inspect missing provisional funding CSV: " << error << '\n';
-        ok = false;
-    }
-    if (stonky::mexc_funding_csv::replaceAtomically(
-            provisionalFundingCsv, missingFundingBase, provisionalFundingSuffix, error) ||
-        std::filesystem::exists(provisionalFundingCsv)) {
-        std::cerr << "Unmarked fresh funding replacement was published\n";
-        ok = false;
-    }
-    if (!stonky::mexc_funding_csv::ensureProvisionalMarker(provisionalFundingCsv, error) ||
-        std::filesystem::exists(provisionalFundingCsv) ||
-        !std::filesystem::is_regular_file(
-            stonky::mexc_funding_csv::provisionalMarkerPath(provisionalFundingCsv))) {
-        std::cerr << "Fresh funding prefix was not marked before CSV publication: " << error << '\n';
         ok = false;
     }
     if (!stonky::mexc_funding_csv::replaceAtomically(
@@ -992,33 +978,26 @@ int main() {
         ok = false;
     }
 
-    bool stillProvisional = false;
     stonky::mexc_funding_csv::Tail convergedFundingTail;
     std::vector<stonky::mexc_funding_csv::Record> convergedStoredFunding;
-    if (!stonky::mexc_funding_csv::inspectProvisionalMarker(
-            provisionalFundingCsv, stillProvisional, error) || !stillProvisional ||
-        !stonky::mexc_funding_csv::readRecords(
+    if (!stonky::mexc_funding_csv::readRecords(
             provisionalFundingCsv, convergedFundingTail, convergedStoredFunding, error) ||
         convergedFundingTail.firstTimestamp != 100 || convergedFundingTail.timestamp != 400 ||
         convergedStoredFunding != widerFundingScan) {
-        std::cerr << "Converged funding prefix lost data or its provisional marker: "
-                  << error << '\n';
+        std::cerr << "Converged funding prefix lost data: " << error << '\n';
         ok = false;
     }
 
-    // A legacy CSV cannot become an established append base merely because a
-    // truncated but self-consistent snapshot contains its exact tail.  Migrate
-    // it to provisional before the first replacement, retain the marker, and
-    // let a later wider full scan fill the missing middle timestamp.
+    // An existing CSV cannot become an established append base merely because a
+    // truncated but self-consistent snapshot contains its exact tail: a later
+    // wider full scan must still fill the missing middle timestamp.
     const auto legacyFundingCsv = tmp.path() / "LEGACY_fr.csv";
     ok &= writeFile(legacyFundingCsv, fundingHeader + "\n100,0.0001\n");
     stonky::mexc_funding_csv::Tail legacyBase;
     std::vector<stonky::mexc_funding_csv::Record> legacyRecords;
     if (!stonky::mexc_funding_csv::readRecords(
-            legacyFundingCsv, legacyBase, legacyRecords, error) ||
-        !stonky::mexc_funding_csv::ensureProvisionalMarker(legacyFundingCsv, error)) {
-        std::cerr << "Could not migrate legacy funding CSV to provisional mode: "
-                  << error << '\n';
+            legacyFundingCsv, legacyBase, legacyRecords, error)) {
+        std::cerr << "Could not read legacy funding CSV: " << error << '\n';
         ok = false;
     }
 
@@ -1041,14 +1020,10 @@ int main() {
 
     stonky::mexc_funding_csv::Tail truncatedLegacyTail;
     std::vector<stonky::mexc_funding_csv::Record> truncatedLegacyRecords;
-    bool legacyStillProvisional = false;
-    if (!stonky::mexc_funding_csv::inspectProvisionalMarker(
-            legacyFundingCsv, legacyStillProvisional, error) || !legacyStillProvisional ||
-        !stonky::mexc_funding_csv::readRecords(
+    if (!stonky::mexc_funding_csv::readRecords(
             legacyFundingCsv, truncatedLegacyTail, truncatedLegacyRecords, error) ||
         truncatedLegacyRecords != firstLegacyUnion) {
-        std::cerr << "Legacy funding migration lost data or its provisional marker: "
-                  << error << '\n';
+        std::cerr << "Legacy funding migration lost data: " << error << '\n';
         ok = false;
     }
 
@@ -1071,9 +1046,7 @@ int main() {
 
     stonky::mexc_funding_csv::Tail restoredLegacyTail;
     std::vector<stonky::mexc_funding_csv::Record> restoredLegacyRecords;
-    if (!stonky::mexc_funding_csv::inspectProvisionalMarker(
-            legacyFundingCsv, legacyStillProvisional, error) || !legacyStillProvisional ||
-        !stonky::mexc_funding_csv::readRecords(
+    if (!stonky::mexc_funding_csv::readRecords(
             legacyFundingCsv, restoredLegacyTail, restoredLegacyRecords, error) ||
         restoredLegacyRecords != restoredRemoteSnapshot) {
         std::cerr << "Legacy funding history failed to converge after the wider snapshot: "

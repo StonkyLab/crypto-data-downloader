@@ -278,86 +278,6 @@ inline bool readRecords(const std::filesystem::path &path, Tail &tail,
     return inspectImpl(path, tail, &records, error);
 }
 
-inline constexpr std::string_view ProvisionalMarkerContents =
-    "mexc-funding-prefix-provisional-v1\n";
-
-inline std::filesystem::path provisionalMarkerPath(const std::filesystem::path &csvPath) {
-    auto path = csvPath;
-    path += ".prefix-provisional";
-    return path;
-}
-
-inline bool inspectProvisionalMarker(const std::filesystem::path &csvPath, bool &exists,
-                                     std::string &error) {
-    exists = false;
-    error.clear();
-    const auto marker = provisionalMarkerPath(csvPath);
-    std::error_code ec;
-    const auto status = std::filesystem::symlink_status(marker, ec);
-    if (ec) {
-        if (ec == std::errc::no_such_file_or_directory) {
-            return true;
-        }
-        error = fmt::format("cannot stat MEXC funding prefix marker {}: {}", marker.string(),
-                            ec.message());
-        return false;
-    }
-    if (!std::filesystem::exists(status)) {
-        return true;
-    }
-    if (!std::filesystem::is_regular_file(status)) {
-        error = fmt::format("MEXC funding prefix marker is not a regular file: {}",
-                            marker.string());
-        return false;
-    }
-
-    std::ifstream input(marker, std::ios::binary);
-    if (!input.is_open()) {
-        error = fmt::format("cannot open MEXC funding prefix marker {}", marker.string());
-        return false;
-    }
-    const std::string contents{std::istreambuf_iterator<char>{input},
-                               std::istreambuf_iterator<char>{}};
-    if (input.bad()) {
-        error = fmt::format("cannot read MEXC funding prefix marker {}", marker.string());
-        return false;
-    }
-    if (contents != ProvisionalMarkerContents) {
-        error = fmt::format("invalid MEXC funding prefix marker {}", marker.string());
-        return false;
-    }
-    exists = true;
-    return true;
-}
-
-inline bool ensureProvisionalMarker(const std::filesystem::path &csvPath, std::string &error) {
-    bool exists = false;
-    if (!inspectProvisionalMarker(csvPath, exists, error)) {
-        return false;
-    }
-    if (exists) {
-        return true;
-    }
-
-    const auto marker = provisionalMarkerPath(csvPath);
-    // Runs are serialized per exchange by the update scripts' flock, so this
-    // publishes without a sibling lock file next to the data.
-    AtomicFileWriter output(marker, std::ios::binary, AtomicFileWriter::Locking::None);
-    if (!output.isOpen()) {
-        error = output.error();
-        return false;
-    }
-    output.stream() << ProvisionalMarkerContents;
-    if (!output.stream().good()) {
-        error = fmt::format("cannot write MEXC funding prefix marker {}", marker.string());
-        return false;
-    }
-    if (!output.commit(error)) {
-        return false;
-    }
-    return true;
-}
-
 inline bool validateRecordSequence(const std::span<const Record> records, std::string &error) {
     std::optional<std::int64_t> previous;
     for (const auto &record : records) {
@@ -419,14 +339,6 @@ inline bool mergeRecords(const std::span<const Record> existing,
 inline bool replaceAtomically(const std::filesystem::path &path, const Tail &expectedBase,
                               const std::span<const Record> records, std::string &error) {
     error.clear();
-    bool provisional = false;
-    if (!inspectProvisionalMarker(path, provisional, error)) {
-        return false;
-    }
-    if (!provisional) {
-        error = "refusing to replace MEXC funding history without a valid provisional marker";
-        return false;
-    }
     if (records.empty()) {
         error = "refusing to publish an empty MEXC funding transaction";
         return false;

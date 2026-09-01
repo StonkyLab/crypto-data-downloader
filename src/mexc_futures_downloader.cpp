@@ -1039,25 +1039,11 @@ void MEXCFuturesDownloader::updateFundingRateData(const std::string &dirPath, co
                             "invalid existing funding-rate CSV: {}", fundingCsvError));
                     }
 
-                    bool provisionalPrefix = false;
-                    if (!mexc_funding_csv::inspectProvisionalMarker(
-                            symbolFilePathCsv, provisionalPrefix, fundingCsvError)) {
-                        throw std::runtime_error(fmt::format(
-                            "invalid funding prefix state: {}", fundingCsvError));
-                    }
-                    if (!provisionalPrefix) {
-                        // Migrate every fresh or legacy/unmarked CSV before fetching or writing.
-                        // MEXC does not expose an authoritative oldest-history boundary, so even
-                        // an exact local-tail overlap cannot prove that a self-consistent snapshot
-                        // did not omit a middle page.  The durable marker therefore makes all
-                        // future runs full-scan unions; a crash can leave marker-without-new-data
-                        // (safe to retry), never an unmarked suffix that permanently hides a gap.
-                        if (!mexc_funding_csv::ensureProvisionalMarker(
-                                symbolFilePathCsv, fundingCsvError)) {
-                            throw std::runtime_error(fmt::format(
-                                "failed to persist provisional funding prefix: {}", fundingCsvError));
-                        }
-                    }
+                    // MEXC exposes no authoritative oldest-history boundary for funding
+                    // rates, so an exact local-tail overlap still cannot prove a
+                    // self-consistent snapshot did not omit a middle page.  Every run is
+                    // therefore a full scan unioned into what is already stored, never an
+                    // incremental resume from the tail.
 
                     constexpr std::int64_t oldestDate = 1577836800000LL; // 2020-01-01 UTC
                     const std::int64_t cutoffTimestamp =
@@ -1174,17 +1160,16 @@ void MEXCFuturesDownloader::updateFundingRateData(const std::string &dirPath, co
                     if (!mexc_funding_csv::mergeRecords(
                             existingRecords, records, mergedRecords, fundingCsvError)) {
                         throw std::runtime_error(fmt::format(
-                            "failed to merge provisional funding history: {}", fundingCsvError));
+                            "failed to merge funding history: {}", fundingCsvError));
                     }
                     if (mergedRecords != existingRecords &&
                         !mexc_funding_csv::replaceAtomically(
                             symbolFilePathCsv, base, mergedRecords, fundingCsvError)) {
                         throw std::runtime_error(fmt::format(
-                            "failed to commit provisional funding history: {}", fundingCsvError));
+                            "failed to commit funding history: {}", fundingCsvError));
                     }
                     spdlog::info(fmt::format(
-                        "Symbol {}: provisional full scan retained {} funding rates; "
-                        "prefix marker remains until an authoritative boundary is available",
+                        "Symbol {}: full funding scan retained {} rates",
                         symbol, mergedRecords.size()));
 
                     return symbol;
@@ -1218,15 +1203,6 @@ void MEXCFuturesDownloader::updateFundingRateData(const std::string &dirPath, co
             }
             if (removedCsv) {
                 spdlog::info(fmt::format("Removing csv file for delisted symbol: {}, file: {}...", symbol, symbolFilePathCsv.string()));
-            }
-            const auto provisionalMarker =
-                mexc_funding_csv::provisionalMarkerPath(symbolFilePathCsv);
-            removeError.clear();
-            std::filesystem::remove(provisionalMarker, removeError);
-            if (removeError) {
-                throw std::runtime_error(fmt::format(
-                    "Could not remove delisted funding prefix marker {}: {}",
-                    provisionalMarker.string(), removeError.message()));
             }
         }
     }
