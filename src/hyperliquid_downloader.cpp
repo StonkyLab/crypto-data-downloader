@@ -12,6 +12,7 @@ Copyright (c) 2025 Vitezslav Kot <vitezslav.kot@stonky.cz>, Stonky s.r.o.
 #include "stonky/csv_data.h"
 #include "stonky/csv_format.h"
 #include "stonky/download_resume.h"
+#include "stonky/transient_error.h"
 #include "stonky/downloader.h"
 #include "stonky/future_utils.h"
 #include "stonky/hyperliquid/hyperliquid_rest_client.h"
@@ -428,6 +429,15 @@ void HyperliquidDownloader::updateMarketData(const std::string &dirPath,
                                            "Rate limit for symbol: {}, retry {}/{} in {} ms: {}",
                                            symbol, attempt + 1, maxRetries - 1, waitMs, errMsg));
                                        std::this_thread::sleep_for(std::chrono::milliseconds(waitMs));
+                                   } else if (isTransientTransportError(errMsg) && attempt < maxRetries - 1) {
+                                       // A reset, a lost DNS answer or a timed-out socket is not the venue
+                                       // rejecting the request; the tail is re-read before every attempt, so
+                                       // retrying resumes exactly where the fault cut the download.
+                                       const int waitMs = 2000 * (1 << attempt);
+                                       spdlog::warn(fmt::format(
+                                           "Transient network error for symbol: {}, retry {}/{} in {} ms: {}",
+                                           symbol, attempt + 1, maxRetries - 1, waitMs, errMsg));
+                                       std::this_thread::sleep_for(std::chrono::milliseconds(waitMs));
                                    } else {
                                        throw std::runtime_error(fmt::format(
                                            "Updating candles for symbol {} failed (attempt {}/{}): {}",
@@ -641,6 +651,15 @@ void HyperliquidDownloader::updateFundingRateData(const std::string &dirPath,
                                        const int waitMs = 1000 * (1 << attempt);
                                        spdlog::warn(fmt::format(
                                            "Rate limit for symbol: {}, retry {}/{} in {} ms: {}",
+                                           symbol, attempt + 1, maxRetries - 1, waitMs, errMsg));
+                                       std::this_thread::sleep_for(std::chrono::milliseconds(waitMs));
+                                   } else if (isTransientTransportError(errMsg) && attempt < maxRetries - 1) {
+                                       // A reset, a lost DNS answer or a timed-out socket is not the venue
+                                       // rejecting the request; the tail is re-read before every attempt, so
+                                       // retrying resumes exactly where the fault cut the download.
+                                       const int waitMs = 2000 * (1 << attempt);
+                                       spdlog::warn(fmt::format(
+                                           "Transient network error for symbol: {}, retry {}/{} in {} ms: {}",
                                            symbol, attempt + 1, maxRetries - 1, waitMs, errMsg));
                                        std::this_thread::sleep_for(std::chrono::milliseconds(waitMs));
                                    } else {
