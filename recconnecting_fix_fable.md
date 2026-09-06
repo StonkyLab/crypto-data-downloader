@@ -211,10 +211,15 @@ its last trade, so the probe ends immediately and behaviour is unchanged.
 
 Binance, OKX and MEXC still end a symbol on the first network fault; the
 symbol is reported by name in the run summary and its CSV resumes from the
-tail on the next run, so the damage is a delay rather than a loss, but the
-Binance run of 2026-09-02 (73 symbols) shows it is not rare. Adding the
-same loop there is ~15 lines per site, two sites per venue, and is proposed
-but not done.
+tail on the next run. Decision (operator, 2026-09-06): leave it. On these
+three venues a fault is a delay, not a loss — Binance appends from the
+tail, MEXC's transactional staging writes nothing on a failed run and
+redoes it next time, OKX fetches archive files by day and picks up the
+missing day — and no venue with a retention window short enough for a
+week's delay to matter is affected (Hyperliquid 1m, 3.5 days, is not
+downloaded). Adding six more retry loops would buy only a quieter exit
+code. The Bybit / Lighter / Hyperliquid loops were different: they already
+existed and were retrying the wrong thing.
 
 ## Operational follow-up
 
