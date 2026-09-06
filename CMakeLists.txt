@@ -180,6 +180,12 @@ if (BUILD_TESTING)
 endif ()
 
 if (BUILD_TESTING AND BUILD_DOWNLOADER)
+    add_executable(bybit_gap_pagination_test test/bybit_gap_pagination_test.cpp)
+    target_link_libraries(bybit_gap_pagination_test PRIVATE
+            spdlog::spdlog_header_only nlohmann_json::nlohmann_json bybit_api)
+    add_test(NAME bybit_pagination_crosses_long_gaps COMMAND bybit_gap_pagination_test)
+    set_tests_properties(bybit_pagination_crosses_long_gaps PROPERTIES TIMEOUT 30)
+
     add_executable(binance_pagination_test
             test/binance_pagination_test.cpp
             src/binance_common.cpp
