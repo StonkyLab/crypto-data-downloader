@@ -466,14 +466,25 @@ void LighterDownloader::updateMarketData(const std::string &dirPath,
                                // include that day's candle; the real-resolution download below
                                // is still bounded by the exact (unrounded) --since value.
                                const int64_t probeFrom = floorTimestamp(oldestLighterDate, dayMs);
+                               bool venueHasNoHistory = false;
                                for (int attempt = 0; attempt < probeRetries; ++attempt) {
                                    try {
                                        const auto probe = m_p->ltClient->getHistoricalPrices(
                                            symbol, lighter::CandleInterval::_1d, probeFrom, nowTimestamp);
-                                       // An empty but valid response is not an authoritative listing
-                                       // date. Starting at the venue floor is slower, but cannot
-                                       // permanently truncate a newly-created CSV.
-                                       listingDate = probe.empty() ? oldestLighterDate : probe.front().openTime;
+                                       // The probe spans the whole downloadable range at 1d. An
+                                       // empty answer therefore means the venue holds no candle at
+                                       // any resolution for this market: 19 listed-but-never-traded
+                                       // stock and FX perps (AAOI, ARM, GME, USDHKD, ...) answer
+                                       // exactly that. Walking the 1m history from the floor
+                                       // instead — 2825 empty windows at the 750 ms throttle, 35
+                                       // minutes per symbol, 11 hours per run for nothing — used
+                                       // to be the fallback. Skip the symbol for this run; nothing
+                                       // is created, so nothing can be truncated, and the next
+                                       // run probes again for two requests.
+                                       venueHasNoHistory = probe.empty();
+                                       if (!venueHasNoHistory) {
+                                           listingDate = probe.front().openTime;
+                                       }
                                        break;
                                    } catch (const std::exception &e) {
                                        if (attempt == probeRetries - 1) {
@@ -487,6 +498,12 @@ void LighterDownloader::updateMarketData(const std::string &dirPath,
                                            symbol, attempt + 1, probeRetries - 1, waitMs, e.what()));
                                        std::this_thread::sleep_for(std::chrono::milliseconds(waitMs));
                                    }
+                               }
+                               if (venueHasNoHistory) {
+                                   spdlog::info(fmt::format(
+                                       "Symbol {}: Lighter has no candle history for this market yet; skipping this run",
+                                       symbol));
+                                   return "";
                                }
                            }
 
