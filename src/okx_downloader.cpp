@@ -8,6 +8,10 @@ Copyright (c) 2025 Vitezslav Kot <vitezslav.kot@stonky.cz>, Stonky s.r.o.
 
 #include "stonky/okx/okx_downloader.h"
 #include "stonky/history_floor.h"
+#include "stonky/okx_trades_aggregator.h"
+#include <cctype>
+#include <optional>
+#include <string_view>
 #include "stonky/atomic_file.h"
 #include "stonky/csv_archive.h"
 #include "stonky/csv_data.h"
@@ -127,6 +131,95 @@ auto withRetry(const std::string &what, Fn &&fn) -> decltype(fn()) {
         }
     }
     throw std::runtime_error(fmt::format("{} failed after {} attempts: {}", what, MAX_REQUEST_ATTEMPTS, lastError));
+}
+
+using Decimal = OkxTradesAggregator::Decimal;
+
+/// Close of the last stored bar, so a trade-folded stretch right after the
+/// tail can fill its leading empty minutes the way the archive would.
+std::optional<Decimal> lastCloseFromCsv(const std::filesystem::path &path) {
+    std::error_code ec;
+    const auto size = std::filesystem::file_size(path, ec);
+    if (ec || size == 0) {
+        return std::nullopt;
+    }
+    std::ifstream in(path, std::ios::binary);
+    const auto tailLen = std::min<std::uintmax_t>(size, 4096);
+    in.seekg(static_cast<std::streamoff>(size - tailLen));
+    std::string tail(tailLen, '\0');
+    in.read(tail.data(), static_cast<std::streamsize>(tailLen));
+    while (!tail.empty() && (tail.back() == '\n' || tail.back() == '\r')) {
+        tail.pop_back();
+    }
+    const auto nl = tail.rfind('\n');
+    const std::string line = nl == std::string::npos ? tail : tail.substr(nl + 1);
+    std::vector<std::string> fields;
+    std::size_t start = 0;
+    for (auto comma = line.find(','); ; comma = line.find(',', start)) {
+        fields.push_back(line.substr(start, comma == std::string::npos ? std::string::npos : comma - start));
+        if (comma == std::string::npos) break;
+        start = comma + 1;
+    }
+    if (fields.size() < 5 || fields[0].empty() || !std::isdigit(static_cast<unsigned char>(fields[0][0]))) {
+        return std::nullopt;
+    }
+    try {
+        return Decimal{fields[4]};
+    } catch (const std::exception &) {
+        return std::nullopt;
+    }
+}
+
+/// Contract value (base units per contract) from rows that carry both
+/// `volume` (contracts) and `vol_ccy` (base): the ratio is exact for any row
+/// with trades. Zero when no such row exists in the first part of the file,
+/// which is what the archive's own 2021 rows look like.
+Decimal contractValueFromCsv(const std::filesystem::path &path) {
+    std::ifstream in(path);
+    std::string line;
+    std::size_t scanned = 0;
+    while (std::getline(in, line) && scanned++ < 20000) {
+        if (line.empty() || !std::isdigit(static_cast<unsigned char>(line[0]))) continue;
+        std::vector<std::string> f;
+        std::size_t start = 0;
+        for (auto comma = line.find(','); ; comma = line.find(',', start)) {
+            f.push_back(line.substr(start, comma == std::string::npos ? std::string::npos : comma - start));
+            if (comma == std::string::npos) break;
+            start = comma + 1;
+        }
+        if (f.size() < 7) continue;
+        try {
+            const Decimal vol{f[5]}, volCcy{f[6]};
+            if (vol > 0 && volCcy > 0) {
+                return volCcy / vol;
+            }
+        } catch (const std::exception &) {
+        }
+    }
+    return Decimal{0};
+}
+
+Decimal contractValueFromCandles(const std::vector<Candle> &candles) {
+    for (const auto &candle: candles) {
+        if (candle.vol > 0 && candle.volCcy > 0) {
+            return candle.volCcy / candle.vol;
+        }
+    }
+    return Decimal{0};
+}
+
+Candle toCandle(const OkxMinuteBar &bar) {
+    Candle candle;
+    candle.ts = bar.ts;
+    candle.o = bar.o;
+    candle.h = bar.h;
+    candle.l = bar.l;
+    candle.c = bar.c;
+    candle.vol = bar.vol;
+    candle.volCcy = bar.volCcy;
+    candle.volCcyQuote = bar.volCcyQuote;
+    candle.confirm = true;
+    return candle;
 }
 
 /// Enumerate every archive file covering [begin, end), walking the range in
@@ -664,11 +757,9 @@ void OKXDownloader::updateMarketData(const std::string &dirPath,
 
                            // Get instFamily and listTime for market data history API
                            std::string instFamilyOrId;
-                           int64_t instrumentListTime = 0;
 
                            auto it = instrumentMap.find(symbol);
                            if (it != instrumentMap.end()) {
-                               instrumentListTime = it->second.listTime;
                                if (instrumentType == InstrumentType::SPOT) {
                                    instFamilyOrId = symbol;
                                } else {
@@ -691,10 +782,13 @@ void OKXDownloader::updateMarketData(const std::string &dirPath,
                                                         symbol, instFamilyOrId));
                            }
 
-                           // Use instrument listing time if file doesn't exist or has older data
-                           if (instrumentListTime > 0 && fromTimeStamp < instrumentListTime) {
-                               fromTimeStamp = instrumentListTime;
-                           }
+                           // The instrument's listTime is deliberately NOT used as a floor. For a
+                           // contract OKX delisted and later relisted, /public/instruments reports
+                           // the relisting as listTime, and clamping to it threw away everything
+                           // the archive still holds from the original listing: KITE from
+                           // 2025-10-28 (listTime 2026-04-09), OL from 2024-11-21, DASH/ZEC/ZEN
+                           // from 2023-08-20. The archive listing answers an empty window with one
+                           // cheap request, so let it decide where the history starts.
 
                            // Nothing older than the bulk archive floor is fetched. Going deeper is
                            // possible through the paginated REST candle endpoint (it reaches back to
@@ -714,24 +808,213 @@ void OKXDownloader::updateMarketData(const std::string &dirPath,
 
                                 // Oldest first, monthly files then the daily files of the running
                                 // month: strictly ascending, which is what append-only resume needs.
-                                std::vector<std::pair<MarketDataFileInfo, int64_t> > archiveFiles;
+                                struct ArchiveEntry {
+                                    MarketDataFileInfo fileInfo;
+                                    int64_t spanMs;
+                                    bool fromTrades;
+                                    int64_t clipStart; // first minute this entry may contribute
+                                    int64_t clipEnd;   // first minute the next source owns; 0 = open-ended
+                                    int segment;       // trade-folded stretch this entry belongs to
+                                };
+                                std::vector<ArchiveEntry> archiveFiles;
 
                                 for (const auto &fileInfo: listArchiveFiles(
                                          *m_p->okxClient, MarketDataModule::Candles1m, instrumentType,
                                          instFamilyOrId, DateAggrType::monthly,
                                          fromTimeStamp, monthlyCutoff)) {
-                                    archiveFiles.emplace_back(fileInfo, MONTHLY_FILE_SPAN_MS);
+                                    archiveFiles.push_back({fileInfo, MONTHLY_FILE_SPAN_MS, false, 0, 0, -1});
                                 }
                                 for (const auto &fileInfo: listArchiveFiles(
                                          *m_p->okxClient, MarketDataModule::Candles1m, instrumentType,
                                          instFamilyOrId, DateAggrType::daily,
                                          std::max(fromTimeStamp, monthlyCutoff), nowTimestamp)) {
-                                    archiveFiles.emplace_back(fileInfo, MS_PER_DAY);
+                                    archiveFiles.push_back({fileInfo, MS_PER_DAY, false, 0, 0, -1});
                                 }
 
-                                for (const auto &[fileInfo, fileSpanMs]: archiveFiles) {
-                                    if (fileInfo.dateTs + fileSpanMs <= lastSavedTimestamp) {
+                                // Where the candle archive has nothing, the trade archive usually
+                                // still has everything. OKX's candle archive starts 2023-08-20 for
+                                // every contract it has since delisted (37 symbols here) and holds
+                                // nothing at all for one delisted before that date (17 more), while
+                                // the trade archive covers all of them from 2021-10-01. Folding the
+                                // trades into minutes reproduces the candles exactly — see
+                                // OkxTradesAggregator. Every stretch the candle listing leaves
+                                // uncovered — before its first file, between two files, or the
+                                // whole range when it has none — is offered to the trade listing;
+                                // a stretch with no trades either is a genuine halt and stays empty.
+                                {
+                                    std::vector<ArchiveEntry> tradeEntries;
+                                    int segment = 0;
+                                    const auto addGap = [&](const int64_t gapStart, const int64_t gapEnd,
+                                                            const int64_t clipEnd) {
+                                        if (gapEnd - gapStart < MS_PER_DAY) {
+                                            return;
+                                        }
+                                        std::vector<std::pair<MarketDataFileInfo, int64_t> > found;
+                                        if (gapStart < monthlyCutoff) {
+                                            for (const auto &fileInfo: listArchiveFiles(
+                                                     *m_p->okxClient, MarketDataModule::Trades, instrumentType,
+                                                     instFamilyOrId, DateAggrType::monthly, gapStart,
+                                                     std::min(gapEnd, monthlyCutoff))) {
+                                                found.emplace_back(fileInfo, MONTHLY_FILE_SPAN_MS);
+                                            }
+                                        }
+                                        if (gapEnd > monthlyCutoff) {
+                                            for (const auto &fileInfo: listArchiveFiles(
+                                                     *m_p->okxClient, MarketDataModule::Trades, instrumentType,
+                                                     instFamilyOrId, DateAggrType::daily,
+                                                     std::max(gapStart, monthlyCutoff), gapEnd)) {
+                                                found.emplace_back(fileInfo, MS_PER_DAY);
+                                            }
+                                        }
+                                        bool added = false;
+                                        for (const auto &[fileInfo, spanMs]: found) {
+                                            if (fileInfo.dateTs + spanMs <= gapStart || fileInfo.dateTs >= gapEnd) {
+                                                continue;
+                                            }
+                                            tradeEntries.push_back({fileInfo, spanMs, true, gapStart, clipEnd, segment});
+                                            added = true;
+                                        }
+                                        if (added) {
+                                            spdlog::info(fmt::format(
+                                                "Symbol {}: candle archive has nothing for [{}, {}); folding {} trade archive file(s) instead",
+                                                symbol, gapStart, gapEnd, tradeEntries.size()));
+                                            ++segment;
+                                        }
+                                    };
+
+                                    int64_t cursor = fromTimeStamp;
+                                    for (const auto &entry: archiveFiles) {
+                                        addGap(cursor, entry.fileInfo.dateTs, entry.fileInfo.dateTs);
+                                        cursor = std::max(cursor, entry.fileInfo.dateTs + entry.spanMs);
+                                    }
+                                    if (archiveFiles.empty()) {
+                                        // No next source to hand over to: fold up to the last trade
+                                        // and do not fill flat bars beyond it (a delisted contract
+                                        // would otherwise gain years of them).
+                                        addGap(cursor, nowTimestamp, 0);
+                                    }
+                                    archiveFiles.insert(archiveFiles.end(), tradeEntries.begin(), tradeEntries.end());
+                                    std::ranges::stable_sort(archiveFiles, [](const ArchiveEntry &a, const ArchiveEntry &b) {
+                                        return a.fileInfo.dateTs < b.fileInfo.dateTs;
+                                    });
+                                }
+
+                                std::optional<Decimal> lastWrittenClose =
+                                    tailCheck.foundValid ? lastCloseFromCsv(symbolFilePathCsv) : std::nullopt;
+
+                                const auto persist = [&](std::vector<Candle> candles, const std::string &what) {
+                                    if (candles.empty()) {
+                                        return;
+                                    }
+                                    std::ranges::sort(candles, [](const Candle &a, const Candle &b) {
+                                        return a.ts < b.ts;
+                                    });
+                                    std::vector<Candle> newCandles;
+                                    for (const auto &candle: candles) {
+                                        if (candle.ts > lastSavedTimestamp ||
+                                            (!hasSavedTimestamp && candle.ts == lastSavedTimestamp)) {
+                                            newCandles.push_back(candle);
+                                        }
+                                    }
+                                    if (newCandles.empty()) {
+                                        return;
+                                    }
+                                    if (!P::writeCandlesToCSVFile(newCandles, symbolFilePathCsv.string(), false)) {
+                                        throw std::runtime_error(fmt::format(
+                                            "failed to persist {} for {}", what, symbol));
+                                    }
+                                    totalNewCandles += static_cast<int64_t>(newCandles.size());
+                                    lastSavedTimestamp = newCandles.back().ts;
+                                    lastWrittenClose = newCandles.back().c;
+                                    hasSavedTimestamp = true;
+                                    hasUsableCsv = true;
+                                };
+
+                                // Contract value for the folded rows, resolved once and only when a
+                                // trade stretch exists: the live instrument, else the ratio stored
+                                // in this CSV, else the first candle archive file, else zero.
+                                std::optional<Decimal> contractValue;
+                                const auto resolveContractValue = [&]() -> Decimal {
+                                    if (const auto inst = instrumentMap.find(symbol);
+                                        inst != instrumentMap.end() && inst->second.ctVal > 0) {
+                                        return inst->second.ctVal;
+                                    }
+                                    if (tailCheck.foundValid) {
+                                        if (const auto fromCsv = contractValueFromCsv(symbolFilePathCsv); fromCsv > 0) {
+                                            return fromCsv;
+                                        }
+                                    }
+                                    for (const auto &entry: archiveFiles) {
+                                        if (entry.fromTrades) {
+                                            continue;
+                                        }
+                                        const auto candles = withRetry(
+                                            fmt::format("download {} for {} (contract value)", entry.fileInfo.filename, symbol),
+                                            [&] {
+                                                const auto zipData = RESTClient::downloadMarketDataFile(entry.fileInfo.url);
+                                                return okx::utils::parseCandlesCsv(okx::utils::extractZip(zipData), symbol);
+                                            });
+                                        if (const auto fromCandles = contractValueFromCandles(candles); fromCandles > 0) {
+                                            return fromCandles;
+                                        }
+                                        break;
+                                    }
+                                    spdlog::warn(fmt::format(
+                                        "Symbol {}: contract value unknown (not listed, no candle archive); vol_ccy and vol_ccy_quote of folded rows are written as 0",
+                                        symbol));
+                                    return Decimal{0};
+                                };
+
+                                std::optional<OkxTradesAggregator> fold;
+                                int activeSegment = -1;
+                                int64_t activeClipStart = 0;
+                                int64_t activeClipEnd = 0;
+                                const auto persistBars = [&](const std::vector<OkxMinuteBar> &bars) {
+                                    std::vector<Candle> candles;
+                                    candles.reserve(bars.size());
+                                    for (const auto &bar: bars) {
+                                        if (bar.ts < activeClipStart || (activeClipEnd > 0 && bar.ts >= activeClipEnd)) {
+                                            continue;
+                                        }
+                                        candles.push_back(toCandle(bar));
+                                    }
+                                    persist(std::move(candles), "trade-folded candles");
+                                };
+                                const auto finishSegment = [&]() {
+                                    if (fold && activeSegment >= 0) {
+                                        persistBars(fold->finish(activeClipEnd));
+                                        activeSegment = -1;
+                                    }
+                                };
+
+                                for (const auto &entry: archiveFiles) {
+                                    const auto &fileInfo = entry.fileInfo;
+                                    if (fileInfo.dateTs + entry.spanMs <= lastSavedTimestamp) {
                                         continue; // fully covered by what is already stored
+                                    }
+                                    if (!entry.fromTrades || entry.segment != activeSegment) {
+                                        finishSegment();
+                                    }
+
+                                    if (entry.fromTrades) {
+                                        if (!contractValue) {
+                                            contractValue = resolveContractValue();
+                                        }
+                                        if (entry.segment != activeSegment) {
+                                            fold.emplace(symbol, *contractValue);
+                                            fold->resume(lastSavedTimestamp, lastWrittenClose);
+                                            activeSegment = entry.segment;
+                                            activeClipStart = entry.clipStart;
+                                            activeClipEnd = entry.clipEnd;
+                                        }
+                                        const auto csvData = withRetry(
+                                            fmt::format("download {} for {}", fileInfo.filename, symbol), [&] {
+                                            const auto zipData = RESTClient::downloadMarketDataFile(fileInfo.url);
+                                            return okx::utils::extractZip(zipData);
+                                        });
+                                        persistBars(fold->feed(std::string_view(
+                                            reinterpret_cast<const char *>(csvData.data()), csvData.size())));
+                                        continue;
                                     }
 
                                     // Never skip forward past a failed file. Propagating the bounded
@@ -745,35 +1028,9 @@ void OKXDownloader::updateMarketData(const std::string &dirPath,
                                         // only this contract's rows — see parseCandlesCsv()
                                         return okx::utils::parseCandlesCsv(csvData, symbol);
                                     });
-
-                                    if (candles.empty()) {
-                                        continue;
-                                    }
-
-                                    std::ranges::sort(candles, [](const Candle &a, const Candle &b) {
-                                        return a.ts < b.ts;
-                                    });
-
-                                    std::vector<Candle> newCandles;
-                                    for (const auto &candle: candles) {
-                                        if (candle.ts > lastSavedTimestamp ||
-                                            (!hasSavedTimestamp && candle.ts == lastSavedTimestamp)) {
-                                            newCandles.push_back(candle);
-                                        }
-                                    }
-
-                                    if (!newCandles.empty()) {
-                                        if (!P::writeCandlesToCSVFile(newCandles, symbolFilePathCsv.string(), false)) {
-                                            throw std::runtime_error(fmt::format(
-                                                "failed to persist archive file {} for {}", fileInfo.filename,
-                                                symbol));
-                                        }
-                                        totalNewCandles += static_cast<int64_t>(newCandles.size());
-                                        lastSavedTimestamp = newCandles.back().ts;
-                                        hasSavedTimestamp = true;
-                                        hasUsableCsv = true;
-                                    }
+                                    persist(std::move(candles), fmt::format("archive file {}", fileInfo.filename));
                                 }
+                                finishSegment();
 
                                // Bulk files only cover complete days, so the last hours come from the
                                // paginated REST endpoint.

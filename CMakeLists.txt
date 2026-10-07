@@ -169,6 +169,10 @@ if (BUILD_TESTING)
     target_include_directories(download_resume_test PRIVATE include)
     add_test(NAME since_resume_boundary_policy COMMAND download_resume_test)
 
+    add_executable(okx_trades_aggregator_test test/okx_trades_aggregator_test.cpp)
+    target_include_directories(okx_trades_aggregator_test PRIVATE include)
+    add_test(NAME okx_trades_fold_reproduces_archive_candles COMMAND okx_trades_aggregator_test)
+
     add_executable(transient_error_test test/transient_error_test.cpp)
     target_include_directories(transient_error_test PRIVATE include)
     add_test(NAME transient_error_classifies_network_faults COMMAND transient_error_test)
