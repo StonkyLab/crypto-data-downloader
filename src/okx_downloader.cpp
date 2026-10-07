@@ -882,9 +882,37 @@ void OKXDownloader::updateMarketData(const std::string &dirPath,
                                         }
                                     };
 
+                                    // A candle file is only nominally a whole period: the monthly
+                                    // file for 2023-08 of a delisted contract starts on the 20th,
+                                    // the day the venue began its candle archive, and a relisted
+                                    // contract's first file starts on its relisting day. Ending the
+                                    // trade stretch at the file's nominal start therefore left
+                                    // 1-19 August 2023 missing from every folded contract. Peek at
+                                    // the file that follows a gap and hand over at its first row.
+                                    const auto firstRowOf = [&](const MarketDataFileInfo &fileInfo) -> int64_t {
+                                        const auto candles = withRetry(
+                                            fmt::format("download {} for {} (first row)", fileInfo.filename, symbol),
+                                            [&] {
+                                                const auto zipData = RESTClient::downloadMarketDataFile(fileInfo.url);
+                                                return okx::utils::parseCandlesCsv(okx::utils::extractZip(zipData), symbol);
+                                            });
+                                        int64_t first = fileInfo.dateTs;
+                                        bool any = false;
+                                        for (const auto &candle: candles) {
+                                            if (!any || candle.ts < first) {
+                                                first = candle.ts;
+                                                any = true;
+                                            }
+                                        }
+                                        return first;
+                                    };
+
                                     int64_t cursor = fromTimeStamp;
                                     for (const auto &entry: archiveFiles) {
-                                        addGap(cursor, entry.fileInfo.dateTs, entry.fileInfo.dateTs);
+                                        if (entry.fileInfo.dateTs - cursor >= MS_PER_DAY) {
+                                            const auto handOver = std::max(entry.fileInfo.dateTs, firstRowOf(entry.fileInfo));
+                                            addGap(cursor, handOver, handOver);
+                                        }
                                         cursor = std::max(cursor, entry.fileInfo.dateTs + entry.spanMs);
                                     }
                                     if (archiveFiles.empty()) {
