@@ -205,7 +205,6 @@ hand-maintained Visual Studio solution or project files; generate them from
    ```powershell
    cmake -S . -B build -G "Visual Studio 17 2022" -A x64 "-DCMAKE_TOOLCHAIN_FILE=C:/vcpkg/scripts/buildsystems/vcpkg.cmake"
    cmake --build build --config Release --parallel
-   ctest --test-dir build -C Release --output-on-failure
    ```
 
    The checked-in `vcpkg.json` installs the complete dependency set, including
@@ -237,8 +236,10 @@ hand-maintained Visual Studio solution or project files; generate them from
    cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release \
        -DCMAKE_TOOLCHAIN_FILE=../vcpkg/scripts/buildsystems/vcpkg.cmake
    cmake --build build --parallel 2
-   ctest --test-dir build --output-on-failure
    ```
+
+   This builds the downloader only. The regression tests are opt-in — see
+   below — so a deployment build does not spend time on them.
 
 The manifest uses `minizip-ng`; when building without vcpkg and without an
 installed minizip-ng CMake package, the OKX connector fetches minizip-ng 4.0.7.
@@ -246,8 +247,9 @@ Set `-DOKX_FETCH_MINIZIP=OFF` for a fully offline, fail-closed configuration.
 
 ### Tests, sanitizers, and coverage
 
-The deterministic regression suite does not need exchange connectivity. A
-minimal test-only build avoids all connector and minizip dependencies:
+The deterministic regression suite does not need exchange connectivity and is
+built only when `-DBUILD_TESTING=ON` is given (it defaults to OFF). A minimal
+test-only build avoids all connector and minizip dependencies:
 
 ```bash
 cmake -S . -B build-tests -DBUILD_DOWNLOADER=OFF -DBUILD_TESTING=ON

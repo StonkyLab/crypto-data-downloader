@@ -5,6 +5,10 @@ set(CMAKE_CXX_STANDARD 23)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 
+# Tests are opt-in: the deployment build on the VPS has no use for them and
+# they only lengthen it. include(CTest) would default BUILD_TESTING to ON, so
+# the option has to be declared first.
+option(BUILD_TESTING "Build the regression tests (ctest)" OFF)
 include(CTest)
 
 option(BUILD_DOWNLOADER "Build the exchange downloader executable" ON)
