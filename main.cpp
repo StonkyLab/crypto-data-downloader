@@ -393,6 +393,9 @@ int main(int argc, char **argv) {
             aggregatorOptions.sourceMinutes = barSizeInMinutes;
             aggregatorOptions.maxJobs = maxJobs;
             aggregatorOptions.allowPartialBuckets = allowPartialAggregation;
+            // -s / -a restrict the aggregation the same way they restrict a
+            // download; without them every source file is rebuilt.
+            aggregatorOptions.symbols = symbols;
             // Rebuild derived files transactionally. This allows a source gap
             // repaired since the previous run to be inserted in chronological
             // order instead of remaining behind an append-only target tail.

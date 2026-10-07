@@ -1168,9 +1168,11 @@ std::vector<CandleAggregator::Report> CandleAggregator::aggregateDirectory(const
         return reports;
     }
 
+    const std::set<std::string> wanted(options.symbols.begin(), options.symbols.end());
     std::vector<std::filesystem::path> sourceFiles;
     for (const auto &entry: std::filesystem::directory_iterator(sourceDir)) {
-        if (entry.is_regular_file() && entry.path().extension() == ".csv") {
+        if (entry.is_regular_file() && entry.path().extension() == ".csv" &&
+            (wanted.empty() || wanted.contains(entry.path().stem().string()))) {
             sourceFiles.push_back(entry.path());
         }
     }
