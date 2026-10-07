@@ -171,6 +171,7 @@ if (BUILD_TESTING)
 
     add_executable(okx_trades_aggregator_test test/okx_trades_aggregator_test.cpp)
     target_include_directories(okx_trades_aggregator_test PRIVATE include)
+    target_link_libraries(okx_trades_aggregator_test PRIVATE spdlog::spdlog_header_only)
     add_test(NAME okx_trades_fold_reproduces_archive_candles COMMAND okx_trades_aggregator_test)
 
     add_executable(transient_error_test test/transient_error_test.cpp)
