@@ -53,8 +53,11 @@ struct OkxMinuteBar {
  * Conventions reproduced from the candle archive:
  *  - a minute without a trade is a flat bar at the previous close with zero
  *    volume (20 of 1440 on that MATIC day), so the fold fills them in;
- *  - OHLC follow trade time order; files are sorted by created_time, and a
- *    file that is not gets sorted here;
+ *  - OHLC follow execution order, which is the file's row order (trade_id is
+ *    strictly increasing). created_time is NOT a usable sort key: LUNA's May
+ *    2022 archive has it stepping back by up to a month between adjacent rows
+ *    while trade_id never does, so it only picks the minute. A trade_id going
+ *    backwards aborts;
  *  - `size` is in contracts, so `volCcy` needs the contract value. A caller
  *    that cannot establish it passes zero and gets zero in both currency
  *    columns, which is what the 2021 rows of the candle archive carry too.
@@ -92,7 +95,7 @@ public:
         std::vector<Trade> trades;
 
         std::size_t pos = 0;
-        bool sorted = true;
+        std::int64_t lastTradeId = -1;
         while (pos < csv.size()) {
             auto eol = csv.find('\n', pos);
             if (eol == std::string_view::npos) {
@@ -125,21 +128,24 @@ public:
             if (field[0] != instId_) {
                 continue; // a family archive can carry a sibling contract's rows
             }
-            std::int64_t ts = 0;
-            for (const char ch: field[5]) {
-                if (ch < '0' || ch > '9') {
-                    throw std::runtime_error("OKX trade record has a non-numeric created_time: " +
-                                             std::string(line));
+            const auto digits = [&line](const std::string_view text, const char *what) {
+                std::int64_t value = 0;
+                for (const char ch: text) {
+                    if (ch < '0' || ch > '9') {
+                        throw std::runtime_error(std::string("OKX trade record has a non-numeric ") + what +
+                                                 ": " + std::string(line));
+                    }
+                    value = value * 10 + (ch - '0');
                 }
-                ts = ts * 10 + (ch - '0');
+                return value;
+            };
+            const auto tradeId = digits(field[1], "trade_id");
+            if (tradeId < lastTradeId) {
+                throw std::runtime_error("OKX trade archive is not in execution order (trade_id " +
+                                         std::to_string(tradeId) + " after " + std::to_string(lastTradeId) + ")");
             }
-            if (!trades.empty() && ts < trades.back().ts) {
-                sorted = false;
-            }
-            trades.push_back({ts, field[3], field[4]});
-        }
-        if (!sorted) {
-            std::ranges::stable_sort(trades, {}, &Trade::ts);
+            lastTradeId = tradeId;
+            trades.push_back({digits(field[5], "created_time"), field[3], field[4]});
         }
 
         std::vector<OkxMinuteBar> closed;
