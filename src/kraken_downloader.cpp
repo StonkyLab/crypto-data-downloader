@@ -17,6 +17,7 @@ Copyright (c) 2026 Vitezslav Kot <vitezslav.kot@stonky.cz>, Stonky s.r.o.
 #include "stonky/downloader.h"
 #include "stonky/future_utils.h"
 #include "stonky/kraken/kraken_rest_client.h"
+#include "stonky/kraken/kraken_funding_archive.h"
 #include "stonky/kraken/kraken.h"
 #include "stonky/utils/utils.h"
 #include "stonky/utils/semaphore.h"
@@ -98,7 +99,13 @@ struct KrakenDownloader::P {
 
     void downloadSpotCandles(const std::string &symbol, const std::string &csvPath) const;
 
-    void downloadFundingRates(const std::string &symbol, const std::string &csvPath) const;
+    /**
+     * Seed a file that starts from nothing with the venue's own export, then
+     * append the REST window. `venueListed` false means the contract exists
+     * only in the archive: the REST endpoint rejects its symbol.
+     */
+    void downloadFundingRates(const std::string &symbol, const std::string &csvPath,
+                              const FundingArchive *archive, bool venueListed) const;
 
     /**
      * Run `fn` up to five times. A rate-limit answer and a transient transport
@@ -484,8 +491,27 @@ void KrakenDownloader::P::downloadSpotCandles(const std::string &symbol, const s
     write(fold.finish(floorTimestamp(nowMs - MINUTE_MS, MINUTE_MS)));
 }
 
-void KrakenDownloader::P::downloadFundingRates(const std::string &symbol, const std::string &csvPath) const {
-    const auto resume = checkFundingRatesCSVFile(csvPath);
+void KrakenDownloader::P::downloadFundingRates(const std::string &symbol, const std::string &csvPath,
+                                               const FundingArchive *archive, const bool venueListed) const {
+    auto resume = checkFundingRatesCSVFile(csvPath);
+
+    if (!resume.hasSavedRecord && archive != nullptr) {
+        // The archive ends inside the REST window, so the REST rows below
+        // continue it without a gap; any overlap is dropped by timestamp.
+        const auto history = archive->rates(symbol);
+        if (!history.empty()) {
+            if (!writeFundingRatesToCSVFile(history, csvPath, resume)) {
+                throw std::runtime_error(fmt::format("CSV funding-rate write failed for symbol {}", symbol));
+            }
+            resume = checkFundingRatesCSVFile(csvPath);
+            spdlog::info(fmt::format("Seeded {} funding periods of symbol: {} from the Kraken archive",
+                                     history.size(), symbol));
+        }
+    }
+
+    if (!venueListed) {
+        return;
+    }
     const auto rates = client->getHistoricalFundingRates(symbol);
     if (rates.empty()) {
         return;
@@ -647,9 +673,50 @@ void KrakenDownloader::updateFundingRateData(const std::string &dirPath,
         spdlog::info(fmt::format("Updating symbols: {}", fmt::join(symbols, ", ")));
     }
 
-    const auto selection = m_p->selectSymbols(m_p->listSymbols(), symbols, frDirectory, "_fr");
-    const auto &symbolsToUpdate = selection.first;
+    const auto listed = m_p->listSymbols();
+    std::set<std::string> venue;
+    for (const auto &entry: listed) {
+        venue.insert(entry.symbol);
+    }
+    const auto selection = m_p->selectSymbols(listed, symbols, frDirectory, "_fr");
+    auto symbolsToUpdate = selection.first;
     const auto &symbolsToDelete = selection.second;
+
+    const auto pathOf = [&frDirectory](const std::string &symbol) {
+        std::filesystem::path path = frDirectory;
+        path.append(symbol + "_fr.csv");
+        return path;
+    };
+
+    // The REST endpoint answers roughly the last year. Kraken's own export
+    // reaches back to the first perpetuals and still names contracts the venue
+    // has dropped from every listing, but it is 110 MB, so it is fetched only
+    // when some symbol starts from nothing or was asked for by name and is
+    // unknown to the venue. A file that already holds records only needs the
+    // REST window appended.
+    std::vector<std::string> unknownRequested;
+    for (const auto &symbol: symbols) {
+        if (!venue.contains(symbol)) {
+            unknownRequested.push_back(symbol);
+        }
+    }
+    const bool anyFresh = std::ranges::any_of(symbolsToUpdate, [&pathOf](const std::string &symbol) {
+        return !P::checkFundingRatesCSVFile(pathOf(symbol).string()).hasSavedRecord;
+    });
+    std::unique_ptr<FundingArchive> archive;
+    if (anyFresh || !unknownRequested.empty()) {
+        spdlog::info(fmt::format("Downloading the Kraken funding history archive: {}", FUNDING_ARCHIVE_URL));
+        archive = std::make_unique<FundingArchive>(RESTClient::downloadFile(FUNDING_ARCHIVE_URL));
+        // Archive-only contracts: every one of them for a whole-universe run,
+        // else only those asked for by name.
+        for (const auto &symbol: symbols.empty() ? archive->symbols() : unknownRequested) {
+            if (!venue.contains(symbol) && archive->contains(symbol)) {
+                symbolsToUpdate.push_back(symbol);
+            }
+        }
+        deduplicatePreserveOrder(symbolsToUpdate);
+        removeUnsafeSymbolFileComponents(symbolsToUpdate);
+    }
 
     if (onSymbolsToUpdateCB) {
         onSymbolsToUpdateCB(symbolsToUpdate);
@@ -666,13 +733,14 @@ void KrakenDownloader::updateFundingRateData(const std::string &dirPath,
     for (const auto &s: symbolsToUpdate) {
         futures.push_back(
             launchBounded(m_p->maxConcurrentDownloadJobs,
-                          [this, frDirectory](const std::string &symbol) -> std::filesystem::path {
-                              std::filesystem::path symbolFilePathCsv = frDirectory;
-                              symbolFilePathCsv.append(symbol + "_fr.csv");
+                          [this, &pathOf, archivePtr = archive.get(), &venue](
+                      const std::string &symbol) -> std::filesystem::path {
+                              const std::filesystem::path symbolFilePathCsv = pathOf(symbol);
 
                               spdlog::info(fmt::format("Updating FR for symbol: {}...", symbol));
                               P::withRetries(symbol, "funding rates", [&] {
-                                  m_p->downloadFundingRates(symbol, symbolFilePathCsv.string());
+                                  m_p->downloadFundingRates(symbol, symbolFilePathCsv.string(), archivePtr,
+                                                            venue.contains(symbol));
                               });
                               spdlog::info(fmt::format("CSV file for symbol: {} updated", symbol));
                               return symbolFilePathCsv;

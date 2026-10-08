@@ -238,4 +238,16 @@ if (BUILD_TESTING AND BUILD_DOWNLOADER)
             stonky_common
             kraken_api)
     add_test(NAME kraken_trades_fold_reproduces_venue_candles COMMAND kraken_trades_aggregator_test)
+
+    add_executable(kraken_funding_archive_test test/kraken_funding_archive_test.cpp)
+    target_include_directories(kraken_funding_archive_test PRIVATE
+            include
+            stonky-cpp-common/include
+            kraken-cpp-api/include)
+    target_link_libraries(kraken_funding_archive_test PRIVATE
+            spdlog::spdlog_header_only
+            nlohmann_json::nlohmann_json
+            stonky_common
+            kraken_api)
+    add_test(NAME kraken_funding_archive_parses_export COMMAND kraken_funding_archive_test)
 endif ()

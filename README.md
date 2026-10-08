@@ -49,9 +49,16 @@ file ends at its last trade, because the venue would otherwise keep adding
 one flat zero-volume bar per interval forever.
 
 **Futures funding** (`-t fr`): hourly periods, stored as the *relative* rate
-(fraction of the mark price per hour, positive when longs pay). The endpoint
-has no range parameters and answers roughly the **last year** for every
-contract, so collect it at least every few months — older periods are gone.
+(fraction of the mark price per hour, positive when longs pay). The REST
+endpoint has no range parameters and answers roughly the **last year**; the
+rest comes from Kraken's own export, a ZIP of per-contract CSVs reaching back
+to the first perpetuals (PI_ 2018-08, PF_ 2022-03) whose values are identical
+to the REST ones on every overlapping period. A symbol that starts from
+nothing is seeded from the export (fetched once per run, 110 MB, only when
+needed) and the REST window is appended; a file that already holds records
+only gets the REST window. The export also contributes contracts the venue
+has dropped from every listing. The snapshot in the URL ends 2026-02-01,
+inside the REST window, so keep collecting at least every few months.
 
 **Spot.** Symbols are the pair altnames the API accepts: `XBTUSD`, `ETHEUR`,
 `SOLUSDT` (Kraken says XBT, not BTC). The OHLC endpoint serves the last 720
