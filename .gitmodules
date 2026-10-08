@@ -19,3 +19,6 @@
 [submodule "lighter-cpp-api"]
 	path = lighter-cpp-api
 	url = https://github.com/StonkyLab/lighter-cpp-api.git
+[submodule "kraken-cpp-api"]
+	path = kraken-cpp-api
+	url = git@github.com:StonkyLab/kraken-cpp-api.git

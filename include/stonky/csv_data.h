@@ -23,6 +23,8 @@ public:
         bool foundValid{false};
         /// True when trailing torn/invalid bytes were truncated away
         bool repairedTail{false};
+        /// The last valid data record itself (no newline); empty when none was found
+        std::string record{};
     };
 
     /**

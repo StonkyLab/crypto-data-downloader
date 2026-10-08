@@ -8,7 +8,7 @@ A high-performance command-line utility for downloading historical market data (
 
 ## Features
 
-- **Multi-Exchange Support**: Binance, Bybit, OKX, MEXC, Hyperliquid, and Lighter
+- **Multi-Exchange Support**: Binance, Bybit, OKX, MEXC, Hyperliquid, Lighter, and Kraken
 - **Multiple Data Types**: OHLCV candles and funding rate history
 - **Parallel Downloads**: Configurable concurrent job processing
 - **Flexible Output**: CSV format with optional T6 (Zorro) conversion
@@ -28,8 +28,49 @@ A high-performance command-line utility for downloading historical market data (
 | MEXC         | ✅ | ✅ | ✅ | ✅ |
 | Hyperliquid  | ✅ | ❌ | ✅ | ✅ |
 | Lighter      | ✅ | ❌ | ✅ | ✅ |
+| Kraken       | ✅ | ✅ | ✅ | ✅ (futures) |
 
 ### Exchange-Specific Notes
+
+#### Kraken
+
+`-e kraken` covers **Kraken Futures** (`-c f`, the default) and **Kraken Spot**
+(`-c s`). Both use public endpoints only; no API key is needed.
+
+**Futures.** Symbols are the venue's contract names: `PF_XBTUSD` (perpetual,
+multi-collateral — the bulk of the universe), `PI_XBTUSD` (perpetual,
+inverse). Dated `FF_`/`FI_` futures and options are not downloaded. Candles
+come from the charts API (executed-trade series) at 1m, 5m, 15m, 30m, 1h,
+4h, 12h, 1d and 1w, over the whole history since listing (PI_ since 2018-08,
+PF_ since 2022-03), as a continuous series: a minute without a trade is a
+flat zero-volume bar. The universe includes the ~450 delisted contracts whose
+candles the charts API still serves (`-d` drops them); a delisted contract's
+file ends at its last trade, because the venue would otherwise keep adding
+one flat zero-volume bar per interval forever.
+
+**Futures funding** (`-t fr`): hourly periods, stored as the *relative* rate
+(fraction of the mark price per hour, positive when longs pay). The endpoint
+has no range parameters and answers roughly the **last year** for every
+contract, so collect it at least every few months — older periods are gone.
+
+**Spot.** Symbols are the pair altnames the API accepts: `XBTUSD`, `ETHEUR`,
+`SOLUSDT` (Kraken says XBT, not BTC). The OHLC endpoint serves the last 720
+candles of a pair and nothing older, so **1-minute bars are folded from the
+public trade tape**, which is paginated back to the pair's first trade
+(October 2013 for XBTUSD). The fold follows the venue's own OHLC conventions
+(volume summed as decimals, empty minutes as flat zero-volume bars at the
+previous close) and only writes a minute once it is closed. Only `-b 1` is
+downloadable; build coarser bars with `-g`, exactly as for OKX.
+
+> **Cost of the spot tape:** 1 000 trades per request and one IP-wide budget
+> of about one request per second (`EGeneral:Too many requests` after a burst
+> of ~25). XBTUSD and XBTEUR hold ~110 million trades each, ETHUSD 67 million:
+> a major pair's first download takes about a day and a half, the whole
+> 1 460-pair universe weeks. Spot downloads therefore run one symbol at a
+> time; every later run only pulls the trades since the last stored bar.
+> Kraken also publishes quarterly OHLCVT ZIP files (support article
+> 360047124832, Google Drive) that could bootstrap a pair in minutes — not
+> wired in, it is a manual download.
 
 #### Lighter
 
@@ -276,7 +317,7 @@ crypto_data_downloader [OPTIONS]
 
 | Option | Long Form | Description | Default |
 |--------|-----------|-------------|---------|
-| `-e` | `--exchange` | Exchange: `bnb` (Binance), `bybit`, `okx`, `mexc`, `hl` (Hyperliquid), `lt` (Lighter) | `bnb` |
+| `-e` | `--exchange` | Exchange: `bnb` (Binance), `bybit`, `okx`, `mexc`, `hl` (Hyperliquid), `lt` (Lighter), `kraken` | `bnb` |
 | `-t` | `--data_type` | Data type: `c` (candles), `fr` (funding rates) | `c` |
 | `-o` | `--output` | Output directory path | *required* |
 | `-s` | `--symbols` | Symbols to download (comma-separated) or `all` | `all` |
@@ -315,6 +356,18 @@ crypto_data_downloader [OPTIONS]
 **Download funding rate history from OKX:**
 ```bash
 ./crypto_data_downloader -e okx -t fr -o /data/okx
+```
+
+**Kraken Futures: all perpetuals, 1h candles, then funding:**
+```bash
+./crypto_data_downloader -e kraken -o /data/kraken -b 60
+./crypto_data_downloader -e kraken -o /data/kraken -t fr
+```
+
+**Kraken Spot: fold the trade tape of two pairs into 1m bars, then build 1h:**
+```bash
+./crypto_data_downloader -e kraken -c s -o /data/kraken -b 1 -s XBTUSD,ETHEUR
+./crypto_data_downloader -e kraken -c s -o /data/kraken -b 1 -g 60 -s XBTUSD,ETHEUR
 ```
 
 **Continue with a bounded live history after archiving old CSV files:**
@@ -584,6 +637,7 @@ the exact canonical headers are:
 | MEXC Spot | `open_time,open,high,low,close,volume,quote_asset_volume` |
 | Hyperliquid Futures | `open_time,open,high,low,close,volume` |
 | Lighter Futures | `open_time,open,high,low,close,volume` |
+| Kraken Spot and Futures | `open_time,open,high,low,close,volume` |
 
 All time fields are Unix milliseconds. For Binance, `timestamp` is the open
 time while `close_time` is the inclusive close time. A six-column example is:
@@ -626,6 +680,7 @@ crypto_data_downloader/
 │   ├── mexc/                 # MEXC-specific downloader
 │   ├── hyperliquid/          # Hyperliquid-specific downloader
 │   ├── lighter/              # Lighter-specific downloader
+│   ├── kraken/               # Kraken-specific downloader
 │   └── downloader.h          # Common utilities
 ├── src/                      # Implementation files
 ├── binance-cpp-api/          # Binance API wrapper (submodule)
@@ -634,6 +689,7 @@ crypto_data_downloader/
 ├── mexc-cpp-api/             # MEXC API wrapper (submodule)
 ├── hyperliquid-cpp-api/      # Hyperliquid API wrapper (submodule)
 ├── lighter-cpp-api/          # Lighter API wrapper (submodule)
+├── kraken-cpp-api/           # Kraken API wrapper (submodule)
 ├── stonky-cpp-common/        # Common utilities (submodule)
 ├── test/                     # Deterministic CTest regression suite
 ├── vcpkg.json                # Pinned cross-platform dependency manifest

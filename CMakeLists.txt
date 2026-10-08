@@ -64,6 +64,7 @@ if (BUILD_DOWNLOADER)
     add_subdirectory(mexc-cpp-api)
     add_subdirectory(hyperliquid-cpp-api)
     add_subdirectory(lighter-cpp-api)
+    add_subdirectory(kraken-cpp-api)
 endif ()
 
 include_directories(
@@ -74,7 +75,8 @@ include_directories(
         okx-cpp-api/include
         mexc-cpp-api/include
         hyperliquid-cpp-api/include
-        lighter-cpp-api/include)
+        lighter-cpp-api/include
+        kraken-cpp-api/include)
 
 set(HEADERS
         include/stonky/downloader.h
@@ -98,6 +100,8 @@ set(HEADERS
         include/stonky/mexc/mexc_spot_downloader.h
         include/stonky/hyperliquid/hyperliquid_downloader.h
         include/stonky/lighter/lighter_downloader.h
+        include/stonky/kraken/kraken_downloader.h
+        include/stonky/kraken_trades_aggregator.h
         src/mexc_funding_csv.h
         src/mexc_funding_pagination.h
 )
@@ -115,11 +119,12 @@ set(SOURCES
         src/mexc_spot_downloader.cpp
         src/hyperliquid_downloader.cpp
         src/lighter_downloader.cpp
+        src/kraken_downloader.cpp
 )
 
 if (BUILD_DOWNLOADER)
     add_executable(crypto_data_downloader main.cpp ${SOURCES} ${HEADERS})
-    target_link_libraries(crypto_data_downloader PRIVATE spdlog::spdlog_header_only cxxopts::cxxopts magic_enum::magic_enum nlohmann_json::nlohmann_json binance_api bybit_api okx_api mexc_api hyperliquid_api lighter_api)
+    target_link_libraries(crypto_data_downloader PRIVATE spdlog::spdlog_header_only cxxopts::cxxopts magic_enum::magic_enum nlohmann_json::nlohmann_json binance_api bybit_api okx_api mexc_api hyperliquid_api lighter_api kraken_api)
 endif ()
 
 if (BUILD_TESTING)
@@ -221,4 +226,16 @@ if (BUILD_TESTING AND BUILD_DOWNLOADER)
             stonky_common
             mexc_api)
     add_test(NAME mexc_models_preserve_binary64_value COMMAND mexc_models_precision_test)
+
+    add_executable(kraken_trades_aggregator_test test/kraken_trades_aggregator_test.cpp)
+    target_include_directories(kraken_trades_aggregator_test PRIVATE
+            include
+            stonky-cpp-common/include
+            kraken-cpp-api/include)
+    target_link_libraries(kraken_trades_aggregator_test PRIVATE
+            spdlog::spdlog_header_only
+            nlohmann_json::nlohmann_json
+            stonky_common
+            kraken_api)
+    add_test(NAME kraken_trades_fold_reproduces_venue_candles COMMAND kraken_trades_aggregator_test)
 endif ()

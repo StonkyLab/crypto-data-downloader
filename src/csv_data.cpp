@@ -109,6 +109,7 @@ CsvData::TailCheck CsvData::lastValidRecord(const std::string& path, const std::
             if (isTerminated && isValidRecord(line, expectedFields, allowMoreFields, ts)) {
                 result.timestamp = ts;
                 result.foundValid = true;
+                result.record = line;
 
                 // Truncate any trailing invalid bytes after this record's newline.
                 const std::size_t validEnd = readStart + searchEnd + 1; // include '\n'
