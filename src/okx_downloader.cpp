@@ -1105,6 +1105,15 @@ void OKXDownloader::updateMarketData(const std::string &dirPath,
                                if (hasUsableCsv) {
                                    return symbolFilePathCsv;
                                }
+                               // A delisted symbol OKX holds no candles for and nothing local
+                               // either: no history left to fetch (DOTR-USDT failed every
+                               // Sunday). A live symbol without data is still a failure.
+                               if (const auto it = instrumentMap.find(symbol);
+                                   it == instrumentMap.end() || it->second.state != InstrumentStatus::live) {
+                                   spdlog::warn(fmt::format(
+                                       "Delisted symbol {} has no OKX candles and no local data; skipped", symbol));
+                                   return std::filesystem::path{};
+                               }
                                throw std::runtime_error(fmt::format(
                                    "No OKX candle data available for symbol: {}", symbol));
                            } catch (const std::exception &e) {
