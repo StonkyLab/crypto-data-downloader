@@ -721,6 +721,12 @@ CandleAggregator::Report aggregateFile(const std::filesystem::path &sourcePath,
         report.error = "cannot determine source file modification time";
         return report;
     }
+    // What the source can know: a bucket that ended after its last write was
+    // still running when the bars were downloaded.
+    const auto sourceCapturedMs = std::min(
+        nowMs, static_cast<std::int64_t>(std::chrono::duration_cast<std::chrono::milliseconds>(
+                   std::chrono::file_clock::to_sys(sourceWriteTimeBefore).time_since_epoch())
+                                              .count()));
 
     // Both rewrite and append build a sibling file and commit by atomic
     // replacement, so a failed scan/write never leaves a half-appended target.
@@ -1069,8 +1075,10 @@ CandleAggregator::Report aggregateFile(const std::filesystem::path &sourcePath,
 
     // A bucket which ends in the past is closed even when the exchange omitted
     // its final source bars (common around outages and delistings). Count/omit
-    // or explicitly render it like every other historical gap. Only the
-    // wall-clock-current bucket is held back for a later run.
+    // or explicitly render it like every other historical gap. A bucket that
+    // had not ended when the source was last written is held back for a later
+    // run: the OKX X-Perp 1m download ended at 14:07, the aggregation ran at
+    // 14:12, and every symbol's 14:05 bucket was reported as a gap (2026-10-18).
     if (!bucket.empty) {
         std::int64_t bucketEnd{};
         if (!checkedAdd(bucket.start, bucketMs, bucketEnd)) {
@@ -1078,7 +1086,7 @@ CandleAggregator::Report aggregateFile(const std::filesystem::path &sourcePath,
             report.error = "trailing aggregate bucket exceeds int64 timestamp range";
             return report;
         }
-        if (bucketEnd <= nowMs) {
+        if (bucketEnd <= sourceCapturedMs) {
             emit();
         }
     }

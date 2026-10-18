@@ -652,9 +652,14 @@ void MEXCFuturesDownloader::updateMarketData(const std::string &dirPath, const s
                         if (!expectedLive) {
                             std::optional<std::int64_t> newestProbeTimestamp;
                             if (!rebuildPrefix) {
+                                // Inclusive bounds: stop at the last closed candle. Up to
+                                // currentOpen the probe returned the running one too - a
+                                // stock contract paused for the weekend reads as delisted,
+                                // and its live candle then failed the closed-range check
+                                // (FUTUSTOCK_USDT, FWDISTOCK_USDT, 2026-10-18).
                                 const auto probe = m_p->mexcFuturesClient->probeHistoricalPrices(
                                     symbol, mexcCandleInterval, actualFromMs / 1000,
-                                    currentOpen / 1000);
+                                    lastCompletedOpen / 1000);
                                 if (!probe.empty()) {
                                     newestProbeTimestamp = probe.back().openTime;
                                 }

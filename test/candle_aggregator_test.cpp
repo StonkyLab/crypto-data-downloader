@@ -194,6 +194,34 @@ bool checkTrailingPartialDoesNotCreateHeaderOnlyTarget(const std::filesystem::pa
     return true;
 }
 
+bool checkBucketRunningAtDownloadIsHeldBack(const std::filesystem::path &pricesDir) {
+    const auto sourceDir = pricesDir / "1m";
+    std::filesystem::create_directories(sourceDir);
+    const auto nowMs = std::chrono::duration_cast<std::chrono::milliseconds>(
+                           std::chrono::system_clock::now().time_since_epoch())
+                           .count();
+    // The previous 5m bucket has ended by the clock, but the download that
+    // wrote its first two bars ran in its middle.
+    const auto bucket = nowMs - nowMs % 300000 - 300000;
+    const auto path = sourceDir / "TEST.csv";
+    {
+        std::ofstream out(path, std::ios::trunc);
+        out << "open_time,open,high,low,close,volume\n"
+            << bucket << ",10,11,9,10.5,1\n"
+            << bucket + 60000 << ",10.5,12,10,11,2\n";
+    }
+    std::filesystem::last_write_time(
+        path, std::chrono::file_clock::from_sys(std::chrono::sys_time<std::chrono::milliseconds>(
+                  std::chrono::milliseconds(bucket + 150000))));
+
+    const auto report = aggregate(pricesDir, false);
+    if (report.failed || report.incompleteBuckets != 0 || report.barsWritten != 0) {
+        std::cerr << "A bucket still running at download time was reported as a gap\n";
+        return false;
+    }
+    return true;
+}
+
 bool checkHistoricalTrailingGapIsReported(const std::filesystem::path &strictDir,
                                           const std::filesystem::path &partialDir) {
     for (const auto &pricesDir: {strictDir, partialDir}) {
@@ -866,6 +894,7 @@ int main() {
     const auto emptyDir = temporaryDirectory.path() / "empty";
     const auto malformedOnlyDir = temporaryDirectory.path() / "malformed-only";
     const auto trailingDir = temporaryDirectory.path() / "trailing";
+    const auto runningAtDownloadDir = temporaryDirectory.path() / "running-at-download";
     const auto historicalTrailingStrictDir = temporaryDirectory.path() / "historical-trailing-strict";
     const auto historicalTrailingPartialDir = temporaryDirectory.path() / "historical-trailing-partial";
     const auto extremeTimestampDir = temporaryDirectory.path() / "extreme-timestamp";
@@ -896,6 +925,7 @@ int main() {
            checkSumOverflowIsLocalized(sumOverflowDir) &&
            checkEmptySourceFails(emptyDir) && checkMalformedOnlySourceFails(malformedOnlyDir) &&
            checkTrailingPartialDoesNotCreateHeaderOnlyTarget(trailingDir) &&
+           checkBucketRunningAtDownloadIsHeldBack(runningAtDownloadDir) &&
            checkHistoricalTrailingGapIsReported(historicalTrailingStrictDir,
                                                 historicalTrailingPartialDir) &&
            checkExtremeTimestampIsLocalized(extremeTimestampDir) &&
