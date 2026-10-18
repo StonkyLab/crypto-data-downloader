@@ -502,15 +502,28 @@ void BybitDownloader::updateMarketData(const std::string &dirPath,
                                        spdlog::warn(fmt::format("Rate limit for symbol: {}, retry {}/{} in {} ms: {}",
                                                                 symbol, attempt + 1, maxRetries - 1, waitMs, errMsg));
                                        std::this_thread::sleep_for(std::chrono::milliseconds(waitMs));
-                                   } else if (isTransientTransportError(errMsg) && attempt < maxRetries - 1) {
+                                   } else if ((isTransientTransportError(errMsg) ||
+                                               errMsg.find("code: 10016") != std::string::npos) &&
+                                              attempt < maxRetries - 1) {
                                        // A reset, a lost DNS answer or a timed-out socket is not the venue
-                                       // rejecting the request; the tail is re-read before every attempt, so
-                                       // retrying resumes exactly where the fault cut the download.
+                                       // rejecting the request, nor is Bybit's own 10016 service error, which
+                                       // hit 181 symbols one Sunday and six others the next (2026-10-11/18);
+                                       // the tail is re-read before every attempt, so retrying resumes exactly
+                                       // where the fault cut the download.
                                        const int waitMs = 2000 * (1 << attempt);
                                        spdlog::warn(fmt::format(
                                            "Transient network error for symbol: {}, retry {}/{} in {} ms: {}",
                                            symbol, attempt + 1, maxRetries - 1, waitMs, errMsg));
                                        std::this_thread::sleep_for(std::chrono::milliseconds(waitMs));
+                                   } else if (isUnknownSymbolError(errMsg) &&
+                                              (symbolDeliveryDates.contains(symbol) ||
+                                               delistedSpotSymbols.contains(symbol))) {
+                                       spdlog::warn(fmt::format(
+                                           "Symbol {} is delisted and Bybit no longer serves it ({}); its local "
+                                           "history stays as it is", symbol, errMsg));
+                                       return std::filesystem::exists(symbolFilePathCsv)
+                                                  ? symbolFilePathCsv
+                                                  : std::filesystem::path{};
                                    } else {
                                        throw std::runtime_error(fmt::format(
                                            "Updating candles for symbol {} failed (attempt {}/{}): {}",
@@ -755,10 +768,14 @@ void BybitDownloader::updateFundingRateData(const std::string &dirPath,
                                        spdlog::warn(fmt::format("Rate limit for symbol: {}, retry {}/{} in {} ms: {}",
                                                                 symbol, attempt + 1, maxRetries - 1, waitMs, errMsg));
                                        std::this_thread::sleep_for(std::chrono::milliseconds(waitMs));
-                                   } else if (isTransientTransportError(errMsg) && attempt < maxRetries - 1) {
+                                   } else if ((isTransientTransportError(errMsg) ||
+                                               errMsg.find("code: 10016") != std::string::npos) &&
+                                              attempt < maxRetries - 1) {
                                        // A reset, a lost DNS answer or a timed-out socket is not the venue
-                                       // rejecting the request; the tail is re-read before every attempt, so
-                                       // retrying resumes exactly where the fault cut the download.
+                                       // rejecting the request, nor is Bybit's own 10016 service error, which
+                                       // hit 181 symbols one Sunday and six others the next (2026-10-11/18);
+                                       // the tail is re-read before every attempt, so retrying resumes exactly
+                                       // where the fault cut the download.
                                        const int waitMs = 2000 * (1 << attempt);
                                        spdlog::warn(fmt::format(
                                            "Transient network error for symbol: {}, retry {}/{} in {} ms: {}",

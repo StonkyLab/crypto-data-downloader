@@ -15,6 +15,7 @@ Copyright (c) 2025 Vitezslav Kot <vitezslav.kot@stonky.cz>, Stonky s.r.o.
 #include "stonky/download_resume.h"
 #include "stonky/downloader.h"
 #include "stonky/future_utils.h"
+#include "stonky/transient_error.h"
 #include "stonky/utils/semaphore.h"
 #include "stonky/utils/utils.h"
 #include "stonky/binance/binance.h"
@@ -237,7 +238,8 @@ void BinanceFuturesDownloader::updateMarketData(const std::string &dirPath, cons
     for (const auto &s: symbolsToUpdate) {
         futures.push_back(
             launchBounded(m_p->maxConcurrentDownloadJobs,
-                       [finalPath, this, &bnbCandleInterval, &barSizeInMinutes, convertToT6, &symbolDeliveryDates](
+                       [finalPath, this, &bnbCandleInterval, &barSizeInMinutes, convertToT6, &symbolDeliveryDates,
+                        &exchangeSymbolSet](
                    const std::string &symbol) ->
                    std::filesystem::path {
                            std::filesystem::path symbolFilePathCsv = finalPath;
@@ -301,6 +303,14 @@ void BinanceFuturesDownloader::updateMarketData(const std::string &dirPath, cons
                                    return symbolFilePathCsv;
                                }
                            } catch (const std::exception &e) {
+                               if (!exchangeSymbolSet.contains(symbol) && isUnknownSymbolError(e.what())) {
+                                   spdlog::warn(fmt::format(
+                                       "Symbol {} is delisted and Binance no longer serves it ({}); its local "
+                                       "history stays as it is", symbol, e.what()));
+                                   return std::filesystem::exists(symbolFilePathCsv)
+                                              ? symbolFilePathCsv
+                                              : std::filesystem::path{};
+                               }
                                spdlog::warn(fmt::format("Updating candles for symbol: {} failed, reason: {}",
                                                         symbol, e.what()));
                                throw;

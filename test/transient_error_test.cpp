@@ -35,5 +35,31 @@ int main() {
             ok = false;
         }
     }
+    // A venue saying it does not list the symbol at all (verbatim, Sunday cron logs);
+    // anything else - its service errors included - must not read as that.
+    constexpr std::string_view unknown[] = {
+        "Bad HTTP response: 400, API Code: -1121, message: Invalid symbol.",
+        "Bad response, code 400, msg: {\"msg\":\"Invalid symbol.\",\"code\":-1121,\"_extend\":null}",
+        "OKX API error, code: 51001, msg: Instrument ID, Instrument ID code, or Spread ID doesn't exist.",
+        "Bybit API error, code: 10001, msg: Not supported symbols",
+    };
+    constexpr std::string_view known[] = {
+        "Bybit API error, code: 10016, msg: svc error: Get kline failed",
+        "Bybit API error, code: 10001, msg: params error: symbol invalid",
+        "Bad HTTP response: 400, API Code: -1121, message: Timestamp for this request is outside of the recvWindow.",
+        "Connection reset by peer [system:104]",
+    };
+    for (const auto m: unknown) {
+        if (!stonky::isUnknownSymbolError(m)) {
+            std::cerr << "Not classified as an unknown symbol: " << m << '\n';
+            ok = false;
+        }
+    }
+    for (const auto m: known) {
+        if (stonky::isUnknownSymbolError(m)) {
+            std::cerr << "Classified as an unknown symbol: " << m << '\n';
+            ok = false;
+        }
+    }
     return ok ? 0 : 1;
 }

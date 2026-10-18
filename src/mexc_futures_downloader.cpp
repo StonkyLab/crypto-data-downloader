@@ -674,8 +674,12 @@ void MEXCFuturesDownloader::updateMarketData(const std::string &dirPath, const s
                             }
                             if (decision.action ==
                                 mexc_staging::DelistedProbeAction::RefuseFresh) {
-                                throw std::runtime_error(
-                                    "MEXC Futures bounded delisted-symbol probe returned no candles for a fresh file");
+                                // Delisted, nothing local, nothing at the venue: no history
+                                // left to fetch (ENFLAMESTOCK_USDT failed every Sunday).
+                                spdlog::warn(fmt::format(
+                                    "Delisted MEXC Futures symbol {} has no local file and the bounded "
+                                    "probe returned no candles; skipped", symbol));
+                                return std::filesystem::path{};
                             }
                             authoritativeLastOpen = decision.authoritativeLastOpen;
                         }
@@ -1044,6 +1048,7 @@ void MEXCFuturesDownloader::updateFundingRateData(const std::string &dirPath, co
                     bool hasMoreData = true;
                     std::optional<std::int64_t> previousRemoteTimestamp;
                     std::optional<mexc_funding_pagination::SnapshotMetadata> pageSnapshot;
+                    int rescans = 0;
 
                     while (hasMoreData) {
                         constexpr int32_t pageSize = 1000;
@@ -1077,6 +1082,20 @@ void MEXCFuturesDownloader::updateFundingRateData(const std::string &dirPath, co
                                 currentPage, pageSize, response.resultList.size(),
                                 response.currentPage, response.pageSize, response.totalCount,
                                 response.totalPage, pageSnapshot, paginationError)) {
+                            // A settlement landing during the scan shifts the pages under it
+                            // (AEVO_USDT at 00:07, 2026-10-18): read them again from the first.
+                            if (rescans < 2 && pageSnapshot &&
+                                paginationError.find("changed during the scan") != std::string::npos) {
+                                ++rescans;
+                                spdlog::warn(fmt::format(
+                                    "Symbol {}: MEXC funding pages changed during the scan; rescanning",
+                                    symbol));
+                                currentPage = 1;
+                                newRates.clear();
+                                previousRemoteTimestamp.reset();
+                                pageSnapshot.reset();
+                                continue;
+                            }
                             throw std::runtime_error(fmt::format(
                                 "MEXC returned invalid funding page {}: {}", currentPage,
                                 paginationError));

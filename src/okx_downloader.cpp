@@ -1116,9 +1116,12 @@ void OKXDownloader::updateMarketData(const std::string &dirPath,
                                            symbol));
                                        return symbolFilePathCsv;
                                    }
+                                   // Nothing local and the venue no longer lists it: there is no
+                                   // history left to fetch.
                                    spdlog::warn(fmt::format(
-                                       "Symbol: {} does not exist on OKX and no usable local candle data exists",
+                                       "Symbol: {} does not exist on OKX and no usable local candle data exists; skipped",
                                        symbol));
+                                   return std::filesystem::path{};
                                } else {
                                    spdlog::warn(fmt::format("Updating candles for symbol: {} failed, reason: {}",
                                                             symbol, e.what()));
@@ -1473,8 +1476,12 @@ void OKXDownloader::updateFundingRateData(const std::string &dirPath,
                                            symbol);
                                        return symbolFilePathCsv;
                                    }
+                                   // Nothing local and the venue no longer lists it: there is no
+                                   // history left to fetch.
                                    spdlog::warn(
-                                       "Symbol {} does not exist on OKX and no usable local funding data exists", symbol);
+                                       "Symbol {} does not exist on OKX and no usable local funding data exists; skipped",
+                                       symbol);
+                                   return std::filesystem::path{};
                                } else {
                                    spdlog::warn(fmt::format("Updating symbol: {} failed, reason: {}",
                                                             symbol, e.what()));

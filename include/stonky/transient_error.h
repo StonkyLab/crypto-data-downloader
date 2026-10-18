@@ -51,6 +51,22 @@ inline bool isTransientTransportError(const std::string_view message) {
     return false;
 }
 
+/**
+ * True for a venue's answer that it does not list the symbol at all: Binance
+ * -1121 "Invalid symbol", OKX 51001 "Instrument ID ... doesn't exist", Bybit
+ * 10001 "Not supported symbols". A trading symbol never gets it; for a
+ * delisted one it is final - the venue has no more of its history - so the
+ * callers skip such a symbol with a warning instead of failing the run. The
+ * Sunday cron failed on such symbols every week and the failure stopped every
+ * step after it (2026-10-11, 2026-10-18).
+ */
+inline bool isUnknownSymbolError(const std::string_view message) {
+    return (message.find("-1121") != std::string_view::npos &&
+            message.find("Invalid symbol") != std::string_view::npos) ||
+           message.find("code: 51001") != std::string_view::npos ||
+           message.find("Not supported symbols") != std::string_view::npos;
+}
+
 } // namespace stonky
 
 #endif // INCLUDE_STONKY_TRANSIENT_ERROR_H

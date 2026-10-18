@@ -11,6 +11,7 @@ Copyright (c) 2025 Vitezslav Kot <vitezslav.kot@stonky.cz>, Stonky s.r.o.
 #include "stonky/binance/binance_common.h"
 #include "stonky/downloader.h"
 #include "stonky/future_utils.h"
+#include "stonky/transient_error.h"
 #include "stonky/utils/semaphore.h"
 #include "stonky/utils/utils.h"
 #include "stonky/binance/binance.h"
@@ -158,7 +159,8 @@ void BinanceSpotDownloader::updateMarketData(const std::string &dirPath, const s
     for (const auto &s: symbolsToUpdate) {
         futures.push_back(
             launchBounded(m_p->maxConcurrentDownloadJobs,
-                       [finalPath, this, &bnbCandleInterval, &barSizeInMinutes, convertToT6](const std::string &symbol) ->
+                       [finalPath, this, &bnbCandleInterval, &barSizeInMinutes, convertToT6, &exchangeSymbolSet](
+                       const std::string &symbol) ->
                    std::filesystem::path {
                            std::filesystem::path symbolFilePathCsv = finalPath;
                            std::filesystem::path symbolFilePathT6 = finalPath;
@@ -212,6 +214,14 @@ void BinanceSpotDownloader::updateMarketData(const std::string &dirPath, const s
                                    return symbolFilePathCsv;
                                }
                            } catch (const std::exception &e) {
+                               if (!exchangeSymbolSet.contains(symbol) && isUnknownSymbolError(e.what())) {
+                                   spdlog::warn(fmt::format(
+                                       "Symbol {} is delisted and Binance no longer serves it ({}); its local "
+                                       "history stays as it is", symbol, e.what()));
+                                   return std::filesystem::exists(symbolFilePathCsv)
+                                              ? symbolFilePathCsv
+                                              : std::filesystem::path{};
+                               }
                                spdlog::warn(fmt::format("Updating candles for symbol: {} failed, reason: {}",
                                                         symbol, e.what()));
                                throw;
