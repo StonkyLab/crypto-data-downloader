@@ -10,7 +10,9 @@ Copyright (c) 2026 Vitezslav Kot <vitezslav.kot@stonky.cz>, Stonky s.r.o.
 #define INCLUDE_STONKY_FUTURE_UTILS_H
 
 #include "stonky/utils/semaphore.h"
+#include "stonky/transient_error.h"
 #include <spdlog/spdlog.h>
+#include <chrono>
 #include <cstdint>
 #include <exception>
 #include <future>
@@ -19,6 +21,7 @@ Copyright (c) 2026 Vitezslav Kot <vitezslav.kot@stonky.cz>, Stonky s.r.o.
 #include <stdexcept>
 #include <string>
 #include <string_view>
+#include <thread>
 #include <tuple>
 #include <type_traits>
 #include <unordered_set>
@@ -69,6 +72,31 @@ auto launchBounded(Semaphore &launchSlots, F &&function, Args &&...args)
         launchSlots.unlock();
         throw;
     }
+}
+
+/**
+ * A worker that runs again, after a pause, when it fails on a transient
+ * transport fault (isTransientTransportError), at most `attempts` times in all.
+ * Only for workers that re-read their state and commit their writes atomically,
+ * as the MEXC ones do: a single TLS handshake on ROBINCATUSDT failed the whole
+ * MEXC Spot step (2026-10-18).
+ */
+template<typename Fn>
+auto retryTransient(Fn fn, const int attempts = 3,
+                    const std::chrono::milliseconds pause = std::chrono::seconds(2)) {
+    return [fn = std::move(fn), attempts, pause](const auto &... args) {
+        for (int attempt = 1;; ++attempt) {
+            try {
+                return fn(args...);
+            } catch (const std::exception &e) {
+                if (attempt >= attempts || !isTransientTransportError(e.what())) {
+                    throw;
+                }
+                spdlog::warn("Transient network error, retry {}/{}: {}", attempt, attempts - 1, e.what());
+                std::this_thread::sleep_for(pause * attempt);
+            }
+        }
+    };
 }
 
 /** Wait for every task, retain all failures, then fail the enclosing command. */

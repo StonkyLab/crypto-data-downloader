@@ -469,7 +469,7 @@ void MEXCSpotDownloader::updateMarketData(const std::string &dirPath, const std:
     for (const auto &s: symbolsToUpdate) {
         futures.push_back(launchBounded(
                 m_p->maxConcurrentDownloadJobs,
-                [finalPath, this, &mexcCandleInterval, &barSizeInMinutes,
+                retryTransient([finalPath, this, &mexcCandleInterval, &barSizeInMinutes,
                  &activeSymbols](const std::string &symbol) -> std::filesystem::path {
                     std::filesystem::path symbolFilePathCsv = finalPath;
 
@@ -890,7 +890,7 @@ void MEXCSpotDownloader::updateMarketData(const std::string &dirPath, const std:
                         throw std::runtime_error(fmt::format("{}: {}", symbol, e.what()));
                     }
                     return "";
-                },
+                }),
                 s));
     }
 

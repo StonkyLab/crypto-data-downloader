@@ -4,7 +4,38 @@
 #include <string>
 #include <vector>
 
+bool checkRetryTransient() {
+    int calls = 0;
+    const auto flaky = stonky::retryTransient([&calls](const int x) {
+        if (++calls == 1) {
+            throw std::runtime_error("ROBINCATUSDT: handshake: tlsv1 alert internal error (SSL routines)");
+        }
+        return x * 2;
+    }, 3, std::chrono::milliseconds(1));
+    if (flaky(21) != 42 || calls != 2) {
+        std::cerr << "A transient fault was not retried\n";
+        return false;
+    }
+    calls = 0;
+    const auto rejected = stonky::retryTransient([&calls](const int) -> int {
+        ++calls;
+        throw std::runtime_error("Bad HTTP response: 400, API Code: -1121, message: Invalid symbol.");
+    }, 3, std::chrono::milliseconds(1));
+    try {
+        rejected(1);
+    } catch (const std::exception &) {
+        if (calls == 1) {
+            return true;
+        }
+    }
+    std::cerr << "A venue rejection was retried or swallowed\n";
+    return false;
+}
+
 int main() {
+    if (!checkRetryTransient()) {
+        return 1;
+    }
     std::vector<std::string> unique{"BTCUSDT", "ETHUSDT", "SOLUSDT"};
     stonky::deduplicatePreserveOrder(unique);
     if (unique != std::vector<std::string>{"BTCUSDT", "ETHUSDT", "SOLUSDT"}) {

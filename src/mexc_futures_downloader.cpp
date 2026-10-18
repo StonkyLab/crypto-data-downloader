@@ -492,7 +492,7 @@ void MEXCFuturesDownloader::updateMarketData(const std::string &dirPath, const s
     for (const auto &s: symbolsToUpdate) {
         futures.push_back(launchBounded(
                 m_p->maxConcurrentDownloadJobs,
-                [finalPath, this, &mexcCandleInterval, &barSizeInMinutes,
+                retryTransient([finalPath, this, &mexcCandleInterval, &barSizeInMinutes,
                  &activeSymbols](const std::string &symbol) -> std::filesystem::path {
                     std::filesystem::path symbolFilePathCsv = finalPath;
 
@@ -847,7 +847,7 @@ void MEXCFuturesDownloader::updateMarketData(const std::string &dirPath, const s
                         throw std::runtime_error(fmt::format("{}: {}", symbol, e.what()));
                     }
                     return "";
-                },
+                }),
                 s));
     }
 
@@ -1016,7 +1016,7 @@ void MEXCFuturesDownloader::updateFundingRateData(const std::string &dirPath, co
     for (const auto &symbol: symbolsToUpdate) {
         fundingFutures.push_back(launchBounded(
             m_p->maxConcurrentDownloadJobs,
-            [this, frDir](const std::string &symbol) -> std::string {
+            retryTransient([this, frDir](const std::string &symbol) -> std::string {
                 try {
                     spdlog::info(fmt::format("Downloading funding rate history for symbol: {}...", symbol));
 
@@ -1192,7 +1192,7 @@ void MEXCFuturesDownloader::updateFundingRateData(const std::string &dirPath, co
                         e.what()));
                     throw;
                 }
-            }, symbol));
+            }), symbol));
     }
     std::ignore = waitAllOrThrow(fundingFutures, [&onSymbolCompletedCB](const std::string &symbol) {
         if (onSymbolCompletedCB) {
