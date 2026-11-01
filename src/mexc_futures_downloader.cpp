@@ -1083,24 +1083,28 @@ void MEXCFuturesDownloader::updateFundingRateData(const std::string &dirPath, co
                                 currentPage));
                         }
                         std::string paginationError;
-                        if (!mexc_funding_pagination::validatePageMetadata(
-                                currentPage, pageSize, response.resultList.size(),
-                                response.currentPage, response.pageSize, response.totalCount,
-                                response.totalPage, pageSnapshot, paginationError)) {
-                            // A settlement landing during the scan shifts the pages under it
-                            // (AEVO_USDT at 00:07, 2026-10-18): read them again from the first.
-                            if (rescans < 2 && pageSnapshot &&
-                                paginationError.find("changed during the scan") != std::string::npos) {
-                                ++rescans;
-                                spdlog::warn(fmt::format(
-                                    "Symbol {}: MEXC funding pages changed during the scan; rescanning",
-                                    symbol));
-                                currentPage = 1;
-                                newRates.clear();
-                                previousRemoteTimestamp.reset();
-                                pageSnapshot.reset();
-                                continue;
-                            }
+                        const bool validPage = mexc_funding_pagination::validatePageMetadata(
+                            currentPage, pageSize, response.resultList.size(),
+                            response.currentPage, response.pageSize, response.totalCount,
+                            response.totalPage, pageSnapshot, paginationError);
+                        if (rescans < 2 && pageSnapshot &&
+                            mexc_funding_pagination::scanShifted(
+                                validPage, paginationError, previousRemoteTimestamp,
+                                response.resultList.front().settleTime)) {
+                            ++rescans;
+                            spdlog::warn(fmt::format(
+                                "Symbol {}: MEXC funding pages changed during the scan; "
+                                "rescanning in 5 s",
+                                symbol));
+                            // The settlement is still being published: give it a moment.
+                            std::this_thread::sleep_for(std::chrono::seconds{5});
+                            currentPage = 1;
+                            newRates.clear();
+                            previousRemoteTimestamp.reset();
+                            pageSnapshot.reset();
+                            continue;
+                        }
+                        if (!validPage) {
                             throw std::runtime_error(fmt::format(
                                 "MEXC returned invalid funding page {}: {}", currentPage,
                                 paginationError));

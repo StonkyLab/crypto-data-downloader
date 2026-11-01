@@ -82,6 +82,22 @@ inline bool validatePageMetadata(
     return true;
 }
 
+/**
+ * A settlement landing during the scan shifts the pages under it.  Either the
+ * metadata changes (AEVO_USDT at 00:07, 2026-10-18), or only the rows move and
+ * MEXC keeps the metadata: the page then starts with the previous page's last
+ * row (1000000MOG_USDT at 00:00, 2026-11-01).  Both mean reading the pages
+ * again from the first; a row out of order inside one page is not a shift.
+ */
+inline bool scanShifted(const bool validPage, const std::string &error,
+                        const std::optional<std::int64_t> &previousOldest,
+                        const std::int64_t pageNewest) {
+    if (!validPage) {
+        return error.find("changed during the scan") != std::string::npos;
+    }
+    return previousOldest && pageNewest >= *previousOldest;
+}
+
 enum class ScanDecision {
     Continue,
     Complete,

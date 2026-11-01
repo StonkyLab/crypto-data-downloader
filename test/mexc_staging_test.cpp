@@ -973,6 +973,20 @@ int main() {
         ok = false;
     }
 
+    // A settlement landing between two page reads is a shifted scan to read
+    // again: changed metadata, or a page repeating the previous page's last row.
+    using stonky::mexc_funding_pagination::scanShifted;
+    if (!scanShifted(false, "MEXC funding pagination metadata changed during the scan",
+                     2000, 1999) ||
+        !scanShifted(true, "", 1779091200000LL, 1779091200000LL) ||
+        scanShifted(true, "", 1779091200000LL, 1779076800000LL) ||
+        scanShifted(true, "", std::nullopt, 1779091200000LL) ||
+        scanShifted(false, "MEXC funding response row count is inconsistent with pagination metadata",
+                    2000, 1999)) {
+        std::cerr << "MEXC funding scan shift was misclassified\n";
+        ok = false;
+    }
+
     using stonky::mexc_funding_pagination::ScanDecision;
     if (!stonky::mexc_funding_pagination::validatedPageCrossesCutoff(249, 250) ||
         stonky::mexc_funding_pagination::validatedPageCrossesCutoff(250, 250) ||
