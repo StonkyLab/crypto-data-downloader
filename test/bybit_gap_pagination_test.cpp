@@ -85,28 +85,32 @@ int main() {
     using namespace stonky::bybit;
     try {
         RESTClient client("", "");
-        for (const int gapDays : {14, 300}) {
-            history = {tail - minute, tail};
-            for (int i = 0; i < 500; ++i) {
-                history.push_back(tail + gapDays * day + i * minute);
+        // 200 is the venue's default page, 1000 the page the downloader asks for since 2026-11-18.
+        for (const int limit : {200, 1000}) {
+            for (const int gapDays : {14, 300}) {
+                history = {tail - minute, tail};
+                for (int i = 0; i < 500; ++i) {
+                    history.push_back(tail + gapDays * day + i * minute);
+                }
+                probes = 0;
+                std::vector<std::int64_t> written;
+                const auto candles = client.getHistoricalPrices(
+                    Category::spot, "RELISTUSDT", CandleInterval::_1, tail, history.back() + minute, limit,
+                    [&written](const std::vector<Candle> &batch) {
+                        for (const auto &candle : batch) {
+                            written.push_back(candle.startTime);
+                        }
+                    });
+                const std::vector<std::int64_t> expected(history.begin() + 1, history.end());
+                std::vector<std::int64_t> returned;
+                for (const auto &candle : candles) {
+                    returned.push_back(candle.startTime);
+                }
+                require(returned == expected && written == expected,
+                        "Relisting gap truncated, skipped or duplicated candles");
+                require(gapDays < 300 || limit != 200 || probes > 2000,
+                        "Long-gap case did not cross the old cap");
             }
-            probes = 0;
-            std::vector<std::int64_t> written;
-            const auto candles = client.getHistoricalPrices(
-                Category::spot, "RELISTUSDT", CandleInterval::_1, tail, history.back() + minute, 200,
-                [&written](const std::vector<Candle> &batch) {
-                    for (const auto &candle : batch) {
-                        written.push_back(candle.startTime);
-                    }
-                });
-            const std::vector<std::int64_t> expected(history.begin() + 1, history.end());
-            std::vector<std::int64_t> returned;
-            for (const auto &candle : candles) {
-                returned.push_back(candle.startTime);
-            }
-            require(returned == expected && written == expected,
-                    "Relisting gap truncated, skipped or duplicated candles");
-            require(gapDays < 300 || probes > 2000, "Long-gap case did not cross the old cap");
         }
 
         history = {tail - minute, tail};

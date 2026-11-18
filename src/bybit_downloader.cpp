@@ -20,6 +20,7 @@ Copyright (c) 2025 Vitezslav Kot <vitezslav.kot@stonky.cz>, Stonky s.r.o.
 #include "stonky/utils/utils.h"
 #include "stonky/utils/semaphore.h"
 #include "csv.h"
+#include <algorithm>
 #include <filesystem>
 #include <fstream>
 #include <map>
@@ -472,17 +473,22 @@ void BybitDownloader::updateMarketData(const std::string &dirPath,
                                       msg.find("too many") != std::string::npos ||
                                       msg.find("429") != std::string::npos;
                            };
-                           constexpr int maxRetries = 5;
+                           // A rate limit at a quarter-hour lasted about 70 s (2026-11-18): eight
+                           // attempts wait up to two minutes, no single pause longer than 60 s.
+                           constexpr int maxRetries = 8;
                            for (int attempt = 0; attempt < maxRetries; ++attempt) {
                                // Re-read CSV state at start of each attempt — a previous attempt
                                // may have written batches to disk before hitting a 429.
                                const auto resume = P::checkSymbolCSVFile(symbolFilePathCsv.string());
                                try {
+                                   // Bybit serves up to 1000 candles a request. Asking for its default 200
+                                   // made five times the requests a download needs, and on 2026-11-18 the
+                                   // 1m step ran into the venue's rate limit (10006) and failed.
                                    std::ignore = m_p->bybitClient->getHistoricalPrices(category,
                                        symbol,
                                        bybitCandleInterval,
                                        resume.timestamp,
-                                       endTimestamp, 200, [symbolFilePathCsv, symbol](const std::vector<Candle> &cnd) {
+                                       endTimestamp, 1000, [symbolFilePathCsv, symbol](const std::vector<Candle> &cnd) {
                                            if (!cnd.empty()) {
                                                const auto persisted = P::checkSymbolCSVFile(symbolFilePathCsv.string());
                                                if (!P::writeCandlesToCSVFile(cnd, symbolFilePathCsv.string(), persisted)) {
@@ -498,7 +504,7 @@ void BybitDownloader::updateMarketData(const std::string &dirPath,
                                } catch (const std::exception &e) {
                                    const std::string errMsg = e.what();
                                    if (isRateLimitError(errMsg) && attempt < maxRetries - 1) {
-                                       const int waitMs = 1000 * (1 << attempt);
+                                       const int waitMs = std::min(1000 * (1 << attempt), 60'000);
                                        spdlog::warn(fmt::format("Rate limit for symbol: {}, retry {}/{} in {} ms: {}",
                                                                 symbol, attempt + 1, maxRetries - 1, waitMs, errMsg));
                                        std::this_thread::sleep_for(std::chrono::milliseconds(waitMs));
@@ -510,7 +516,7 @@ void BybitDownloader::updateMarketData(const std::string &dirPath,
                                        // hit 181 symbols one Sunday and six others the next (2026-10-11/18);
                                        // the tail is re-read before every attempt, so retrying resumes exactly
                                        // where the fault cut the download.
-                                       const int waitMs = 2000 * (1 << attempt);
+                                       const int waitMs = std::min(2000 * (1 << attempt), 60'000);
                                        spdlog::warn(fmt::format(
                                            "Transient network error for symbol: {}, retry {}/{} in {} ms: {}",
                                            symbol, attempt + 1, maxRetries - 1, waitMs, errMsg));
@@ -744,7 +750,9 @@ void BybitDownloader::updateFundingRateData(const std::string &dirPath,
                                       msg.find("too many") != std::string::npos ||
                                       msg.find("429") != std::string::npos;
                            };
-                           constexpr int maxRetries = 5;
+                           // A rate limit at a quarter-hour lasted about 70 s (2026-11-18): eight
+                           // attempts wait up to two minutes, no single pause longer than 60 s.
+                           constexpr int maxRetries = 8;
                            for (int attempt = 0; attempt < maxRetries; ++attempt) {
                                // Re-read CSV state at start of each attempt — a previous attempt
                                // may have written rows to disk before hitting a 429.
@@ -764,7 +772,7 @@ void BybitDownloader::updateFundingRateData(const std::string &dirPath,
                                } catch (const std::exception &e) {
                                    const std::string errMsg = e.what();
                                    if (isRateLimitError(errMsg) && attempt < maxRetries - 1) {
-                                       const int waitMs = 1000 * (1 << attempt);
+                                       const int waitMs = std::min(1000 * (1 << attempt), 60'000);
                                        spdlog::warn(fmt::format("Rate limit for symbol: {}, retry {}/{} in {} ms: {}",
                                                                 symbol, attempt + 1, maxRetries - 1, waitMs, errMsg));
                                        std::this_thread::sleep_for(std::chrono::milliseconds(waitMs));
@@ -776,7 +784,7 @@ void BybitDownloader::updateFundingRateData(const std::string &dirPath,
                                        // hit 181 symbols one Sunday and six others the next (2026-10-11/18);
                                        // the tail is re-read before every attempt, so retrying resumes exactly
                                        // where the fault cut the download.
-                                       const int waitMs = 2000 * (1 << attempt);
+                                       const int waitMs = std::min(2000 * (1 << attempt), 60'000);
                                        spdlog::warn(fmt::format(
                                            "Transient network error for symbol: {}, retry {}/{} in {} ms: {}",
                                            symbol, attempt + 1, maxRetries - 1, waitMs, errMsg));
