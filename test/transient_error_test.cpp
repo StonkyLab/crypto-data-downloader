@@ -13,6 +13,12 @@ int main() {
         "Connection reset by peer [system:104]",
         "Transport failure for /fapi/v1/klines: The socket was closed due to a timeout [asio.misc:...] timed out",
         "handshake: tlsv1 alert internal error (SSL routines) [asio.ssl:...]",
+        // boost::system::system_error(...).what() under Boost 1.88: a clean close Beast
+        // reports with its own codes, which match neither "End of file" nor "asio."
+        "end of stream [beast.http:1]",
+        "partial message [beast.http:2]",
+        "No route to host [system:113]",
+        "Software caused connection abort [system:103]",
     };
     // Venue answers: repeating the request cannot change them.
     constexpr std::string_view permanent[] = {

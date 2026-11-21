@@ -7,6 +7,7 @@ Copyright (c) 2025 Vitezslav Kot <vitezslav.kot@stonky.cz>, Stonky s.r.o.
 */
 
 #include "stonky/okx/okx_downloader.h"
+#include "okx_retry.h"
 #include "stonky/history_floor.h"
 #include "stonky/okx_trades_aggregator.h"
 #include <cctype>
@@ -63,7 +64,7 @@ constexpr std::int64_t ARCHIVE_FLOOR_MS = 1630425600000;
 /// decide whether a file can still hold records newer than what is stored.
 constexpr std::int64_t MONTHLY_FILE_SPAN_MS = 32LL * MS_PER_DAY;
 
-constexpr int MAX_REQUEST_ATTEMPTS = 4;
+using okx_retry::withRetry;
 
 /// How many times a listing window is re-requested while it keeps handing back
 /// a download URL that belongs to a different instrument than the entry it is
@@ -106,31 +107,6 @@ std::int64_t hkDayStartMs(const std::int64_t tsMs) {
  */
 std::int64_t archiveWindowStart(const std::int64_t tsMs, const DateAggrType dateAggrType) {
     return dateAggrType == DateAggrType::monthly ? hkMonthStartMs(tsMs) : hkDayStartMs(tsMs);
-}
-
-/// Run a request with bounded retries. Transient OKX failures (rate limiting,
-/// gateway hiccups) must not translate into skipped archive files — a skipped
-/// file becomes a permanent hole, because the resume logic only ever appends
-/// after the last stored record.
-template<typename Fn>
-auto withRetry(const std::string &what, Fn &&fn) -> decltype(fn()) {
-    std::string lastError;
-    for (int attempt = 1; attempt <= MAX_REQUEST_ATTEMPTS; ++attempt) {
-        try {
-            return fn();
-        } catch (const std::exception &e) {
-            lastError = e.what();
-            // A delisted/unknown instrument is a terminal answer, not a hiccup.
-            if (lastError.find("code: 51001") != std::string::npos ||
-                lastError.find("code: 51000") != std::string::npos) {
-                throw;
-            }
-            if (attempt < MAX_REQUEST_ATTEMPTS) {
-                std::this_thread::sleep_for(std::chrono::milliseconds(500 * attempt));
-            }
-        }
-    }
-    throw std::runtime_error(fmt::format("{} failed after {} attempts: {}", what, MAX_REQUEST_ATTEMPTS, lastError));
 }
 
 using Decimal = OkxTradesAggregator::Decimal;
@@ -313,7 +289,11 @@ struct OKXDownloader::P {
     /// endpoint with 39 ordinary dated futures, so `instType` alone is not a
     /// sufficient filter — `ruleType` is what separates them.
     [[nodiscard]] std::vector<Instrument> productInstruments(const InstrumentType instrumentType) const {
-        auto instruments = okxClient->getInstruments(xperp ? InstrumentType::FUTURES : instrumentType);
+        // Every OKX request goes through withRetry: a rate limit or a fault on
+        // any of them failed the whole step before (MYRIA-USDT, 2026-11-20).
+        auto instruments = withRetry("public/instruments", [&] {
+            return okxClient->getInstruments(xperp ? InstrumentType::FUTURES : instrumentType);
+        });
 
         if (xperp) {
             std::erase_if(instruments, [](const Instrument &i) { return i.ruleType != "xperp"; });
@@ -1063,8 +1043,14 @@ void OKXDownloader::updateMarketData(const std::string &dirPath,
                                // Bulk files only cover complete days, so the last hours come from the
                                // paginated REST endpoint.
                                if (lastSavedTimestamp < nowTimestamp) {
-                                   auto recentCandles = m_p->okxClient->getHistoricalPrices(
-                                       symbol, BarSize::_1m, lastSavedTimestamp, nowTimestamp);
+                                   // Nothing is written until the whole range is in, so a retry
+                                   // starts again from the last stored record.
+                                   auto recentCandles = withRetry(
+                                       fmt::format("history-candles {} [{}, {}]", symbol, lastSavedTimestamp,
+                                                   nowTimestamp), [&] {
+                                           return m_p->okxClient->getHistoricalPrices(
+                                               symbol, BarSize::_1m, lastSavedTimestamp, nowTimestamp);
+                                       });
 
                                    if (!recentCandles.empty()) {
                                        // Sort by timestamp (API returns newest first)
@@ -1437,8 +1423,14 @@ void OKXDownloader::updateFundingRateData(const std::string &dirPath,
 
                                // 2. Fill the gap between last bulk file and now using REST API
                                if (lastSavedTimestamp < nowTimestamp) {
-                                   auto recentRates = m_p->okxClient->getFundingRates(
-                                       symbol, lastSavedTimestamp, nowTimestamp, 1000);
+                                   // As the REST candles: nothing is written before the whole
+                                   // range is in, so a retry starts from the last stored record.
+                                   auto recentRates = withRetry(
+                                       fmt::format("funding-rate-history {} [{}, {}]", symbol, lastSavedTimestamp,
+                                                   nowTimestamp), [&] {
+                                           return m_p->okxClient->getFundingRates(
+                                               symbol, lastSavedTimestamp, nowTimestamp, 1000);
+                                       });
 
                                    if (!recentRates.empty()) {
                                        std::ranges::sort(recentRates, [](const FundingRate &a, const FundingRate &b) {

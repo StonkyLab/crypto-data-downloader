@@ -187,6 +187,11 @@ if (BUILD_TESTING)
     target_include_directories(transient_error_test PRIVATE include)
     add_test(NAME transient_error_classifies_network_faults COMMAND transient_error_test)
 
+    add_executable(okx_retry_test test/okx_retry_test.cpp)
+    target_include_directories(okx_retry_test PRIVATE src include)
+    target_link_libraries(okx_retry_test PRIVATE spdlog::spdlog_header_only)
+    add_test(NAME okx_retry_waits_out_rate_limits COMMAND okx_retry_test)
+
     add_executable(run_lock_test test/run_lock_test.cpp)
     target_include_directories(run_lock_test PRIVATE include)
     target_link_libraries(run_lock_test PRIVATE spdlog::spdlog_header_only)

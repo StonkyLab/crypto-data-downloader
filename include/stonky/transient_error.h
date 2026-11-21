@@ -38,9 +38,13 @@ inline bool isTransientTransportError(const std::string_view message) {
         "Temporary failure in name resolution",
         "handshake:",              // TLS handshake interrupted
         "End of file",             // peer closed mid-response
+        "end of stream",           // Beast: peer closed cleanly before the response
+        "partial message",         // Beast: peer closed inside the body
         "Operation canceled",      // cancelled by a deadline timer
         "Connection refused",      // venue edge briefly unavailable
+        "Software caused connection abort", // ECONNABORTED
         "Network is unreachable",
+        "No route to host",        // EHOSTUNREACH
         "asio.",                   // any other boost.asio category error
     };
     for (const auto marker: markers) {
