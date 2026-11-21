@@ -28,6 +28,11 @@ namespace stonky {
  * deliberately not matched: repeating it cannot change the answer.
  */
 inline bool isTransientTransportError(const std::string_view message) {
+    // A certificate this client refuses (untrusted, expired, another host's) is the
+    // same on every attempt, although "handshake:" and "asio." below match it.
+    if (message.find("certificate verify failed") != std::string_view::npos) {
+        return false;
+    }
     constexpr std::string_view markers[] = {
         "Transport failure",       // Bybit/Binance async transport wrapper
         "Connection reset",        // ECONNRESET, with or without "by peer"

@@ -28,6 +28,9 @@ int main() {
         "CSV write failed for symbol: BTCUSDT",
         "MEXC Spot returned no candles for a non-empty range",
         "Old data format for symbol BTCUSDT, delete file before retrying",
+        // Boost 1.88 / OpenSSL 3.5 text of a refused certificate: the next attempt
+        // gets the same certificate.
+        "handshake: certificate verify failed (SSL routines) [asio.ssl:167772294]",
     };
     for (const auto m: transient) {
         if (!stonky::isTransientTransportError(m)) {

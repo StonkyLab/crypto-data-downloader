@@ -24,28 +24,48 @@ namespace stonky::okx_retry {
 /// Attempts of a request that keeps failing with anything but a transient failure.
 constexpr int MAX_REQUEST_ATTEMPTS = 4;
 
-/// Attempts of a request the venue rate-limits or a fault cuts: pauses of 1 s
-/// doubling to at most 60 s, about two minutes in all, as the Bybit loops wait
-/// since 2026-11-18. On 2026-11-20 OKX answered one market-data-history request
-/// for MYRIA-USDT with 429/50011 four times within 5.5 s; four attempts with 3 s
-/// of pauses ran out and the whole OKX spot step failed. Each request waits on
-/// its own, so a venue down for hours makes a step run for hours before it fails.
+/// Attempts of a request the venue rate-limits or a fault cuts, with pauses of
+/// 1 s doubling to at most 60 s: about two minutes of pauses in all, as the Bybit
+/// loops wait since 2026-11-18. On 2026-11-20 OKX answered one market-data-history
+/// request for MYRIA-USDT with 429/50011 four times within 5.5 s; four attempts
+/// with 3 s of pauses ran out and the whole OKX spot step failed. Each request
+/// waits on its own and an attempt may itself wait for its connection, so a venue
+/// down for hours makes a step run for hours before it fails.
 constexpr int MAX_TRANSIENT_ATTEMPTS = 8;
 
-/// The venue's state rather than its answer, so a later attempt of the same
-/// request can be expected to clear it: a rate limit (HTTP 429, OKX 50011), a
-/// gateway error (HTTP 5xx), a fault on the way (reset, timeout, lost DNS answer).
+/// OKX's codes that ask to try again later (docs-v5 error table, read 2026-11-21):
+/// 50001 service temporarily unavailable (HTTP 503), 50004 endpoint request timeout
+/// (400), 50011 rate limit (200 by the table, 429 in practice), 50013 systems busy
+/// (429), 50026 system error (500). The execution gateway takes 50011, 50013 and
+/// 50026 for throttling too.
+constexpr std::string_view RETRY_LATER_CODES[] = {"50001", "50004", "50011", "50013", "50026"};
+
+/// The venue's state rather than its answer to the request, so a later attempt can
+/// be expected to clear it: a rate limit, a gateway error, a fault on the way.
 inline bool isTransientFailure(const std::string_view message) {
-    constexpr std::string_view markers[] = {
-        "Bad response, code 429", "Bad response, code 5", // API host (RESTClient checkResponse)
-        "HTTP status: 429", "HTTP status: 5",             // archive file (HTTPSession::downloadBinary)
-        "code: 50011", "\"code\":\"50011\"",              // OKX's rate-limit code, as an API error or a body
-    };
-    for (const auto marker: markers) {
-        if (message.find(marker) != std::string_view::npos) {
-            return true;
+    using namespace std::string_view_literals;
+
+    // An OKX code in an HTTP 200 answer (handleOKXResponse): "OKX API error, code: 50013, msg: ...".
+    if (constexpr auto prefix = "OKX API error, code: "sv; message.starts_with(prefix)) {
+        const auto rest = message.substr(prefix.size());
+        return std::ranges::any_of(RETRY_LATER_CODES, [&](const std::string_view code) {
+            return rest.starts_with(code) && rest.substr(code.size()).starts_with(",");
+        });
+    }
+    // Any other answer: its HTTP status or the OKX code in its body decides, never a
+    // word of the body, which is the venue's text (a 403 page may well say setTimeout).
+    for (const auto prefix: {"Bad response, code "sv,                      // API host (checkResponse)
+                             "Failed to download file, HTTP status: "sv}) { // archive (downloadBinary)
+        if (message.starts_with(prefix)) {
+            const auto status = message.substr(prefix.size());
+            return status.starts_with("429") || status.starts_with("5") ||
+                   std::ranges::any_of(RETRY_LATER_CODES, [&](const std::string_view code) {
+                       return message.find(std::string(R"("code":")").append(code).append(R"(")")) !=
+                              std::string_view::npos;
+                   });
         }
     }
+    // No answer came back: a reset, a timeout, a lost DNS answer, a broken TLS session.
     return isTransientTransportError(message);
 }
 

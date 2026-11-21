@@ -190,6 +190,8 @@ if (BUILD_TESTING)
     add_executable(okx_retry_test test/okx_retry_test.cpp)
     target_include_directories(okx_retry_test PRIVATE src include)
     target_link_libraries(okx_retry_test PRIVATE spdlog::spdlog_header_only)
+    target_compile_definitions(okx_retry_test PRIVATE
+            OKX_DOWNLOADER_CPP="${CMAKE_CURRENT_SOURCE_DIR}/src/okx_downloader.cpp")
     add_test(NAME okx_retry_waits_out_rate_limits COMMAND okx_retry_test)
 
     add_executable(run_lock_test test/run_lock_test.cpp)
